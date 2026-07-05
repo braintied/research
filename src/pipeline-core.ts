@@ -355,12 +355,52 @@ export async function directFetchAsText(url: string): Promise<string | null> {
 }
 
 /**
- * Orchestrator: tries Crawl4AI first, falls back to DirectFetch.
+ * Jina Reader fallback — https://r.jina.ai/{url} returns the page as clean
+ * markdown. Free tier; only attempted when JINA_API_KEY is configured.
+ * Handles JS-rendered pages that DirectFetch can't, without self-hosted infra.
+ */
+export async function jinaReaderFetch(url: string): Promise<string | null> {
+  const key = process.env.JINA_API_KEY;
+  if (key === undefined || key === '') return null;
+
+  try {
+    const response = await fetch(`https://r.jina.ai/${url}`, {
+      headers: {
+        Authorization: `Bearer ${key}`,
+        Accept: 'text/plain',
+      },
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!response.ok) {
+      logger.warn({ url: url.slice(0, 80), status: response.status }, '[JinaReader] Non-OK response');
+      return null;
+    }
+
+    const markdown = await response.text();
+    if (markdown.trim().length < 200) return null;
+
+    logger.info({ url: url.slice(0, 60), chars: markdown.length }, '[JinaReader] Success');
+    return markdown;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ url, error: msg }, '[JinaReader] Failed');
+    return null;
+  }
+}
+
+/**
+ * Orchestrator: Crawl4AI (self-hosted, $0) → Jina Reader (free tier, only if
+ * JINA_API_KEY set) → DirectFetch (plain HTML).
  */
 export async function crawlUrl(url: string): Promise<string | null> {
   const content = await crawlWithCrawl4AI(url);
   if (content !== null && content.trim().length >= 200) {
     return content;
+  }
+  const jinaContent = await jinaReaderFetch(url);
+  if (jinaContent !== null) {
+    return jinaContent;
   }
   return directFetchAsText(url);
 }

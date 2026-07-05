@@ -20,6 +20,8 @@ export const PROVIDER_NAMES = [
   'tavily',
   'exa',
   'serpapi',
+  'serper',
+  'searxng',
   'reddit',
   'youtube',
   'hn',

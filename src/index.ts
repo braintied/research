@@ -73,6 +73,8 @@ export {
   tavilyProvider,
   exaProvider,
   serpapiProvider,
+  serperProvider,
+  searxngProvider,
   redditProvider,
   youtubeProvider,
   hnProvider,
@@ -190,21 +192,23 @@ export async function runDeepResearch(
     '[runDeepResearch] Pipeline configured',
   );
 
+  const enabledProviders = getEnabledProviders();
+  const availableProviderNames = Object.keys(enabledProviders);
+
   // ---------------------------------------------------------------------------
-  // Step 1: plan subqueries
+  // Step 1: plan subqueries (restricted to providers enabled for this run)
   // ---------------------------------------------------------------------------
   let subqueries: Subquery[] = await planSubqueries({
     promptMd: input.brief,
     targetWordCount,
     subqueriesMin: depthConfig.subqueriesMin,
     subqueriesMax: depthConfig.subqueriesMax,
+    availableProviders: availableProviderNames,
   });
 
   if (subqueries.length === 0) {
     throw new Error('Planner returned zero subqueries — cannot proceed');
   }
-
-  const enabledProviders = getEnabledProviders();
 
   // ---------------------------------------------------------------------------
   // Step 2: search (route providers per subquery, run in parallel, dedup)
@@ -299,6 +303,7 @@ export async function runDeepResearch(
       refinementHint,
       subqueriesMin: depthConfig.subqueriesMin,
       subqueriesMax: depthConfig.subqueriesMax,
+      availableProviders: availableProviderNames,
     });
 
     if (additionalSubqueries.length === 0) {

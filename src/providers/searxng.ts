@@ -1,22 +1,24 @@
 /**
- * SearXNG client — Phase 1 Experiment 4 scaffold
+ * SearXNG Search Provider
  *
  * Round-robin multi-instance client for self-hosted SearXNG. Reads
  * SEARXNG_URLS as a comma-separated list (e.g.,
  * "https://searxng-a.fly.dev,https://searxng-b.fly.dev,https://searxng-c.fly.dev").
  *
- * Phase 1 Experiment 4 uses this only for the smoke-test script
- * (`scripts/smoke-test-searxng.ts`) — measure success rate across 1,000
- * queries / 24h before promoting SearXNG to Tier 1 in the cascading search
- * registry. Phase 2 wires it into the provider registry alongside Tavily,
- * Exa, etc., once we know the upstream-engine reliability profile.
- *
- * Plan: ~/.claude/plans/we-were-building-in-imperative-eich.md
- * (Phase 1 Experiment 4)
+ * $0/query metasearch — the default free breadth tier of the provider
+ * registry (Tavily remains the paid quality tier). Originally a Phase-1
+ * smoke-test scaffold (`scripts/smoke-test-searxng.ts`); the registry wiring
+ * promised as "Phase 2" is now done via `searxngProvider` below.
  */
 
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import {
+  SearchResultSchema,
+  type SearchProvider,
+  type SearchResult,
+  type SearchOpts,
+} from '../types.js';
 
 // =============================================================================
 // SearXNG /search JSON response shape (subset we consume)
@@ -38,8 +40,8 @@ const SearxngResponseSchema = z.object({
 });
 
 // =============================================================================
-// Result shape (matches the SearchResult contract minus the strict provider
-// enum — we don't ship SearXNG into ProviderName until Phase 2)
+// Result shape — raw client output; `searxngProvider.search()` maps this into
+// the shared SearchResult contract.
 // =============================================================================
 
 export interface SearxngResult {
@@ -188,3 +190,67 @@ export async function searxngSearch(
     return { success: false, triedUrls, results: [], error: primaryMessage };
   }
 }
+
+// =============================================================================
+// SearchProvider registration — the free breadth tier
+// =============================================================================
+
+function toIsoString(dateStr: string): string | undefined {
+  if (dateStr.length === 0) return undefined;
+  try {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return undefined;
+    return d.toISOString();
+  } catch {
+    return undefined;
+  }
+}
+
+export const searxngProvider: SearchProvider = {
+  name: 'searxng',
+
+  get enabled(): boolean {
+    return getInstanceUrls().length > 0;
+  },
+
+  async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
+    const outcome = await searxngSearch(query, {
+      limit: opts.limit,
+    });
+
+    if (!outcome.success) {
+      throw new Error(
+        outcome.error !== undefined ? outcome.error : 'SearXNG search failed on all instances',
+      );
+    }
+
+    const results: SearchResult[] = [];
+    for (const item of outcome.results) {
+      const publishedAt = item.published_at !== undefined ? toIsoString(item.published_at) : undefined;
+
+      const candidate = {
+        provider: 'searxng' as const,
+        url: item.url,
+        title: item.title,
+        snippet: item.snippet,
+        published_at: publishedAt,
+        engagement: {
+          score: item.score,
+        },
+        raw_metadata: item.engine !== undefined ? { engine: item.engine } : {},
+      };
+
+      const validated = SearchResultSchema.safeParse(candidate);
+      if (validated.success) {
+        results.push(validated.data);
+      }
+    }
+
+    logger.info(
+      { query: query.slice(0, 60), count: results.length },
+      '[SearXNG] Search complete',
+    );
+
+    return results;
+  },
+};

@@ -7,7 +7,7 @@
  */
 
 import { logger } from '../logger.js';
-import { crawlWithCrawl4AI, directFetchAsText } from '../pipeline-core.js';
+import { crawlWithCrawl4AI, directFetchAsText, jinaReaderFetch } from '../pipeline-core.js';
 import {
   FetchResultSchema,
   type SearchProvider,
@@ -46,6 +46,16 @@ export const crawl4aiProvider: SearchProvider = {
       logger.warn({ url: url.slice(0, 60), error: msg }, '[Crawl4AI] crawlWithCrawl4AI threw, falling back to directFetch');
     }
 
+    // Fall back to Jina Reader (free tier, JS-rendered pages) when configured
+    if (markdown === null || markdown.trim().length < 200) {
+      try {
+        markdown = await jinaReaderFetch(url);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn({ url: url.slice(0, 60), error: msg }, '[Crawl4AI] jinaReaderFetch threw, falling back to directFetch');
+      }
+    }
+
     // Fall back to direct HTTP fetch
     if (markdown === null || markdown.trim().length < 200) {
       try {
@@ -61,7 +71,7 @@ export const crawl4aiProvider: SearchProvider = {
         provider: 'crawl4ai',
         url,
         fetch_status: 'failed',
-        fetch_error: 'Both crawlWithCrawl4AI and directFetchAsText returned no content',
+        fetch_error: 'crawlWithCrawl4AI, jinaReaderFetch, and directFetchAsText all returned no content',
       });
       return result;
     }

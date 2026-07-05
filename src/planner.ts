@@ -22,28 +22,55 @@ import type { Subquery } from './types.js';
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 const PLANNER_MAX_RETRIES = 2;
 
-const PROVIDER_ROUTING_TABLE = `
-| Content need              | Use these providers                            |
-|---------------------------|------------------------------------------------|
-| Forum / community voice   | reddit, tavily                                 |
-| Video reviews / demos     | youtube                                        |
-| YouTube comment threads   | youtube                                        |
-| News / recent reactions   | tavily, serpapi                                |
-| Google SERP / ads / PAA   | serpapi                                        |
-| Long-form blogs / essays  | exa, crawl4ai                                  |
-| Academic papers / arxiv   | exa, tavily                                    |
-| Hacker News discussions   | hn, tavily                                     |
-| RSS newsletters / Substack| rss, crawl4ai                                  |
-| Competitor landing pages  | crawl4ai, serpapi                              |
-| Audience verbatim pain    | reddit, youtube                                |
-| Vendor docs / changelogs  | crawl4ai, exa                                  |
-`;
+/** Provider → the content need it serves, used to build the routing table. */
+const PROVIDER_ROUTING_ROWS: Array<{ need: string; providers: string[] }> = [
+  { need: 'Forum / community voice', providers: ['reddit', 'searxng', 'tavily'] },
+  { need: 'Video reviews / demos', providers: ['youtube'] },
+  { need: 'YouTube comment threads', providers: ['youtube'] },
+  { need: 'News / recent reactions', providers: ['searxng', 'serper', 'tavily', 'serpapi'] },
+  { need: 'Google SERP / ads / PAA', providers: ['serper', 'serpapi'] },
+  { need: 'Long-form blogs / essays', providers: ['exa', 'searxng', 'crawl4ai'] },
+  { need: 'Academic papers / arxiv', providers: ['exa', 'tavily', 'searxng'] },
+  { need: 'Hacker News discussions', providers: ['hn', 'tavily'] },
+  { need: 'RSS newsletters / Substack', providers: ['rss', 'crawl4ai'] },
+  { need: 'Competitor landing pages', providers: ['crawl4ai', 'serper', 'serpapi'] },
+  { need: 'Audience verbatim pain', providers: ['reddit', 'youtube'] },
+  { need: 'Vendor docs / changelogs', providers: ['crawl4ai', 'searxng', 'exa'] },
+];
 
-const buildSystemPrompt = (subqueriesMin: number, subqueriesMax: number) =>
-  `You are a research planner. Decompose the following deep-research brief into ${subqueriesMin}–${subqueriesMax} specific, web-searchable subqueries grouped by section (A.1, A.2, B.1...). For each subquery, choose 1–3 providers from this list: tavily, exa, serpapi, reddit, youtube, hn, rss, crawl4ai. Choose providers based on what the subquery needs to find.
+/** Legacy default — used when the caller doesn't pass availableProviders. */
+const DEFAULT_PLANNER_PROVIDERS = [
+  'tavily', 'exa', 'serpapi', 'serper', 'searxng', 'reddit', 'youtube', 'hn', 'rss', 'crawl4ai',
+];
+
+/**
+ * Build the routing table restricted to the providers actually available for
+ * this run, so the planner never routes a subquery to a disabled provider.
+ */
+function buildRoutingTable(available: string[]): string {
+  const availableSet = new Set(available);
+  const lines: string[] = [
+    '| Content need              | Use these providers                            |',
+    '|---------------------------|------------------------------------------------|',
+  ];
+  for (const row of PROVIDER_ROUTING_ROWS) {
+    const usable = row.providers.filter((p) => availableSet.has(p));
+    if (usable.length === 0) continue;
+    lines.push(`| ${row.need.padEnd(25)} | ${usable.join(', ').padEnd(46)} |`);
+  }
+  return lines.join('\n');
+}
+
+const buildSystemPrompt = (
+  subqueriesMin: number,
+  subqueriesMax: number,
+  availableProviders: string[],
+) => {
+  const providerList = availableProviders.join(', ');
+  return `You are a research planner. Decompose the following deep-research brief into ${subqueriesMin}–${subqueriesMax} specific, web-searchable subqueries grouped by section (A.1, A.2, B.1...). For each subquery, choose 1–3 providers from this list: ${providerList}. Choose providers based on what the subquery needs to find.
 
 Provider routing reference:
-${PROVIDER_ROUTING_TABLE}
+${buildRoutingTable(availableProviders)}
 
 Output ONLY valid JSON in this exact shape (no markdown fences, no explanation):
 {
@@ -51,15 +78,16 @@ Output ONLY valid JSON in this exact shape (no markdown fences, no explanation):
     {
       "section_path": "A.1",
       "query": "specific web-searchable query string",
-      "providers": ["tavily"],
+      "providers": ["${availableProviders[0]}"],
       "expected_source_types": ["news"],
       "rationale": "1-sentence explanation"
     }
   ]
 }
 
-Valid provider values: tavily, exa, serpapi, reddit, youtube, hn, rss, crawl4ai
+Valid provider values: ${providerList}
 Valid expected_source_types: forum, social, video, video_comments, longform, academic, news, serp, course_page, audience_voice, newsletter, documentation`;
+};
 
 // =============================================================================
 // Internal Zod schemas
@@ -183,13 +211,23 @@ export interface PlanSubqueriesInput {
   /** Subquery breadth — defaults to legacy 15-35 if omitted. */
   subqueriesMin?: number;
   subqueriesMax?: number;
+  /**
+   * Provider names the planner may route subqueries to. Pass the enabled
+   * search-provider names so plans never target disabled providers. Defaults
+   * to the full legacy list when omitted.
+   */
+  availableProviders?: string[];
 }
 
 export async function planSubqueries(input: PlanSubqueriesInput): Promise<Subquery[]> {
   const { promptMd, targetWordCount, refinementHint } = input;
   const subqueriesMin = input.subqueriesMin ?? 15;
   const subqueriesMax = input.subqueriesMax ?? 35;
-  const systemPrompt = buildSystemPrompt(subqueriesMin, subqueriesMax);
+  const availableProviders =
+    input.availableProviders !== undefined && input.availableProviders.length > 0
+      ? input.availableProviders
+      : DEFAULT_PLANNER_PROVIDERS;
+  const systemPrompt = buildSystemPrompt(subqueriesMin, subqueriesMax, availableProviders);
 
   let userMessage = `Research brief:\n\n${promptMd}\n\nTarget report length: ${targetWordCount.min}–${targetWordCount.max} words.`;
 

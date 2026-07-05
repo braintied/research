@@ -8,6 +8,8 @@
 import { tavilyProvider } from './tavily.js';
 import { exaProvider } from './exa.js';
 import { serpapiProvider } from './serpapi.js';
+import { serperProvider } from './serper.js';
+import { searxngProvider } from './searxng.js';
 import { redditProvider } from './reddit.js';
 import { youtubeProvider } from './youtube.js';
 import { hnProvider } from './hn.js';
@@ -29,6 +31,8 @@ const ALL_PROVIDERS: Record<ProviderName, SearchProvider> = {
   tavily: tavilyProvider,
   exa: exaProvider,
   serpapi: serpapiProvider,
+  serper: serperProvider,
+  searxng: searxngProvider,
   reddit: redditProvider,
   youtube: youtubeProvider,
   hn: hnProvider,
@@ -66,22 +70,26 @@ export function getEnabledProviders(): Partial<Record<ProviderName, SearchProvid
 // Source-type → provider routing table
 // =============================================================================
 
+// Free/cheap breadth tiers (searxng $0, serper 2.5k free/mo) lead the general
+// categories; specialist providers stay first where they're clearly better
+// (reddit for forums, youtube for video, exa for semantic/academic). Disabled
+// providers are filtered at routing time, so listing extras is free.
 const SOURCE_TYPE_ROUTING: Record<ExpectedSourceType, ProviderName[]> = {
-  forum:          ['reddit', 'tavily', 'facebook_groups'],
+  forum:          ['reddit', 'searxng', 'tavily', 'facebook_groups'],
   social:         ['reddit', 'x', 'tiktok', 'instagram'],
   video:          ['youtube', 'tavily'],
   video_comments: ['youtube'],
   social_video:   ['tiktok', 'instagram'],
-  longform:       ['exa', 'tavily', 'crawl4ai'],
-  academic:       ['exa', 'tavily'],
-  news:           ['tavily', 'hn', 'x'],
-  serp:           ['serpapi'],
-  course_page:    ['serpapi', 'crawl4ai'],
+  longform:       ['exa', 'searxng', 'tavily', 'crawl4ai'],
+  academic:       ['exa', 'tavily', 'searxng'],
+  news:           ['searxng', 'serper', 'tavily', 'hn', 'x'],
+  serp:           ['serper', 'serpapi'],
+  course_page:    ['serper', 'serpapi', 'crawl4ai'],
   audience_voice: ['reddit', 'youtube', 'facebook_groups', 'tiktok', 'instagram'],
-  newsletter:     ['rss', 'tavily'],
-  documentation:  ['tavily', 'crawl4ai'],
+  newsletter:     ['rss', 'searxng', 'tavily'],
+  documentation:  ['searxng', 'tavily', 'crawl4ai'],
   podcast:        ['podcasts'],
-  course_review:  ['reddit', 'youtube', 'serpapi', 'facebook_groups'],
+  course_review:  ['reddit', 'youtube', 'serper', 'serpapi', 'facebook_groups'],
 };
 
 /**
@@ -113,6 +121,8 @@ export {
   tavilyProvider,
   exaProvider,
   serpapiProvider,
+  serperProvider,
+  searxngProvider,
   redditProvider,
   youtubeProvider,
   hnProvider,
