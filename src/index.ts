@@ -75,6 +75,7 @@ export {
   serpapiProvider,
   serperProvider,
   searxngProvider,
+  perplexityProvider,
   redditProvider,
   youtubeProvider,
   hnProvider,
@@ -119,6 +120,19 @@ export { parseMarkdownReport } from './parse-markdown-report.js';
 // Knowledge-ingestion core (continuous internet-knowledge ingestion).
 export * from './ingestion/index.js';
 
+// Research kinds — semantic presets (quick/standard/deep/managed/social).
+export {
+  RESEARCH_KINDS,
+  RESEARCH_KIND_PRESETS,
+  coerceResearchKind,
+  runResearch,
+} from './kinds.js';
+export type { ResearchKind, ResearchKindPreset, RunResearchInput, KindResearchResult } from './kinds.js';
+
+// Managed deep research (Perplexity sonar-deep-research).
+export { runManagedResearch } from './managed-research.js';
+export type { RunManagedResearchInput, RunManagedResearchResult } from './managed-research.js';
+
 // =============================================================================
 // Constants — mirror the original runner's budget knobs
 // =============================================================================
@@ -149,6 +163,12 @@ export interface RunDeepResearchInput {
    * indexing is skipped entirely.
    */
   indexSink?: IndexSink;
+  /**
+   * Optional provider allowlist. When provided, only these providers (further
+   * intersected with the env-enabled set) participate in search/fetch — used
+   * by research kinds (e.g. 'social' restricts to community providers).
+   */
+  providers?: ProviderName[];
 }
 
 export interface RunDeepResearchResult {
@@ -192,7 +212,19 @@ export async function runDeepResearch(
     '[runDeepResearch] Pipeline configured',
   );
 
-  const enabledProviders = getEnabledProviders();
+  let enabledProviders = getEnabledProviders();
+  if (input.providers !== undefined && input.providers.length > 0) {
+    const allowlist = new Set<string>(input.providers);
+    // crawl4ai is the shared fetch backbone — always keep it available.
+    allowlist.add('crawl4ai');
+    const filtered: typeof enabledProviders = {};
+    for (const [name, provider] of Object.entries(enabledProviders)) {
+      if (allowlist.has(name)) {
+        filtered[name as ProviderName] = provider;
+      }
+    }
+    enabledProviders = filtered;
+  }
   const availableProviderNames = Object.keys(enabledProviders);
 
   // ---------------------------------------------------------------------------

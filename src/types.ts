@@ -22,6 +22,7 @@ export const PROVIDER_NAMES = [
   'serpapi',
   'serper',
   'searxng',
+  'perplexity',
   'reddit',
   'youtube',
   'hn',

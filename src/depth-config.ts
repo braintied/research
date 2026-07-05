@@ -1,8 +1,10 @@
 /**
  * Depth-mode tunables for the deep-research pipeline.
  *
- * The pipeline (deep-research-prompt-runner.ts) supports three modes:
+ * The pipeline supports four modes:
  *
+ *   - 'quick'    — single-pass cheap mode. ~30-90s per run, ~$0.05-0.50 cost.
+ *                  No critique loop. Fast context grabs and pre-research.
  *   - 'blog'     — lightweight single-article mode. ~1-3 min per run, ~$0.5-2 cost.
  *                  Tuned for a single premium blog post: a handful of subqueries,
  *                  shallow per-subquery fetch, and a single critique pass. Keeps
@@ -21,7 +23,7 @@
  * isn't truncated mid-flight.
  */
 
-export type ResearchDepth = 'blog' | 'standard' | 'wide';
+export type ResearchDepth = 'quick' | 'blog' | 'standard' | 'wide';
 
 export interface DepthTunables {
   /** Target subquery range — passed to the planner as instructions. */
@@ -51,6 +53,18 @@ export interface DepthTunables {
 }
 
 export const DEPTH_CONFIG: Record<ResearchDepth, DepthTunables> = {
+  quick: {
+    // Single-pass cheap research (~30-90s, ~$0.05-0.50). No critique loop —
+    // mirrors Sentigen's composite Tavily→Crawl4AI→NANO pattern. For fast
+    // context grabs, card backing, and pre-research before a deeper run.
+    subqueriesMin: 3,
+    subqueriesMax: 8,
+    urlsPerSubquery: 3,
+    critiqueMaxPasses: 0,
+    hardCapUsd: 0.75,
+    targetWordCountMin: 400,
+    targetWordCountMax: 1500,
+  },
   blog: {
     subqueriesMin: 6,
     subqueriesMax: 10,
@@ -82,6 +96,7 @@ export const DEPTH_CONFIG: Record<ResearchDepth, DepthTunables> = {
 
 /** Narrow an arbitrary string to a valid ResearchDepth. Falls back to 'standard'. */
 export function coerceDepth(input: string | null | undefined): ResearchDepth {
+  if (input === 'quick') return 'quick';
   if (input === 'blog') return 'blog';
   if (input === 'wide') return 'wide';
   return 'standard';

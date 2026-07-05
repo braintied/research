@@ -10,6 +10,7 @@ import { exaProvider } from './exa.js';
 import { serpapiProvider } from './serpapi.js';
 import { serperProvider } from './serper.js';
 import { searxngProvider } from './searxng.js';
+import { perplexityProvider } from './perplexity.js';
 import { redditProvider } from './reddit.js';
 import { youtubeProvider } from './youtube.js';
 import { hnProvider } from './hn.js';
@@ -33,6 +34,7 @@ const ALL_PROVIDERS: Record<ProviderName, SearchProvider> = {
   serpapi: serpapiProvider,
   serper: serperProvider,
   searxng: searxngProvider,
+  perplexity: perplexityProvider,
   reddit: redditProvider,
   youtube: youtubeProvider,
   hn: hnProvider,
@@ -82,7 +84,7 @@ const SOURCE_TYPE_ROUTING: Record<ExpectedSourceType, ProviderName[]> = {
   social_video:   ['tiktok', 'instagram'],
   longform:       ['exa', 'searxng', 'tavily', 'crawl4ai'],
   academic:       ['exa', 'tavily', 'searxng'],
-  news:           ['searxng', 'serper', 'tavily', 'hn', 'x'],
+  news:           ['searxng', 'serper', 'tavily', 'perplexity', 'hn', 'x'],
   serp:           ['serper', 'serpapi'],
   course_page:    ['serper', 'serpapi', 'crawl4ai'],
   audience_voice: ['reddit', 'youtube', 'facebook_groups', 'tiktok', 'instagram'],
@@ -123,6 +125,7 @@ export {
   serpapiProvider,
   serperProvider,
   searxngProvider,
+  perplexityProvider,
   redditProvider,
   youtubeProvider,
   hnProvider,
