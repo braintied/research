@@ -530,43 +530,68 @@ export async function assembleFinalReport(
   const { promptMd, sections, gaps, synthesisModelOverride, telemetry } = input;
   const assemblyModel = resolveSynthesisModel(synthesisModelOverride, ASSEMBLY_MODEL_DEFAULT);
 
-  // Build full markdown from sections
-  const sectionsMarkdown = sections
+  // ---------------------------------------------------------------------------
+  // Global citation renumbering.
+  //
+  // Each section synthesizes with a LOCAL citation map starting at [^1], so
+  // section A's [^1] and section B's [^1] are different URLs. The assembled
+  // bibliography is indexed globally (validateGrounding does bibliography[N-1]),
+  // which made grounding structurally always 0. Renumber every section's
+  // anchors onto one global URL→number map before assembly.
+  // ---------------------------------------------------------------------------
+  const urlToGlobal = new Map<string, number>();
+  let globalCounter = 1;
+  for (const section of sections) {
+    for (const ic of section.inline_citations) {
+      if (!urlToGlobal.has(ic.source_url)) {
+        urlToGlobal.set(ic.source_url, globalCounter);
+        globalCounter++;
+      }
+    }
+  }
+
+  const renumberedSections: SectionDraft[] = sections.map((s) => {
+    // Two-pass placeholder replacement — a direct local→global rewrite can
+    // collide when local [^2] maps to global [^5] while local [^5] exists.
+    const replacements: Array<{ from: string; to: string }> = [];
+    for (const ic of s.inline_citations) {
+      const globalNum = urlToGlobal.get(ic.source_url);
+      if (globalNum === undefined) continue;
+      replacements.push({ from: ic.anchor, to: `[^${globalNum}]` });
+    }
+    let body = s.body_md;
+    replacements.forEach((r, i) => {
+      body = body.split(r.from).join(`\u{E000}CIT${i}\u{E000}`);
+    });
+    replacements.forEach((r, i) => {
+      body = body.split(`\u{E000}CIT${i}\u{E000}`).join(r.to);
+    });
+    const inlineCitations = s.inline_citations.map((ic) => {
+      const globalNum = urlToGlobal.get(ic.source_url);
+      return globalNum !== undefined ? { ...ic, anchor: `[^${globalNum}]` } : ic;
+    });
+    return { ...s, body_md: body, inline_citations: inlineCitations };
+  });
+
+  // Build full markdown from renumbered sections
+  const sectionsMarkdown = renumberedSections
     .map((s) => {
       const prefix = '#'.repeat(s.level);
       return `${prefix} ${s.heading}\n\n${s.body_md}`;
     })
     .join('\n\n');
 
-  // Collect all citations across sections (deduped by source_url)
-  const citationByUrl = new Map<
-    string,
-    {
-      citation_anchor: string;
-      source_url: string;
-      title: string;
-      author: string;
-      provider: ProviderName;
-      published_at: string | undefined;
-    }
-  >();
-
-  for (const section of sections) {
-    for (const ic of section.inline_citations) {
-      if (!citationByUrl.has(ic.source_url)) {
-        citationByUrl.set(ic.source_url, {
-          citation_anchor: ic.anchor,
-          source_url: ic.source_url,
-          title: '',
-          author: '',
-          provider: 'crawl4ai',
-          published_at: undefined,
-        });
-      }
-    }
-  }
-
-  const bibliography = Array.from(citationByUrl.values());
+  // Bibliography in global numeric order — bibliography[N-1] ⇔ [^N].
+  const bibliography = Array.from(urlToGlobal.entries())
+    .sort((a, b) => a[1] - b[1])
+    .map(([sourceUrl, num]) => ({
+      citation_anchor: `[^${num}]`,
+      source_url: sourceUrl,
+      title: '',
+      author: '',
+      provider: 'crawl4ai' as ProviderName,
+      published_at: undefined as string | undefined,
+    }));
 
   // Generate title + executive summary via Claude
   const totalWords = sections.reduce((sum, s) => sum + s.word_count, 0);
