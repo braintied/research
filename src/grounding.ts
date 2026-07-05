@@ -24,6 +24,8 @@ export interface HallucinatedCitation {
   citation_anchor: string;         // e.g. "[^3]"
   expected_substring: string;      // the surrounding claim sentence in synthesis
   matched_chunk_id: string | null; // null if anchor not in bibliography
+  /** Best trigram overlap observed across the source's chunks (0–1) — tuning data. */
+  best_ratio?: number;
 }
 
 export interface GroundingResult {
@@ -100,20 +102,36 @@ function buildTrigrams(text: string): string[] {
 /**
  * Check if ≥60% of the claim trigrams appear in the chunk content.
  */
-function trigramMatchRatio(claimText: string, chunkContent: string): number {
-  const claimTrigrams = buildTrigrams(claimText);
-  if (claimTrigrams.length === 0) {
+function directionalTrigramRatio(needleText: string, haystackText: string): number {
+  const needleTrigrams = buildTrigrams(needleText);
+  if (needleTrigrams.length === 0) {
     return 0;
   }
 
-  const chunkLower = chunkContent.toLowerCase();
+  const haystackLower = haystackText.toLowerCase();
   let matched = 0;
-  for (const trigram of claimTrigrams) {
-    if (chunkLower.includes(trigram)) {
+  for (const trigram of needleTrigrams) {
+    if (haystackLower.includes(trigram)) {
       matched++;
     }
   }
-  return matched / claimTrigrams.length;
+  return matched / needleTrigrams.length;
+}
+
+/**
+ * Bidirectional trigram overlap between a citation's ±200-char claim window
+ * and a chunk (verbatim quote).
+ *
+ * Forward (window→chunk) alone was structurally near-zero: the window is
+ * dominated by the model's own prose, so even a correctly-cited verbatim
+ * quote drowned in paraphrase. The reverse direction (chunk→window) measures
+ * the right thing for short quotes embedded in longer prose: what fraction of
+ * the QUOTE's content appears near the citation. Take the max.
+ */
+function trigramMatchRatio(claimText: string, chunkContent: string): number {
+  const forward = directionalTrigramRatio(claimText, chunkContent);
+  const reverse = directionalTrigramRatio(chunkContent, claimText);
+  return Math.max(forward, reverse);
 }
 
 const TRIGRAM_MATCH_THRESHOLD = 0.6;
@@ -183,8 +201,12 @@ export function validateGrounding(input: ValidateGroundingInput): GroundingResul
 
     // Check if any chunk passes the trigram match threshold
     let foundMatch = false;
+    let bestRatio = 0;
     for (const chunk of matchingChunks) {
       const matchRatio = trigramMatchRatio(cw.window, chunk.content);
+      if (matchRatio > bestRatio) {
+        bestRatio = matchRatio;
+      }
       if (matchRatio >= TRIGRAM_MATCH_THRESHOLD) {
         foundMatch = true;
         break;
@@ -201,6 +223,7 @@ export function validateGrounding(input: ValidateGroundingInput): GroundingResul
         citation_anchor: cw.anchor,
         expected_substring: cw.window.slice(0, 300),
         matched_chunk_id: firstChunk !== undefined ? (firstChunk.source_url !== null ? firstChunk.source_url : null) : null,
+        best_ratio: Math.round(bestRatio * 100) / 100,
       });
     }
   }
