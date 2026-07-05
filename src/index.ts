@@ -9,9 +9,11 @@
  * writes. Report indexing is optional and injected via `indexSink`.
  */
 
+import { z } from 'zod';
 import {
   hashUrl,
   canonicalizeUrl,
+  SearchResultSchema,
 } from './types.js';
 import type {
   Subquery,
@@ -133,6 +135,9 @@ export type { ResearchKind, ResearchKindPreset, RunResearchInput, KindResearchRe
 export { runManagedResearch } from './managed-research.js';
 export type { RunManagedResearchInput, RunManagedResearchResult } from './managed-research.js';
 
+// Document layer — research → typed structured documents (PRD, briefs, specs).
+export * from './documents/index.js';
+
 // =============================================================================
 // Constants — mirror the original runner's budget knobs
 // =============================================================================
@@ -146,6 +151,59 @@ const RERANK_TOP_K = 40;
 // =============================================================================
 
 export type IndexSink = (chunks: ReportChunkInput[]) => Promise<void>;
+
+/**
+ * Pluggable source cache — modeled on ora-ai's `research_source_cache` table
+ * (per-provider TTLs), which the original decoupling dropped. Each consumer
+ * plugs its own store (Postgres, Redis, memory). Keys are namespaced by the
+ * pipeline: `search:<provider>:<query>` and `fetch:<url>`. Errors from the
+ * adapter are swallowed (cache is an optimization, never a dependency).
+ */
+export interface ResearchCacheAdapter {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string, ttlSeconds: number): Promise<void>;
+}
+
+/** Per-provider search-result TTLs (seconds) — mirrors ora-ai's cache policy. */
+const SEARCH_CACHE_TTL_SECONDS: Partial<Record<ProviderName, number>> = {
+  serpapi: 7 * 86_400,
+  serper: 7 * 86_400,
+  searxng: 7 * 86_400,
+  tavily: 30 * 86_400,
+  exa: 30 * 86_400,
+  perplexity: 7 * 86_400,
+  reddit: 60 * 86_400,
+  youtube: 60 * 86_400,
+  hn: 60 * 86_400,
+  rss: 7 * 86_400,
+};
+const DEFAULT_SEARCH_CACHE_TTL_SECONDS = 14 * 86_400;
+const FETCH_CACHE_TTL_SECONDS = 30 * 86_400;
+
+async function cacheGet(cache: ResearchCacheAdapter | undefined, key: string, log: Logger): Promise<string | null> {
+  if (cache === undefined) return null;
+  try {
+    return await cache.get(key);
+  } catch (err: unknown) {
+    log.warn({ key: key.slice(0, 80), error: errMsg(err).slice(0, 120) }, '[cache] get failed (non-fatal)');
+    return null;
+  }
+}
+
+async function cacheSet(
+  cache: ResearchCacheAdapter | undefined,
+  key: string,
+  value: string,
+  ttlSeconds: number,
+  log: Logger,
+): Promise<void> {
+  if (cache === undefined) return;
+  try {
+    await cache.set(key, value, ttlSeconds);
+  } catch (err: unknown) {
+    log.warn({ key: key.slice(0, 80), error: errMsg(err).slice(0, 120) }, '[cache] set failed (non-fatal)');
+  }
+}
 
 export interface RunDeepResearchInput {
   /** The research brief / prompt to investigate. */
@@ -169,6 +227,8 @@ export interface RunDeepResearchInput {
    * by research kinds (e.g. 'social' restricts to community providers).
    */
   providers?: ProviderName[];
+  /** Optional source cache (search results + fetched markdown). */
+  cache?: ResearchCacheAdapter;
 }
 
 export interface RunDeepResearchResult {
@@ -245,7 +305,7 @@ export async function runDeepResearch(
   // ---------------------------------------------------------------------------
   // Step 2: search (route providers per subquery, run in parallel, dedup)
   // ---------------------------------------------------------------------------
-  const allSearchResults = await runSearch(subqueries, enabledProviders, log);
+  const allSearchResults = await runSearch(subqueries, enabledProviders, log, input.cache);
 
   // Depth-aware fetch cap with global ceiling.
   const naturalCap = subqueries.length * depthConfig.urlsPerSubquery;
@@ -255,7 +315,7 @@ export async function runDeepResearch(
   // ---------------------------------------------------------------------------
   // Step 3: fetch content
   // ---------------------------------------------------------------------------
-  const markdownByUrl = await fetchContent(urlsToFetch, enabledProviders, log);
+  const markdownByUrl = await fetchContent(urlsToFetch, enabledProviders, log, input.cache);
 
   // ---------------------------------------------------------------------------
   // Step 4: extract quotes → per-section maps
@@ -345,9 +405,9 @@ export async function runDeepResearch(
     subqueries = [...subqueries, ...additionalSubqueries];
 
     // Extra search for the refinement subqueries only.
-    const extraResults = await runSearch(additionalSubqueries, enabledProviders, log);
+    const extraResults = await runSearch(additionalSubqueries, enabledProviders, log, input.cache);
     const extraToFetch = extraResults.slice(0, Math.min(extraResults.length, CUMULATIVE_URL_CEILING));
-    const extraMarkdown = await fetchContent(extraToFetch, enabledProviders, log);
+    const extraMarkdown = await fetchContent(extraToFetch, enabledProviders, log, input.cache);
 
     const extraExtraction = await extractQuotes(
       additionalSubqueries,
@@ -480,11 +540,14 @@ export async function runDeepResearch(
 
 type EnabledProviders = ReturnType<typeof getEnabledProviders>;
 
+const CachedSearchResultsSchema = z.array(SearchResultSchema);
+
 /** Route + run searches for a set of subqueries, deduped by canonical URL. */
 async function runSearch(
   subqueries: Subquery[],
   enabledProviders: EnabledProviders,
   log: Logger,
+  cache?: ResearchCacheAdapter,
 ): Promise<SearchResult[]> {
   const perSubqueryResults = await Promise.all(
     subqueries.map(async (subquery): Promise<SearchResult[]> => {
@@ -504,8 +567,29 @@ async function runSearch(
         }
         tasks.push(
           (async (): Promise<SearchResult[]> => {
+            const cacheKey = `search:${providerName}:${subquery.query}`;
+            const cached = await cacheGet(cache, cacheKey, log);
+            if (cached !== null) {
+              try {
+                const parsed = CachedSearchResultsSchema.safeParse(JSON.parse(cached));
+                if (parsed.success) {
+                  return parsed.data;
+                }
+              } catch {
+                // Corrupt cache entry — fall through to a live search.
+              }
+            }
             try {
-              return await provider.search(subquery.query, { limit: SEARCH_RESULT_LIMIT });
+              const results = await provider.search(subquery.query, { limit: SEARCH_RESULT_LIMIT });
+              const ttl = SEARCH_CACHE_TTL_SECONDS[providerName];
+              await cacheSet(
+                cache,
+                cacheKey,
+                JSON.stringify(results),
+                ttl !== undefined ? ttl : DEFAULT_SEARCH_CACHE_TTL_SECONDS,
+                log,
+              );
+              return results;
             } catch (err: unknown) {
               log.warn(
                 {
@@ -557,12 +641,20 @@ async function fetchContent(
   results: SearchResult[],
   enabledProviders: EnabledProviders,
   log: Logger,
+  cache?: ResearchCacheAdapter,
 ): Promise<Record<string, string>> {
   const markdownByUrl: Record<string, string> = {};
   const crawl4aiProvider = enabledProviders['crawl4ai'];
 
   await Promise.all(
     results.map(async (result) => {
+      const cacheKey = `fetch:${result.url}`;
+      const cachedMarkdown = await cacheGet(cache, cacheKey, log);
+      if (cachedMarkdown !== null && cachedMarkdown.length > 0) {
+        markdownByUrl[result.url] = cachedMarkdown;
+        return;
+      }
+
       const provider = enabledProviders[result.provider];
       let markdown = '';
       try {
@@ -581,6 +673,7 @@ async function fetchContent(
       }
       if (markdown.length > 0) {
         markdownByUrl[result.url] = markdown;
+        await cacheSet(cache, cacheKey, markdown, FETCH_CACHE_TTL_SECONDS, log);
       }
     }),
   );

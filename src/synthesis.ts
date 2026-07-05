@@ -65,7 +65,7 @@ export interface SynthesisCallResult {
   outputTokens: number;
 }
 
-async function synthesisGenerate(args: {
+export async function synthesisGenerate(args: {
   system: string;
   user: string;
   model: string;
