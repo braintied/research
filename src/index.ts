@@ -284,6 +284,15 @@ export async function runDeepResearch(
       }
     }
     enabledProviders = filtered;
+  } else {
+    // Cost discipline: perplexity never participates in pipeline runs
+    // implicitly (its per-call cost dwarfs the free/cheap tiers). It is
+    // opt-in only — kind='managed' (runManagedResearch) or an explicit
+    // input.providers list that names it.
+    if (enabledProviders['perplexity'] !== undefined) {
+      const { perplexity: _excluded, ...withoutPerplexity } = enabledProviders;
+      enabledProviders = withoutPerplexity;
+    }
   }
   const availableProviderNames = Object.keys(enabledProviders);
 

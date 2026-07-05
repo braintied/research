@@ -1,7 +1,7 @@
 {
   "name": "@braintied/research",
-  "version": "0.2.1",
-  "description": "Deep-research engine \u2014 multi-provider search, quote extraction, synthesis, critique, grounded report assembly, and research-driven document generation (PRDs, briefs, specs)",
+  "version": "0.2.2",
+  "description": "Deep-research engine — multi-provider search, quote extraction, synthesis, critique, grounded report assembly, and research-driven document generation (PRDs, briefs, specs)",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",

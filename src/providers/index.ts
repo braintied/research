@@ -84,7 +84,10 @@ const SOURCE_TYPE_ROUTING: Record<ExpectedSourceType, ProviderName[]> = {
   social_video:   ['tiktok', 'instagram'],
   longform:       ['exa', 'searxng', 'tavily', 'crawl4ai'],
   academic:       ['exa', 'tavily', 'searxng'],
-  news:           ['searxng', 'serper', 'tavily', 'perplexity', 'hn', 'x'],
+  // NOTE: perplexity is deliberately NOT in any routing entry — pipeline runs
+  // never spend on it implicitly. It participates only via kind='managed'
+  // (runManagedResearch) or an explicit RunDeepResearchInput.providers list.
+  news:           ['searxng', 'serper', 'tavily', 'hn', 'x'],
   serp:           ['serper', 'serpapi'],
   course_page:    ['serper', 'serpapi', 'crawl4ai'],
   audience_voice: ['reddit', 'youtube', 'facebook_groups', 'tiktok', 'instagram'],
