@@ -1,0 +1,63 @@
+{
+  "name": "@braintied/research",
+  "version": "0.2.0",
+  "description": "Deep-research engine — multi-provider search, quote extraction, synthesis, critique, grounded report assembly, and research-driven document generation (PRDs, briefs, specs)",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "pack:release": "npm run clean && npm run build && npm pack --pack-destination ./releases",
+    "smoke:searxng": "npx tsx scripts/smoke-test-searxng.ts"
+  },
+  "keywords": [
+    "research",
+    "deep-research",
+    "ai",
+    "search",
+    "synthesis",
+    "content-generation",
+    "prd",
+    "document-generation"
+  ],
+  "author": "Braintied",
+  "license": "UNLICENSED",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ga1ien/braintied-research.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "zod": "^4.3.4"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.104.1",
+    "@google/genai": "^2.8.0",
+    "openai": "^6.42.0",
+    "youtube-transcript": "^1.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.6",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.3",
+    "zod": "^4.3.4"
+  }
+}
