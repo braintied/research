@@ -16,6 +16,7 @@ import { recordGeminiUsage } from './cache-hit-measurement.js';
 import {
   SectionDraftSchema,
   FinalReportSchema,
+  ProviderNameSchema,
 } from './types.js';
 import type {
   SectionDraft,
@@ -514,6 +515,16 @@ export interface AssembleFinalReportInput {
   synthesisModelOverride?: string;
   /** Phase 1 Experiment 3 — Gemini cache-hit measurement attribution. */
   telemetry?: { organizationId?: string; promptRunId?: string };
+  /**
+   * Real provenance per source URL (from the search phase) — used to fill
+   * bibliography provider/title/author instead of hardcoded placeholders.
+   */
+  sourceMeta?: Record<string, {
+    provider?: string;
+    title?: string;
+    author?: string;
+    published_at?: string;
+  }>;
 }
 
 export interface AssembleFinalReportResult {
@@ -527,11 +538,22 @@ export interface AssembleFinalReportResult {
 export async function assembleFinalReport(
   input: AssembleFinalReportInput,
 ): Promise<AssembleFinalReportResult> {
-  const { promptMd, sections, gaps, synthesisModelOverride, telemetry } = input;
+  const { promptMd, sections, gaps, synthesisModelOverride, telemetry, sourceMeta } = input;
   const assemblyModel = resolveSynthesisModel(synthesisModelOverride, ASSEMBLY_MODEL_DEFAULT);
 
   // ---------------------------------------------------------------------------
-  // Global citation renumbering.
+  // Citation pruning (audit m2): a section's inline_citations were built from
+  // the full OFFERED citation map, not from what the model actually cited —
+  // producing phantom bibliography entries. Keep only citations whose local
+  // anchor actually appears in the section body.
+  // ---------------------------------------------------------------------------
+  const citedSections: SectionDraft[] = sections.map((s) => ({
+    ...s,
+    inline_citations: s.inline_citations.filter((ic) => s.body_md.includes(ic.anchor)),
+  }));
+
+  // ---------------------------------------------------------------------------
+  // Global citation renumbering (audit fix, v0.2.1).
   //
   // Each section synthesizes with a LOCAL citation map starting at [^1], so
   // section A's [^1] and section B's [^1] are different URLs. The assembled
@@ -541,7 +563,7 @@ export async function assembleFinalReport(
   // ---------------------------------------------------------------------------
   const urlToGlobal = new Map<string, number>();
   let globalCounter = 1;
-  for (const section of sections) {
+  for (const section of citedSections) {
     for (const ic of section.inline_citations) {
       if (!urlToGlobal.has(ic.source_url)) {
         urlToGlobal.set(ic.source_url, globalCounter);
@@ -550,7 +572,7 @@ export async function assembleFinalReport(
     }
   }
 
-  const renumberedSections: SectionDraft[] = sections.map((s) => {
+  const renumberedSections: SectionDraft[] = citedSections.map((s) => {
     // Two-pass placeholder replacement — a direct local→global rewrite can
     // collide when local [^2] maps to global [^5] while local [^5] exists.
     const replacements: Array<{ from: string; to: string }> = [];
@@ -563,6 +585,11 @@ export async function assembleFinalReport(
     replacements.forEach((r, i) => {
       body = body.split(r.from).join(`\u{E000}CIT${i}\u{E000}`);
     });
+    // Between the two passes every legitimate anchor is a placeholder, so any
+    // [^N] still present is model-hallucinated (never in the offered map).
+    // Strip them — left in place they'd collide with the new global numbering
+    // and point at the wrong bibliography entry.
+    body = body.replace(/\[\^\d+\]/g, '');
     replacements.forEach((r, i) => {
       body = body.split(`\u{E000}CIT${i}\u{E000}`).join(r.to);
     });
@@ -582,16 +609,25 @@ export async function assembleFinalReport(
     .join('\n\n');
 
   // Bibliography in global numeric order — bibliography[N-1] ⇔ [^N].
+  // Provenance (audit m3): fill provider/title/author from the search phase's
+  // sourceMeta instead of hardcoding placeholders. Unknown providers fall back
+  // to 'crawl4ai' (the fetch backbone) so the ProviderName enum still holds.
   const bibliography = Array.from(urlToGlobal.entries())
     .sort((a, b) => a[1] - b[1])
-    .map(([sourceUrl, num]) => ({
-      citation_anchor: `[^${num}]`,
-      source_url: sourceUrl,
-      title: '',
-      author: '',
-      provider: 'crawl4ai' as ProviderName,
-      published_at: undefined as string | undefined,
-    }));
+    .map(([sourceUrl, num]) => {
+      const meta = sourceMeta !== undefined ? sourceMeta[sourceUrl] : undefined;
+      const providerParse = ProviderNameSchema.safeParse(
+        meta !== undefined && meta.provider !== undefined ? meta.provider : '',
+      );
+      return {
+        citation_anchor: `[^${num}]`,
+        source_url: sourceUrl,
+        title: meta !== undefined && meta.title !== undefined ? meta.title : '',
+        author: meta !== undefined && meta.author !== undefined ? meta.author : '',
+        provider: providerParse.success ? providerParse.data : ('crawl4ai' as ProviderName),
+        published_at: meta !== undefined ? meta.published_at : undefined,
+      };
+    });
 
   // Generate title + executive summary via Claude
   const totalWords = sections.reduce((sum, s) => sum + s.word_count, 0);
@@ -660,11 +696,14 @@ export async function assembleFinalReport(
           .join('\n')
       : '');
 
+  // Audit M4: return the RENUMBERED sections — returning the originals gave
+  // indexSink/RAG consumers section-local [^1] anchors that collide across
+  // sections and disagree with the global bibliography.
   const report = FinalReportSchema.parse({
     title,
     executive_summary: executiveSummary,
     full_markdown: fullMarkdown,
-    sections,
+    sections: renumberedSections,
     bibliography,
     gaps,
     word_count: countWords(fullMarkdown),

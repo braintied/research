@@ -30,6 +30,9 @@ const VoyageRerankResultSchema = z.object({
 
 const VoyageRerankResponseSchema = z.object({
   data: z.array(VoyageRerankResultSchema),
+  usage: z.object({
+    total_tokens: z.number().int().nonnegative().default(0),
+  }).optional(),
 });
 
 type VoyageRerankResponse = z.infer<typeof VoyageRerankResponseSchema>;
@@ -58,6 +61,8 @@ export interface RerankQuotesInput {
 export interface RerankQuotesResult {
   quotes: VerbatimQuote[];
   rerank_used: boolean;
+  /** Actual Voyage token usage when the API reported it (0 on fallback). */
+  total_tokens?: number;
 }
 
 export async function rerankQuotes(input: RerankQuotesInput): Promise<RerankQuotesResult> {
@@ -147,7 +152,11 @@ export async function rerankQuotes(input: RerankQuotesInput): Promise<RerankQuot
       '[deep-research/rerank] Rerank complete',
     );
 
-    return { quotes: reranked, rerank_used: true };
+    return {
+      quotes: reranked,
+      rerank_used: true,
+      total_tokens: json.usage !== undefined ? json.usage.total_tokens : undefined,
+    };
   } catch (err: unknown) {
     const reason = err instanceof Error ? err.message : String(err);
     emitGaugeFireAndForget('deep_research.rerank.fallback', {

@@ -150,6 +150,15 @@ export const ExtractedQuotesSchema = z.object({
   dates_mentioned: z.array(z.string()).default([]),
   entities_mentioned: z.array(z.string()).default([]),
   themes: z.array(z.string()).default([]),
+  /**
+   * Model token usage for this extraction call, when the extractor reports
+   * it (Gemini extractor does; provider-native extract() implementations may
+   * omit). Feeds CostTracker so extraction spend is capped + attributed.
+   */
+  usage: z.object({
+    prompt_tokens: z.number().int().nonnegative(),
+    candidate_tokens: z.number().int().nonnegative(),
+  }).optional(),
 });
 
 export type ExtractedQuotes = z.infer<typeof ExtractedQuotesSchema>;

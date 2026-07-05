@@ -15,7 +15,12 @@
  */
 
 import { runDeepResearch } from './index.js';
-import type { RunDeepResearchInput, IndexSink } from './index.js';
+import type {
+  RunDeepResearchInput,
+  IndexSink,
+  OnPipelineUsage,
+  ResearchCacheAdapter,
+} from './index.js';
 import { runManagedResearch } from './managed-research.js';
 import type { ResearchDepth } from './depth-config.js';
 import type { Logger } from './logger.js';
@@ -107,6 +112,12 @@ export interface RunResearchInput {
   maxCostUsd?: number;
   /** Optional sink for report chunks (pipeline kinds only). */
   indexSink?: IndexSink;
+  /** Per-stage usage events for attribution (pipeline kinds only). */
+  onUsage?: OnPipelineUsage;
+  /** Optional source cache (pipeline kinds only). */
+  cache?: ResearchCacheAdapter;
+  /** Free-first tier threshold override (pipeline kinds only). */
+  minFreeResults?: number;
   logger?: Logger;
 }
 
@@ -152,6 +163,9 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
     logger: input.logger,
     indexSink: input.indexSink,
     providers: preset.providers,
+    onUsage: input.onUsage,
+    cache: input.cache,
+    minFreeResults: input.minFreeResults,
   };
 
   const result = await runDeepResearch(pipelineInput);

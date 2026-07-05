@@ -17,10 +17,20 @@ async function main(): Promise<void> {
   console.log('[smoke] Enabled providers:', enabled.join(', '));
 
   const started = Date.now();
+  const usageByCategory: Record<string, { events: number; costUsd: number }> = {};
   const research = await runResearch({
     brief: 'What are the leading open-source web crawling tools for LLM/RAG pipelines in 2026, and how do Crawl4AI and Firecrawl compare on cost and capability?',
     kind: 'quick',
+    onUsage: (e) => {
+      const bucket = usageByCategory[e.category] !== undefined
+        ? usageByCategory[e.category]
+        : (usageByCategory[e.category] = { events: 0, costUsd: 0 });
+      bucket.events++;
+      bucket.costUsd += e.costUsd;
+    },
   });
+  console.log('[smoke] Pipeline usage by category:',
+    Object.fromEntries(Object.entries(usageByCategory).map(([k, v]) => [k, `${v.events}ev $${v.costUsd.toFixed(4)}`])));
 
   console.log('[smoke] Research complete', {
     engine: research.engine,

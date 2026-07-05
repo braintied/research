@@ -18,6 +18,7 @@ import {
 import type {
   Subquery,
   SearchResult,
+  SearchProvider,
   ExtractedQuotes,
   VerbatimQuote,
   ProviderName,
@@ -28,6 +29,11 @@ import type {
 import { DEPTH_CONFIG, getModelPricing } from './depth-config.js';
 import type { ResearchDepth } from './depth-config.js';
 import { CostTracker } from './cost-tracker.js';
+import {
+  EXTRACTION_MODEL,
+  GEMINI_MAX_CONTENT_CHARS,
+  CHARS_PER_TOKEN,
+} from './pipeline-core.js';
 import { planSubqueries } from './planner.js';
 import {
   getEnabledProviders,
@@ -122,6 +128,15 @@ export { parseMarkdownReport } from './parse-markdown-report.js';
 // Knowledge-ingestion core (continuous internet-knowledge ingestion).
 export * from './ingestion/index.js';
 
+// Standalone scrape primitives — the Crawl4AI → Jina Reader → direct-fetch
+// chain, usable outside the research pipeline (e.g. Sentigen WebResearch).
+export {
+  crawlUrl,
+  crawlWithCrawl4AI,
+  jinaReaderFetch,
+  directFetchAsText,
+} from './pipeline-core.js';
+
 // Research kinds — semantic presets (quick/standard/deep/managed/social).
 export {
   RESEARCH_KINDS,
@@ -151,6 +166,87 @@ const RERANK_TOP_K = 40;
 // =============================================================================
 
 export type IndexSink = (chunks: ReportChunkInput[]) => Promise<void>;
+
+/**
+ * Per-stage usage event for pipeline runs (audit M3) — fired every time the
+ * CostTracker records an entry, so consumers with their own attribution
+ * ledgers (Sentigen admin_ai_usage_log, cortex gauge_events) see EVERY spend:
+ * search, fetch, extract, rerank/embed, synth, critique, plan, assembly.
+ */
+export interface PipelineUsageEvent {
+  provider: string;
+  category: 'search' | 'fetch' | 'extract' | 'embed' | 'synth' | 'critique' | 'plan' | 'transcribe';
+  model?: string;
+  units: number;
+  costUsd: number;
+  metadata: Record<string, unknown>;
+}
+
+export type OnPipelineUsage = (event: PipelineUsageEvent) => void | Promise<void>;
+
+/** CostTracker that also notifies an OnPipelineUsage listener per entry. */
+class NotifyingCostTracker extends CostTracker {
+  constructor(
+    capUsd: number,
+    private readonly listener: OnPipelineUsage | undefined,
+    private readonly log: Logger,
+  ) {
+    super(capUsd);
+  }
+
+  override record(entry: Parameters<CostTracker['record']>[0]): void {
+    super.record(entry);
+    if (this.listener !== undefined) {
+      const modelRaw = entry.metadata['model'];
+      const event: PipelineUsageEvent = {
+        provider: entry.provider,
+        category: entry.category,
+        model: typeof modelRaw === 'string' ? modelRaw : undefined,
+        units: entry.units,
+        costUsd: entry.units * entry.unit_cost_usd,
+        metadata: entry.metadata,
+      };
+      Promise.resolve(this.listener(event)).catch((err: unknown) => {
+        this.log.warn(
+          { error: err instanceof Error ? err.message.slice(0, 120) : String(err) },
+          '[runDeepResearch] onUsage listener failed (non-fatal)',
+        );
+      });
+    }
+  }
+
+  override recordMany(entries: Parameters<CostTracker['record']>[0][]): void {
+    for (const e of entries) this.record(e);
+  }
+}
+
+// Per-call search cost estimates (USD) — audit M2. Free providers are $0;
+// paid providers use list-price estimates so the cap sees search spend.
+const SEARCH_COST_PER_CALL_USD: Partial<Record<ProviderName, number>> = {
+  tavily: 0.008,
+  exa: 0.007,
+  serpapi: 0.015,
+  serper: 0.001,
+  perplexity: 0.005,
+  podcasts: 0.002,
+};
+
+// Gemini flash-lite extraction pricing (USD per 1M tokens).
+const EXTRACTION_INPUT_USD_PER_M = 0.10;
+const EXTRACTION_OUTPUT_USD_PER_M = 0.40;
+// Voyage rerank-2 (USD per 1M tokens).
+const VOYAGE_RERANK_USD_PER_M = 0.05;
+
+/**
+ * Free-first tiering (audit M5): among GENERAL web-search providers, the $0/
+ * free-quota tier runs first; paid general providers only fire when the free
+ * tier returned fewer than `minFreeResults` unique results for the subquery.
+ * Specialist providers (reddit/youtube/hn/rss/social) always run as routed —
+ * the planner picked them deliberately for source-type coverage.
+ */
+const GENERAL_FREE_SEARCH: ReadonlySet<ProviderName> = new Set(['searxng', 'serper']);
+const GENERAL_PAID_SEARCH: ReadonlySet<ProviderName> = new Set(['tavily', 'exa', 'serpapi', 'perplexity']);
+const DEFAULT_MIN_FREE_RESULTS = 5;
 
 /**
  * Pluggable source cache — modeled on ora-ai's `research_source_cache` table
@@ -229,6 +325,17 @@ export interface RunDeepResearchInput {
   providers?: ProviderName[];
   /** Optional source cache (search results + fetched markdown). */
   cache?: ResearchCacheAdapter;
+  /**
+   * Fired for every recorded cost entry (search, extract, rerank, synth,
+   * critique, assembly) — wire to your attribution ledger. Errors swallowed.
+   */
+  onUsage?: OnPipelineUsage;
+  /**
+   * Free-first tier threshold: paid general-search providers only fire for a
+   * subquery when the free tier returned fewer unique results than this.
+   * Default 5. Set 0 to always fan out to paid providers (legacy behavior).
+   */
+  minFreeResults?: number;
 }
 
 export interface RunDeepResearchResult {
@@ -253,7 +360,8 @@ export async function runDeepResearch(
   const depth: ResearchDepth = input.depth !== undefined ? input.depth : 'standard';
   const depthConfig = DEPTH_CONFIG[depth];
   const capUsd: number = input.maxCostUsd !== undefined ? input.maxCostUsd : depthConfig.hardCapUsd;
-  const costTracker = new CostTracker(capUsd);
+  const costTracker: CostTracker = new NotifyingCostTracker(capUsd, input.onUsage, log);
+  const minFreeResults = input.minFreeResults !== undefined ? input.minFreeResults : DEFAULT_MIN_FREE_RESULTS;
 
   const targetWordCount = {
     min: depthConfig.targetWordCountMin,
@@ -314,7 +422,28 @@ export async function runDeepResearch(
   // ---------------------------------------------------------------------------
   // Step 2: search (route providers per subquery, run in parallel, dedup)
   // ---------------------------------------------------------------------------
-  const allSearchResults = await runSearch(subqueries, enabledProviders, log, input.cache);
+  const allSearchResults = await runSearch(
+    subqueries, enabledProviders, costTracker, log, input.cache, minFreeResults,
+  );
+
+  // Provenance map for the bibliography (audit m3) — accumulated across the
+  // initial search and every critique-loop refinement search.
+  const sourceMetaByUrl: Record<string, {
+    provider?: string; title?: string; author?: string; published_at?: string;
+  }> = {};
+  const recordSourceMeta = (results: SearchResult[]): void => {
+    for (const r of results) {
+      if (sourceMetaByUrl[r.url] === undefined) {
+        sourceMetaByUrl[r.url] = {
+          provider: r.provider,
+          title: r.title,
+          author: r.author,
+          published_at: r.published_at,
+        };
+      }
+    }
+  };
+  recordSourceMeta(allSearchResults);
 
   // Depth-aware fetch cap with global ceiling.
   const naturalCap = subqueries.length * depthConfig.urlsPerSubquery;
@@ -335,6 +464,7 @@ export async function runDeepResearch(
     markdownByUrl,
     enabledProviders,
     depthConfig.urlsPerSubquery,
+    costTracker,
     log,
   );
 
@@ -414,7 +544,10 @@ export async function runDeepResearch(
     subqueries = [...subqueries, ...additionalSubqueries];
 
     // Extra search for the refinement subqueries only.
-    const extraResults = await runSearch(additionalSubqueries, enabledProviders, log, input.cache);
+    const extraResults = await runSearch(
+      additionalSubqueries, enabledProviders, costTracker, log, input.cache, minFreeResults,
+    );
+    recordSourceMeta(extraResults);
     const extraToFetch = extraResults.slice(0, Math.min(extraResults.length, CUMULATIVE_URL_CEILING));
     const extraMarkdown = await fetchContent(extraToFetch, enabledProviders, log, input.cache);
 
@@ -424,6 +557,7 @@ export async function runDeepResearch(
       extraMarkdown,
       enabledProviders,
       depthConfig.urlsPerSubquery,
+      costTracker,
       log,
     );
 
@@ -478,6 +612,7 @@ export async function runDeepResearch(
     promptMd: input.brief,
     sections,
     gaps: finalGaps,
+    sourceMeta: sourceMetaByUrl,
   });
   recordSynthCost(costTracker, assembly.model, assembly.inputTokens, assembly.cachedReadTokens, assembly.outputTokens, 'assembly');
   const report = assembly.report;
@@ -551,12 +686,77 @@ type EnabledProviders = ReturnType<typeof getEnabledProviders>;
 
 const CachedSearchResultsSchema = z.array(SearchResultSchema);
 
-/** Route + run searches for a set of subqueries, deduped by canonical URL. */
+/**
+ * Search one provider for one subquery — cache-aware, cost-recorded (audit
+ * M2: only LIVE calls record cost; cache hits are free), never throws.
+ */
+async function searchOneProvider(
+  providerName: ProviderName,
+  provider: SearchProvider,
+  subquery: Subquery,
+  costTracker: CostTracker,
+  log: Logger,
+  cache?: ResearchCacheAdapter,
+): Promise<SearchResult[]> {
+  const cacheKey = `search:${providerName}:${subquery.query}`;
+  const cached = await cacheGet(cache, cacheKey, log);
+  if (cached !== null) {
+    try {
+      const parsed = CachedSearchResultsSchema.safeParse(JSON.parse(cached));
+      if (parsed.success) {
+        return parsed.data;
+      }
+    } catch {
+      // Corrupt cache entry — fall through to a live search.
+    }
+  }
+  try {
+    const results = await provider.search(subquery.query, { limit: SEARCH_RESULT_LIMIT });
+    const perCall = SEARCH_COST_PER_CALL_USD[providerName];
+    if (perCall !== undefined && perCall > 0) {
+      costTracker.record({
+        provider: providerName,
+        category: 'search',
+        units: 1,
+        unit_cost_usd: perCall,
+        metadata: { query: subquery.query.slice(0, 80), results: results.length },
+      });
+    }
+    const ttl = SEARCH_CACHE_TTL_SECONDS[providerName];
+    await cacheSet(
+      cache,
+      cacheKey,
+      JSON.stringify(results),
+      ttl !== undefined ? ttl : DEFAULT_SEARCH_CACHE_TTL_SECONDS,
+      log,
+    );
+    return results;
+  } catch (err: unknown) {
+    log.warn(
+      {
+        providerName,
+        query: subquery.query.slice(0, 60),
+        error: errMsg(err).slice(0, 120),
+      },
+      '[runDeepResearch] Search failed (non-fatal)',
+    );
+    return [];
+  }
+}
+
+/**
+ * Route + run searches for a set of subqueries, deduped by canonical URL.
+ * Free-first tiering (audit M5): free general-search + specialist providers
+ * run first; paid general providers fire only when the first tier returned
+ * fewer than `minFreeResults` unique results for the subquery.
+ */
 async function runSearch(
   subqueries: Subquery[],
   enabledProviders: EnabledProviders,
+  costTracker: CostTracker,
   log: Logger,
   cache?: ResearchCacheAdapter,
+  minFreeResults: number = DEFAULT_MIN_FREE_RESULTS,
 ): Promise<SearchResult[]> {
   const perSubqueryResults = await Promise.all(
     subqueries.map(async (subquery): Promise<SearchResult[]> => {
@@ -565,66 +765,62 @@ async function runSearch(
         providerNames.add(pn);
       }
 
-      const subResults: SearchResult[] = [];
-      const subSeen = new Set<string>();
-
-      const tasks: Array<Promise<SearchResult[]>> = [];
+      interface TierEntry {
+        name: ProviderName;
+        provider: SearchProvider;
+      }
+      const tier1: TierEntry[] = [];
+      const tier2Paid: TierEntry[] = [];
       for (const providerName of providerNames) {
         const provider = enabledProviders[providerName];
-        if (provider === undefined) {
-          continue;
+        if (provider === undefined) continue;
+        if (GENERAL_PAID_SEARCH.has(providerName) && minFreeResults > 0) {
+          tier2Paid.push({ name: providerName, provider });
+        } else {
+          // Free general (searxng/serper) + all specialist providers the
+          // planner routed deliberately.
+          tier1.push({ name: providerName, provider });
         }
-        tasks.push(
-          (async (): Promise<SearchResult[]> => {
-            const cacheKey = `search:${providerName}:${subquery.query}`;
-            const cached = await cacheGet(cache, cacheKey, log);
-            if (cached !== null) {
-              try {
-                const parsed = CachedSearchResultsSchema.safeParse(JSON.parse(cached));
-                if (parsed.success) {
-                  return parsed.data;
-                }
-              } catch {
-                // Corrupt cache entry — fall through to a live search.
-              }
-            }
-            try {
-              const results = await provider.search(subquery.query, { limit: SEARCH_RESULT_LIMIT });
-              const ttl = SEARCH_CACHE_TTL_SECONDS[providerName];
-              await cacheSet(
-                cache,
-                cacheKey,
-                JSON.stringify(results),
-                ttl !== undefined ? ttl : DEFAULT_SEARCH_CACHE_TTL_SECONDS,
-                log,
-              );
-              return results;
-            } catch (err: unknown) {
-              log.warn(
-                {
-                  providerName,
-                  query: subquery.query.slice(0, 60),
-                  error: errMsg(err).slice(0, 120),
-                },
-                '[runDeepResearch] Search failed (non-fatal)',
-              );
-              return [];
-            }
-          })(),
-        );
       }
 
-      const chunkResults = await Promise.all(tasks);
-      for (const resultSet of chunkResults) {
-        for (const result of resultSet) {
-          const canonical = canonicalizeUrl(result.url);
-          const hash = hashUrl(canonical);
-          if (!subSeen.has(hash)) {
-            subSeen.add(hash);
-            subResults.push({ ...result, url: canonical });
+      const subResults: SearchResult[] = [];
+      const subSeen = new Set<string>();
+      const collect = (resultSets: SearchResult[][]): void => {
+        for (const resultSet of resultSets) {
+          for (const result of resultSet) {
+            const canonical = canonicalizeUrl(result.url);
+            const hash = hashUrl(canonical);
+            if (!subSeen.has(hash)) {
+              subSeen.add(hash);
+              subResults.push({ ...result, url: canonical });
+            }
           }
         }
+      };
+
+      collect(await Promise.all(
+        tier1.map((entry) =>
+          searchOneProvider(entry.name, entry.provider, subquery, costTracker, log, cache),
+        ),
+      ));
+
+      // Paid tier only when free coverage is thin (or tiering disabled).
+      if (tier2Paid.length > 0 && subResults.length < minFreeResults) {
+        log.info(
+          {
+            query: subquery.query.slice(0, 60),
+            freeResults: subResults.length,
+            paid: tier2Paid.map((e) => e.name),
+          },
+          '[runDeepResearch] Free tier thin — falling through to paid providers',
+        );
+        collect(await Promise.all(
+          tier2Paid.map((entry) =>
+            searchOneProvider(entry.name, entry.provider, subquery, costTracker, log, cache),
+          ),
+        ));
       }
+
       return subResults;
     }),
   );
@@ -708,6 +904,7 @@ async function extractQuotes(
   markdownByUrl: Record<string, string>,
   enabledProviders: EnabledProviders,
   urlsPerSubquery: number,
+  costTracker: CostTracker,
   log: Logger,
 ): Promise<ExtractionMaps> {
   // Map each subquery's section to the URLs it should draw from.
@@ -770,6 +967,35 @@ async function extractQuotes(
           url: result.url,
           content: markdown,
           mode: extractionModeFor(providerName),
+        });
+      }
+
+      // Extraction cost (audit M2) — real Gemini tokens when the extractor
+      // reported them, else a conservative estimate from content length so
+      // the cap still sees extraction spend from provider-native extractors.
+      if (extracted.usage !== undefined) {
+        costTracker.record({
+          provider: 'google',
+          category: 'extract',
+          units: extracted.usage.prompt_tokens,
+          unit_cost_usd: EXTRACTION_INPUT_USD_PER_M / 1_000_000,
+          metadata: { model: EXTRACTION_MODEL, operation: 'extract-input', url: result.url.slice(0, 80) },
+        });
+        costTracker.record({
+          provider: 'google',
+          category: 'extract',
+          units: extracted.usage.candidate_tokens,
+          unit_cost_usd: EXTRACTION_OUTPUT_USD_PER_M / 1_000_000,
+          metadata: { model: EXTRACTION_MODEL, operation: 'extract-output', url: result.url.slice(0, 80) },
+        });
+      } else {
+        const estimatedInputTokens = Math.ceil(Math.min(markdown.length, GEMINI_MAX_CONTENT_CHARS) / CHARS_PER_TOKEN);
+        costTracker.record({
+          provider: 'google',
+          category: 'extract',
+          units: estimatedInputTokens,
+          unit_cost_usd: EXTRACTION_INPUT_USD_PER_M / 1_000_000,
+          metadata: { model: EXTRACTION_MODEL, operation: 'extract-input-estimated', url: result.url.slice(0, 80) },
         });
       }
 
@@ -848,7 +1074,11 @@ async function synthesizeSections(
   });
 
   // Rerank each section's quote pool against the section goal.
+  // Cost (audit M2): use Voyage's REAL total_tokens when the API reports it;
+  // fall back to the legacy ~650 tokens/section estimate on fallback paths.
   const rerankedQuotesByPath: Record<string, VerbatimQuote[]> = {};
+  let rerankActualTokens = 0;
+  let rerankEstimatedSections = 0;
   for (const spec of sectionsToWrite) {
     const raw = quotesBySection[spec.section_path];
     if (raw === undefined || raw.length === 0) {
@@ -857,16 +1087,28 @@ async function synthesizeSections(
     }
     const rerankResult = await rerankQuotes({ query: spec.goal, quotes: raw, topK: RERANK_TOP_K });
     rerankedQuotesByPath[spec.section_path] = rerankResult.quotes;
+    if (rerankResult.total_tokens !== undefined && rerankResult.total_tokens > 0) {
+      rerankActualTokens += rerankResult.total_tokens;
+    } else if (rerankResult.rerank_used) {
+      rerankEstimatedSections++;
+    }
   }
 
-  // Voyage rerank-2 cost (matches runner's estimate: ~650 tokens/section @ $0.05/M).
-  costTracker.record({
-    provider: 'voyage',
-    category: 'embed',
-    units: sectionsToWrite.length * 650,
-    unit_cost_usd: 0.05 / 1_000_000,
-    metadata: { operation: 'rerank-2', sections: sectionsToWrite.length },
-  });
+  const rerankUnits = rerankActualTokens + rerankEstimatedSections * 650;
+  if (rerankUnits > 0) {
+    costTracker.record({
+      provider: 'voyage',
+      category: 'embed',
+      units: rerankUnits,
+      unit_cost_usd: VOYAGE_RERANK_USD_PER_M / 1_000_000,
+      metadata: {
+        operation: 'rerank-2',
+        sections: sectionsToWrite.length,
+        actual_tokens: rerankActualTokens,
+        estimated_sections: rerankEstimatedSections,
+      },
+    });
+  }
 
   const synthesized = await synthesizeAllSections({
     sectionsToWrite,

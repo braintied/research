@@ -33,6 +33,11 @@ export interface GroundingResult {
   total_citations: number;
   valid_citations: number;
   hallucinated: HallucinatedCitation[];
+  /**
+   * 'ungrounded' — the report contains ZERO citation markers (worst case, not
+   * best: ratio is forced to 0, not 1). 'validated' — markers were checked.
+   */
+  status: 'validated' | 'ungrounded';
 }
 
 export interface ValidateGroundingInput {
@@ -77,6 +82,9 @@ function extractCitationWindows(
 function buildTrigrams(text: string): string[] {
   const words = text
     .toLowerCase()
+    // Citation markers are markup, not content — stripped whole so their
+    // digits don't pollute trigrams in citation-dense windows.
+    .replace(/\[\^\d+\]/g, ' ')
     .replace(/[^a-z0-9\s]/g, ' ')
     .trim()
     .split(/\s+/)
@@ -102,16 +110,32 @@ function buildTrigrams(text: string): string[] {
 /**
  * Check if ≥60% of the claim trigrams appear in the chunk content.
  */
+/**
+ * Normalize text for trigram substring matching — same transform as
+ * buildTrigrams' word stream. Both sides MUST be normalized identically:
+ * matching normalized word-trigrams against RAW text (the original
+ * behavior) silently fails on any trigram straddling punctuation or a
+ * citation marker, structurally deflating every ratio.
+ */
+function normalizeForMatch(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/\[\^\d+\]/g, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function directionalTrigramRatio(needleText: string, haystackText: string): number {
   const needleTrigrams = buildTrigrams(needleText);
   if (needleTrigrams.length === 0) {
     return 0;
   }
 
-  const haystackLower = haystackText.toLowerCase();
+  const haystackNormalized = normalizeForMatch(haystackText);
   let matched = 0;
   for (const trigram of needleTrigrams) {
-    if (haystackLower.includes(trigram)) {
+    if (haystackNormalized.includes(trigram)) {
       matched++;
     }
   }
@@ -148,11 +172,15 @@ export function validateGrounding(input: ValidateGroundingInput): GroundingResul
   const citationWindows = extractCitationWindows(fullMarkdown);
 
   if (citationWindows.length === 0) {
+    // Zero citations is the WORST outcome for a research report, not a pass —
+    // an entirely uncited report must never score better than a partially
+    // grounded one. (Previously returned ratio 1.)
     return {
-      ratio: 1,
+      ratio: 0,
       total_citations: 0,
       valid_citations: 0,
       hallucinated: [],
+      status: 'ungrounded',
     };
   }
 
@@ -229,12 +257,13 @@ export function validateGrounding(input: ValidateGroundingInput): GroundingResul
   }
 
   const totalCitations = uniqueWindows.length;
-  const ratio = totalCitations > 0 ? validCount / totalCitations : 1;
+  const ratio = totalCitations > 0 ? validCount / totalCitations : 0;
 
   return {
     ratio,
     total_citations: totalCitations,
     valid_citations: validCount,
     hallucinated,
+    status: 'validated',
   };
 }

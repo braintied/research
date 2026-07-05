@@ -33,6 +33,10 @@ const GeminiResponseEnvelopeSchema = z.object({
       })),
     }),
   })),
+  usageMetadata: z.object({
+    promptTokenCount: z.number().int().nonnegative().default(0),
+    candidatesTokenCount: z.number().int().nonnegative().default(0),
+  }).optional(),
 });
 
 // =============================================================================
@@ -278,10 +282,18 @@ export async function extractQuotesWithGemini(input: GeminiExtractInput): Promis
     return buildEmptyResult(input);
   }
 
+  const usageMeta = envelopeResult.data.usageMetadata;
+
   // Build and Zod-validate the final ExtractedQuotes
   const assembled = {
     source_url: input.url,
     source_provider: input.provider,
+    usage: usageMeta !== undefined
+      ? {
+          prompt_tokens: usageMeta.promptTokenCount,
+          candidate_tokens: usageMeta.candidatesTokenCount,
+        }
+      : undefined,
     key_claims: rawResult.data.key_claims,
     verbatim_quotes: rawResult.data.verbatim_quotes.map(q => ({
       quote: q.quote,
