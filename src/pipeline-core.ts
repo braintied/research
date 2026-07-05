@@ -220,12 +220,24 @@ export async function crawlWithCrawl4AI(url: string): Promise<string | null> {
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        // IMPORTANT: use the TYPED config shape (`browser_config`/`crawler_config`
+        // with `{type, params}`). The legacy FLAT `crawler_params` shape is
+        // silently IGNORED by the Crawl4AI 0.8.x server — wait/delay never
+        // apply, so JS-rendered SPAs come back empty (verified in Sentigen
+        // 2026-06-20: flat → 1 char, typed → 5,898 chars on the same URL).
         body: JSON.stringify({
           urls: [url],
-          crawler_params: {
-            wait_until: 'domcontentloaded',
-            delay_before_return_html: 3,
-            page_timeout: 60000,
+          browser_config: {
+            type: 'BrowserConfig',
+            params: { headless: true, java_script_enabled: true },
+          },
+          crawler_config: {
+            type: 'CrawlerRunConfig',
+            params: {
+              wait_until: 'domcontentloaded',
+              delay_before_return_html: 3,
+              page_timeout: 60000,
+            },
           },
         }),
         signal: AbortSignal.timeout(70000),
