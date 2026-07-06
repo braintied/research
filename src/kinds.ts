@@ -25,6 +25,7 @@ import { runManagedResearch } from './managed-research.js';
 import type { ResearchDepth } from './depth-config.js';
 import type { Logger } from './logger.js';
 import type { FinalReport, ProviderName, VerbatimQuote } from './types.js';
+import type { GroundingResult } from './grounding.js';
 
 // =============================================================================
 // Kind definitions
@@ -128,6 +129,11 @@ export interface KindResearchResult {
   /** Verbatim evidence pool — empty for managed runs (no quote extraction). */
   quotes: VerbatimQuote[];
   costUsd: number;
+  /**
+   * Faithfulness verdict (audit F2) — null for managed runs, whose provider
+   * does its own citation pipeline and exposes no quote-level evidence.
+   */
+  grounding: GroundingResult | null;
 }
 
 /**
@@ -149,6 +155,7 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
       report: managed.report,
       quotes: [],
       costUsd: managed.costUsd,
+      grounding: null,
     };
   }
 
@@ -175,5 +182,6 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
     report: result.report,
     quotes: result.quotes,
     costUsd: result.costUsd,
+    grounding: result.grounding,
   };
 }

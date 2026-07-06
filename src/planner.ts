@@ -109,13 +109,24 @@ const GeminiResponseSchema = z.object({
       }),
     }),
   ),
+  usageMetadata: z.object({
+    promptTokenCount: z.number().int().nonnegative().default(0),
+    candidatesTokenCount: z.number().int().nonnegative().default(0),
+  }).optional(),
 });
+
+/** Token usage reported for one planner LLM call (audit F8). */
+export interface PlannerUsage {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+}
 
 // =============================================================================
 // Gemini call helper
 // =============================================================================
 
-async function callGemini(userMessage: string, systemPrompt: string): Promise<string> {
+async function callGemini(userMessage: string, systemPrompt: string): Promise<{ text: string; usage: PlannerUsage }> {
   const key = getGeminiKey();
   const url = `${GEMINI_API_BASE}/${EXTRACTION_MODEL}:generateContent?key=${key}`;
 
@@ -151,14 +162,22 @@ async function callGemini(userMessage: string, systemPrompt: string): Promise<st
     throw new Error('Gemini returned empty content parts');
   }
 
-  return firstPart.text;
+  const usageMeta = parsed.usageMetadata;
+  return {
+    text: firstPart.text,
+    usage: {
+      model: EXTRACTION_MODEL,
+      inputTokens: usageMeta !== undefined ? usageMeta.promptTokenCount : 0,
+      outputTokens: usageMeta !== undefined ? usageMeta.candidatesTokenCount : 0,
+    },
+  };
 }
 
 // =============================================================================
 // Claude fallback call helper
 // =============================================================================
 
-async function callClaude(userMessage: string, systemPrompt: string): Promise<string> {
+async function callClaude(userMessage: string, systemPrompt: string): Promise<{ text: string; usage: PlannerUsage }> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (apiKey === undefined || apiKey === '') {
     throw new Error('ANTHROPIC_API_KEY environment variable is not configured');
@@ -180,7 +199,14 @@ async function callClaude(userMessage: string, systemPrompt: string): Promise<st
     }
   }
 
-  return text;
+  return {
+    text,
+    usage: {
+      model: 'claude-sonnet-4-6',
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+    },
+  };
 }
 
 // =============================================================================
@@ -217,10 +243,17 @@ export interface PlanSubqueriesInput {
    * to the full legacy list when omitted.
    */
   availableProviders?: string[];
+  /**
+   * Reports token usage for every planner LLM call — including failed
+   * attempts, which still bill (audit F8: the 'plan' cost category was dead
+   * code; planner spend never hit the cap). Errors are the caller's problem;
+   * the sink itself must not throw.
+   */
+  usageSink?: (usage: PlannerUsage) => void;
 }
 
 export async function planSubqueries(input: PlanSubqueriesInput): Promise<Subquery[]> {
-  const { promptMd, targetWordCount, refinementHint } = input;
+  const { promptMd, targetWordCount, refinementHint, usageSink } = input;
   const subqueriesMin = input.subqueriesMin ?? 15;
   const subqueriesMax = input.subqueriesMax ?? 35;
   const availableProviders =
@@ -235,11 +268,23 @@ export async function planSubqueries(input: PlanSubqueriesInput): Promise<Subque
     userMessage += `\n\nFocus the new subqueries on these gaps: ${refinementHint}`;
   }
 
+  const reportUsage = (usage: PlannerUsage): void => {
+    if (usageSink !== undefined) {
+      try {
+        usageSink(usage);
+      } catch {
+        // Usage reporting must never break planning.
+      }
+    }
+  };
+
   // Try Gemini up to PLANNER_MAX_RETRIES times
   let geminiText: string | null = null;
   for (let attempt = 0; attempt < PLANNER_MAX_RETRIES; attempt++) {
     try {
-      geminiText = await callGemini(userMessage, systemPrompt);
+      const geminiResult = await callGemini(userMessage, systemPrompt);
+      reportUsage(geminiResult.usage);
+      geminiText = geminiResult.text;
       const jsonStr = extractJson(geminiText);
       const parsed = PlannerOutputSchema.parse(JSON.parse(jsonStr));
       logger.info(
@@ -258,8 +303,9 @@ export async function planSubqueries(input: PlanSubqueriesInput): Promise<Subque
   // Fallback: Claude Sonnet 4.6
   logger.info('[planner] Falling back to Claude for subquery planning');
   try {
-    const claudeText = await callClaude(userMessage, systemPrompt);
-    const jsonStr = extractJson(claudeText);
+    const claudeResult = await callClaude(userMessage, systemPrompt);
+    reportUsage(claudeResult.usage);
+    const jsonStr = extractJson(claudeResult.text);
     const parsed = PlannerOutputSchema.parse(JSON.parse(jsonStr));
     logger.info(
       { count: parsed.subqueries.length, subqueriesMin, subqueriesMax },

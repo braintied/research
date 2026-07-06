@@ -35,6 +35,7 @@ import {
   CHARS_PER_TOKEN,
 } from './pipeline-core.js';
 import { planSubqueries } from './planner.js';
+import type { PlannerUsage } from './planner.js';
 import {
   getEnabledProviders,
   routeProvidersForSourceTypes,
@@ -49,6 +50,7 @@ import type { SectionSpec } from './synthesis.js';
 import { critiqueDraft } from './critique.js';
 import { buildReportChunks } from './chunker.js';
 import { validateGrounding } from './grounding.js';
+import type { GroundingResult } from './grounding.js';
 import { logger as defaultLogger } from './logger.js';
 import type { Logger } from './logger.js';
 
@@ -73,6 +75,7 @@ export type { Logger } from './logger.js';
 
 // Stage-level building blocks (so consumers can compose their own pipelines)
 export { planSubqueries, summarizePromptBrief } from './planner.js';
+export type { PlanSubqueriesInput, PlannerUsage } from './planner.js';
 export {
   getAllProviders,
   getEnabledProviders,
@@ -342,6 +345,13 @@ export interface RunDeepResearchResult {
   report: FinalReport;
   quotes: VerbatimQuote[];
   costUsd: number;
+  /**
+   * Faithfulness verdict for the assembled report (audit F2: this was
+   * computed and then discarded — callers could never see, gate on, or
+   * surface it). Diagnostic: the pipeline never aborts on a low ratio; the
+   * CALLER decides whether to flag, retry, or reject.
+   */
+  grounding: GroundingResult;
 }
 
 /**
@@ -404,6 +414,32 @@ export async function runDeepResearch(
   }
   const availableProviderNames = Object.keys(enabledProviders);
 
+  // Planner spend → CostTracker 'plan' category (audit F8: previously never
+  // recorded, so the hard cap under-counted by every plan + re-plan call).
+  const plannerUsageSink = (usage: PlannerUsage): void => {
+    const isGemini = usage.model.startsWith('gemini-');
+    const pricing = isGemini
+      ? { inputUsdPerM: EXTRACTION_INPUT_USD_PER_M, outputUsdPerM: EXTRACTION_OUTPUT_USD_PER_M, provider: 'google' }
+      : (() => {
+          const p = getModelPricing(usage.model);
+          return { inputUsdPerM: p.inputUsdPerM, outputUsdPerM: p.outputUsdPerM, provider: p.provider };
+        })();
+    costTracker.record({
+      provider: pricing.provider,
+      category: 'plan',
+      units: usage.inputTokens,
+      unit_cost_usd: pricing.inputUsdPerM / 1_000_000,
+      metadata: { model: usage.model, operation: 'plan-input' },
+    });
+    costTracker.record({
+      provider: pricing.provider,
+      category: 'plan',
+      units: usage.outputTokens,
+      unit_cost_usd: pricing.outputUsdPerM / 1_000_000,
+      metadata: { model: usage.model, operation: 'plan-output' },
+    });
+  };
+
   // ---------------------------------------------------------------------------
   // Step 1: plan subqueries (restricted to providers enabled for this run)
   // ---------------------------------------------------------------------------
@@ -413,6 +449,7 @@ export async function runDeepResearch(
     subqueriesMin: depthConfig.subqueriesMin,
     subqueriesMax: depthConfig.subqueriesMax,
     availableProviders: availableProviderNames,
+    usageSink: plannerUsageSink,
   });
 
   if (subqueries.length === 0) {
@@ -535,6 +572,7 @@ export async function runDeepResearch(
       subqueriesMin: depthConfig.subqueriesMin,
       subqueriesMax: depthConfig.subqueriesMax,
       availableProviders: availableProviderNames,
+      usageSink: plannerUsageSink,
     });
 
     if (additionalSubqueries.length === 0) {
@@ -675,6 +713,7 @@ export async function runDeepResearch(
     report,
     quotes: allQuotes,
     costUsd: costTracker.total(),
+    grounding,
   };
 }
 
@@ -792,7 +831,10 @@ async function runSearch(
             const hash = hashUrl(canonical);
             if (!subSeen.has(hash)) {
               subSeen.add(hash);
-              subResults.push({ ...result, url: canonical });
+              // Provenance tag (audit F1): this result was retrieved FOR this
+              // subquery's section. Cache entries come back untagged (tags are
+              // per-run); tagging happens here, after retrieval.
+              subResults.push({ ...result, url: canonical, retrieved_for: [subquery.section_path] });
             }
           }
         }
@@ -825,18 +867,26 @@ async function runSearch(
     }),
   );
 
-  // Cross-subquery dedup.
-  const merged: SearchResult[] = [];
-  const seen = new Set<string>();
+  // Cross-subquery dedup — MERGE provenance instead of dropping it (audit
+  // F1): a URL retrieved by several subqueries is evidence for all of their
+  // sections, and the previous blind dedup severed that link entirely.
+  const mergedByHash = new Map<string, SearchResult>();
   for (const subResults of perSubqueryResults) {
     for (const result of subResults) {
       const hash = hashUrl(result.url);
-      if (!seen.has(hash)) {
-        seen.add(hash);
-        merged.push(result);
+      const existing = mergedByHash.get(hash);
+      if (existing === undefined) {
+        mergedByHash.set(hash, result);
+      } else {
+        for (const path of result.retrieved_for) {
+          if (!existing.retrieved_for.includes(path)) {
+            existing.retrieved_for.push(path);
+          }
+        }
       }
     }
   }
+  const merged = Array.from(mergedByHash.values());
   log.info({ total: merged.length }, '[runDeepResearch] Search phase complete');
   return merged;
 }
@@ -907,19 +957,46 @@ async function extractQuotes(
   costTracker: CostTracker,
   log: Logger,
 ): Promise<ExtractionMaps> {
-  // Map each subquery's section to the URLs it should draw from.
+  // Map each section to the URLs its OWN subqueries actually retrieved
+  // (audit F1). The old mapping bucketed by provider identity over the global
+  // deduped list — every same-provider section got identical URLs and later
+  // sections inherited earlier sections' sources. It also overwrote the map
+  // per subquery, so only a section's LAST subquery counted; URLs now merge
+  // across all of a section's subqueries (per-subquery cap preserved).
   const sectionToUrls = new Map<string, string[]>();
   for (const subquery of subqueries) {
     const sectionUrls: string[] = [];
     for (const result of allSearchResults) {
-      if (subquery.providers.includes(result.provider)) {
+      if (result.retrieved_for.includes(subquery.section_path)) {
         sectionUrls.push(result.url);
         if (sectionUrls.length >= urlsPerSubquery) {
           break;
         }
       }
     }
-    sectionToUrls.set(subquery.section_path, sectionUrls);
+    // Legacy fallback for callers composing their own untagged SearchResults
+    // (retrieved_for defaults to []): the old provider heuristic, better than
+    // an evidence-empty section.
+    if (sectionUrls.length === 0) {
+      for (const result of allSearchResults) {
+        if (result.retrieved_for.length === 0 && subquery.providers.includes(result.provider)) {
+          sectionUrls.push(result.url);
+          if (sectionUrls.length >= urlsPerSubquery) {
+            break;
+          }
+        }
+      }
+    }
+    const existing = sectionToUrls.get(subquery.section_path);
+    if (existing === undefined) {
+      sectionToUrls.set(subquery.section_path, sectionUrls);
+    } else {
+      for (const url of sectionUrls) {
+        if (!existing.includes(url)) {
+          existing.push(url);
+        }
+      }
+    }
   }
 
   const quotesBySection: Record<string, VerbatimQuote[]> = {};

@@ -88,6 +88,13 @@ export const SearchResultSchema = z.object({
   snippet: z.string().default(''),                  // search-provider summary
   author: z.string().optional(),                    // u/foo, channel, byline
   published_at: z.string().datetime({ offset: true }).optional(),
+  /**
+   * Section paths of the subqueries that actually RETRIEVED this result
+   * (tagged at search time, merged across subqueries at dedup). Evidence
+   * bucketing uses this — NOT provider identity (audit F1: bucketing by
+   * provider gave every same-provider section identical URLs).
+   */
+  retrieved_for: z.array(z.string()).default([]),
   engagement: z.object({
     upvotes: z.number().optional(),
     comment_count: z.number().optional(),

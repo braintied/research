@@ -32,6 +32,24 @@ async function main(): Promise<void> {
   console.log('[smoke] Pipeline usage by category:',
     Object.fromEntries(Object.entries(usageByCategory).map(([k, v]) => [k, `${v.events}ev $${v.costUsd.toFixed(4)}`])));
 
+  console.log('[smoke] Grounding verdict returned to caller (F2a):', research.grounding === null ? 'NULL' : {
+    status: research.grounding.status,
+    ratio: Number(research.grounding.ratio.toFixed(2)),
+    valid: research.grounding.valid_citations,
+    total: research.grounding.total_citations,
+  });
+  // F1 dispersion check: sections should NOT share identical source sets.
+  const sectionSources = research.report.sections.map((s) => ({
+    path: s.section_path,
+    sources: [...new Set(s.inline_citations.map((ic) => ic.source_url))].sort(),
+  }));
+  const uniqueSets = new Set(sectionSources.map((x) => JSON.stringify(x.sources)));
+  console.log('[smoke] F1 evidence dispersion:', {
+    sections: sectionSources.length,
+    distinctSourceSets: uniqueSets.size,
+    perSection: sectionSources.map((x) => `${x.path}:${x.sources.length}src`).join(' '),
+  });
+
   console.log('[smoke] Research complete', {
     engine: research.engine,
     words: research.report.word_count,

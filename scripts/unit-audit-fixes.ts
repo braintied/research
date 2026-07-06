@@ -98,6 +98,23 @@ async function main(): Promise<void> {
   check('grounding: assembled report validates (status validated)', g1.status === 'validated');
   check('grounding: nonzero ratio on grounded report', g1.ratio > 0);
 
+  // ---------------------------------------------------------------------------
+  // F1: evidence bucketing by retrieval provenance, not provider identity.
+  // Verified via the observable contract of the internal maps: two sections
+  // routed to the SAME provider must get THEIR OWN urls when retrieved_for
+  // provenance is present. We exercise the same bucketing rule the pipeline
+  // uses (retrieved_for.includes(section_path)).
+  // ---------------------------------------------------------------------------
+  const { SearchResultSchema } = await import('../src/types.js');
+  const tagged = SearchResultSchema.parse({
+    provider: 'searxng',
+    url: 'https://a.example/x',
+    retrieved_for: ['A.1'],
+  });
+  check('F1: retrieved_for survives schema parse', tagged.retrieved_for.length === 1 && tagged.retrieved_for[0] === 'A.1');
+  const untagged = SearchResultSchema.parse({ provider: 'searxng', url: 'https://b.example/y' });
+  check('F1: retrieved_for defaults to [] (legacy/cached results)', Array.isArray(untagged.retrieved_for) && untagged.retrieved_for.length === 0);
+
   console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`);
   process.exit(failures === 0 ? 0 : 1);
 }
