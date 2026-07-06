@@ -1,0 +1,72 @@
+{
+  "generatedAt": "2026-07-06T07:57:26.054Z",
+  "brief": "tech-01-crawlers",
+  "results": [
+    {
+      "band": "4x8",
+      "min": 4,
+      "max": 8,
+      "ok": true,
+      "error": null,
+      "latencyMs": 394170,
+      "costUsd": 0.3361,
+      "metrics": {
+        "wordCount": 1492,
+        "bibliographyCount": 18,
+        "inlineAnchorCount": 66,
+        "citationDensityPer1k": 44.24,
+        "distinctSourceDomains": 15,
+        "distinctProviders": 3,
+        "sectionCount": 6,
+        "sectionSourceDispersion": 1,
+        "uncitedSectionCount": 0,
+        "groundingRatio": 0.222,
+        "groundingStatus": "validated"
+      }
+    },
+    {
+      "band": "8x16",
+      "min": 8,
+      "max": 16,
+      "ok": true,
+      "error": null,
+      "latencyMs": 160952,
+      "costUsd": 0.0971,
+      "metrics": {
+        "wordCount": 1248,
+        "bibliographyCount": 12,
+        "inlineAnchorCount": 44,
+        "citationDensityPer1k": 35.26,
+        "distinctSourceDomains": 12,
+        "distinctProviders": 2,
+        "sectionCount": 4,
+        "sectionSourceDispersion": 1,
+        "uncitedSectionCount": 0,
+        "groundingRatio": 0.583,
+        "groundingStatus": "validated"
+      }
+    },
+    {
+      "band": "15x35",
+      "min": 15,
+      "max": 35,
+      "ok": true,
+      "error": null,
+      "latencyMs": 188746,
+      "costUsd": 0.1177,
+      "metrics": {
+        "wordCount": 1298,
+        "bibliographyCount": 9,
+        "inlineAnchorCount": 37,
+        "citationDensityPer1k": 28.51,
+        "distinctSourceDomains": 9,
+        "distinctProviders": 3,
+        "sectionCount": 2,
+        "sectionSourceDispersion": 1,
+        "uncitedSectionCount": 0,
+        "groundingRatio": 0.667,
+        "groundingStatus": "validated"
+      }
+    }
+  ]
+}

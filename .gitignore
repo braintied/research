@@ -5,3 +5,6 @@ releases/
 .env
 .env.*
 .DS_Store
+
+# eval source cache (regenerable)
+evals/.source-cache.json

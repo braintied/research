@@ -21,7 +21,9 @@
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
     "pack:release": "npm run clean && npm run build && npm pack --pack-destination ./releases",
-    "smoke:searxng": "npx tsx scripts/smoke-test-searxng.ts"
+    "smoke:searxng": "npx tsx scripts/smoke-test-searxng.ts",
+    "eval:baseline": "tsx evals/run-baseline.ts",
+    "eval:ablation": "tsx evals/run-fanout-ablation.ts"
   },
   "keywords": [
     "research",

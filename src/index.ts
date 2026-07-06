@@ -339,6 +339,13 @@ export interface RunDeepResearchInput {
    * Default 5. Set 0 to always fan out to paid providers (legacy behavior).
    */
   minFreeResults?: number;
+  /**
+   * Override the planner's subquery breadth for THIS run (evals/fan-out
+   * ablation — ROADMAP Phase 2 tests whether the 15–35 default band over-
+   * spends). Omit to use the depth preset. Applies to the initial plan and
+   * every re-plan.
+   */
+  subqueryBandOverride?: { min: number; max: number };
 }
 
 export interface RunDeepResearchResult {
@@ -378,11 +385,18 @@ export async function runDeepResearch(
     max: depthConfig.targetWordCountMax,
   };
 
+  const subqueriesMin = input.subqueryBandOverride !== undefined
+    ? input.subqueryBandOverride.min
+    : depthConfig.subqueriesMin;
+  const subqueriesMax = input.subqueryBandOverride !== undefined
+    ? input.subqueryBandOverride.max
+    : depthConfig.subqueriesMax;
+
   log.info(
     {
       depth,
-      subqueriesMin: depthConfig.subqueriesMin,
-      subqueriesMax: depthConfig.subqueriesMax,
+      subqueriesMin,
+      subqueriesMax,
       urlsPerSubquery: depthConfig.urlsPerSubquery,
       critiqueMaxPasses: depthConfig.critiqueMaxPasses,
       capUsd,
@@ -446,8 +460,8 @@ export async function runDeepResearch(
   let subqueries: Subquery[] = await planSubqueries({
     promptMd: input.brief,
     targetWordCount,
-    subqueriesMin: depthConfig.subqueriesMin,
-    subqueriesMax: depthConfig.subqueriesMax,
+    subqueriesMin,
+    subqueriesMax,
     availableProviders: availableProviderNames,
     usageSink: plannerUsageSink,
   });
@@ -569,8 +583,8 @@ export async function runDeepResearch(
       promptMd: input.brief,
       targetWordCount,
       refinementHint,
-      subqueriesMin: depthConfig.subqueriesMin,
-      subqueriesMax: depthConfig.subqueriesMax,
+      subqueriesMin,
+      subqueriesMax,
       availableProviders: availableProviderNames,
       usageSink: plannerUsageSink,
     });

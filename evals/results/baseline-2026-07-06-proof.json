@@ -1,0 +1,239 @@
+{
+  "generatedAt": "2026-07-06T06:21:53.312Z",
+  "args": {
+    "kind": null,
+    "subset": true,
+    "domain": null,
+    "limit": null,
+    "ids": null,
+    "useCache": true,
+    "label": "proof"
+  },
+  "results": [
+    {
+      "id": "tech-01-crawlers",
+      "domain": "technical",
+      "kind": "quick",
+      "engine": "pipeline",
+      "ok": true,
+      "error": null,
+      "latencyMs": 154942,
+      "costUsd": 0.0421,
+      "stageCosts": {
+        "plan": {
+          "events": 2,
+          "costUsd": 0.000252
+        },
+        "search": {
+          "events": 3,
+          "costUsd": 0.003
+        },
+        "extract": {
+          "events": 28,
+          "costUsd": 0.008222
+        },
+        "embed": {
+          "events": 1,
+          "costUsd": 0.000025
+        },
+        "synth": {
+          "events": 4,
+          "costUsd": 0.030558
+        }
+      },
+      "metrics": {
+        "wordCount": 853,
+        "bibliographyCount": 4,
+        "inlineAnchorCount": 14,
+        "citationDensityPer1k": 16.41,
+        "distinctSourceDomains": 4,
+        "distinctProviders": 1,
+        "sectionCount": 5,
+        "sectionSourceDispersion": 1,
+        "uncitedSectionCount": 3,
+        "groundingRatio": 0.5,
+        "groundingStatus": "validated"
+      }
+    },
+    {
+      "id": "market-03-search-apis",
+      "domain": "market",
+      "kind": "quick",
+      "engine": "pipeline",
+      "ok": true,
+      "error": null,
+      "latencyMs": 110597,
+      "costUsd": 0.0511,
+      "stageCosts": {
+        "plan": {
+          "events": 2,
+          "costUsd": 0.00021
+        },
+        "search": {
+          "events": 2,
+          "costUsd": 0.002
+        },
+        "extract": {
+          "events": 24,
+          "costUsd": 0.008043
+        },
+        "embed": {
+          "events": 1,
+          "costUsd": 0.000071
+        },
+        "synth": {
+          "events": 4,
+          "costUsd": 0.040776
+        }
+      },
+      "metrics": {
+        "wordCount": 870,
+        "bibliographyCount": 6,
+        "inlineAnchorCount": 29,
+        "citationDensityPer1k": 33.33,
+        "distinctSourceDomains": 6,
+        "distinctProviders": 2,
+        "sectionCount": 4,
+        "sectionSourceDispersion": 1,
+        "uncitedSectionCount": 0,
+        "groundingRatio": 0.167,
+        "groundingStatus": "validated"
+      }
+    },
+    {
+      "id": "audience-01-vibecoding",
+      "domain": "audience",
+      "kind": "social",
+      "engine": "pipeline",
+      "ok": true,
+      "error": null,
+      "latencyMs": 480400,
+      "costUsd": 0.3319,
+      "stageCosts": {
+        "plan": {
+          "events": 4,
+          "costUsd": 0.00108
+        },
+        "extract": {
+          "events": 499,
+          "costUsd": 0.146753
+        },
+        "embed": {
+          "events": 2,
+          "costUsd": 0.000776
+        },
+        "synth": {
+          "events": 6,
+          "costUsd": 0.171309
+        },
+        "critique": {
+          "events": 2,
+          "costUsd": 0.012
+        }
+      },
+      "metrics": {
+        "wordCount": 1489,
+        "bibliographyCount": 26,
+        "inlineAnchorCount": 71,
+        "citationDensityPer1k": 47.68,
+        "distinctSourceDomains": 5,
+        "distinctProviders": 4,
+        "sectionCount": 8,
+        "sectionSourceDispersion": 1,
+        "uncitedSectionCount": 0,
+        "groundingRatio": 0.231,
+        "groundingStatus": "validated"
+      }
+    },
+    {
+      "id": "product-01-research-fallback",
+      "domain": "product",
+      "kind": "quick",
+      "engine": "pipeline",
+      "ok": true,
+      "error": null,
+      "latencyMs": 129824,
+      "costUsd": 0.0429,
+      "stageCosts": {
+        "plan": {
+          "events": 2,
+          "costUsd": 0.000238
+        },
+        "search": {
+          "events": 2,
+          "costUsd": 0.002
+        },
+        "extract": {
+          "events": 30,
+          "costUsd": 0.009935
+        },
+        "embed": {
+          "events": 1,
+          "costUsd": 0.000028
+        },
+        "synth": {
+          "events": 4,
+          "costUsd": 0.030738
+        }
+      },
+      "metrics": {
+        "wordCount": 821,
+        "bibliographyCount": 6,
+        "inlineAnchorCount": 20,
+        "citationDensityPer1k": 24.36,
+        "distinctSourceDomains": 5,
+        "distinctProviders": 2,
+        "sectionCount": 5,
+        "sectionSourceDispersion": 1,
+        "uncitedSectionCount": 2,
+        "groundingRatio": 0.167,
+        "groundingStatus": "validated"
+      }
+    },
+    {
+      "id": "client-02-ecommerce-personalization",
+      "domain": "client",
+      "kind": "quick",
+      "engine": "pipeline",
+      "ok": true,
+      "error": null,
+      "latencyMs": 140620,
+      "costUsd": 0.0457,
+      "stageCosts": {
+        "plan": {
+          "events": 2,
+          "costUsd": 0.000239
+        },
+        "search": {
+          "events": 2,
+          "costUsd": 0.002
+        },
+        "extract": {
+          "events": 29,
+          "costUsd": 0.009401
+        },
+        "embed": {
+          "events": 1,
+          "costUsd": 0.000056
+        },
+        "synth": {
+          "events": 4,
+          "costUsd": 0.033981
+        }
+      },
+      "metrics": {
+        "wordCount": 838,
+        "bibliographyCount": 6,
+        "inlineAnchorCount": 22,
+        "citationDensityPer1k": 26.25,
+        "distinctSourceDomains": 6,
+        "distinctProviders": 2,
+        "sectionCount": 5,
+        "sectionSourceDispersion": 1,
+        "uncitedSectionCount": 2,
+        "groundingRatio": 0.167,
+        "groundingStatus": "validated"
+      }
+    }
+  ]
+}
