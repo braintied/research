@@ -42,7 +42,14 @@ Near-dup content not deduped (only canonical URL); evidence-empty sections still
 
 | Phase | Items | Effort | Why this order |
 |---|---|---|---|
-| **1 — Correctness** | F1 provenance + P0 runner swap + F8 planner cost + F2a (return grounding in result) | S–M | Bugs first; F1 unblocks every quality metric; P0 is a drop-in |
+| **1 — Correctness** ✅ SHIPPED 2026-07-06 (v0.4.0 + cortex-worker v346) | F1 provenance + P0 runner swap + F8 planner cost + F2a (return grounding in result) | S–M | Bugs first; F1 unblocks every quality metric; P0 is a drop-in |
+
+### Phase 1 execution notes (2026-07-06)
+- **F1** — `SearchResult.retrieved_for[]` (tagged per-subquery at search, MERGED at dedup); `extractQuotes` buckets by provenance with legacy provider fallback for untagged callers; also fixed the per-subquery map overwrite (only a section's last subquery counted). Live quick run: 4 sections → 3 distinct source sets (pre-fix: identical). Package `c92d039`.
+- **P0 correction** — the runner already consumed package synthesis via the Wave-2 shims; the zero-citation reports were the runner's OWN F1-pattern bucketing (its `sectionToUrls` + a dead `urlToSectionPaths` map that assigned every url to every section) starving `quotesBySection`. Fixed symmetrically in `deep-research-prompt-runner.ts` (ora-ai `5051daf8`).
+- **F8** — `planSubqueries` reports per-call token usage (Gemini `usageMetadata` + Claude `usage`) via `usageSink`; recorded under the previously-dead `'plan'` category. Live: `plan: 2ev` in onUsage.
+- **F2a** — `grounding` now on `RunDeepResearchResult` + `KindResearchResult` (null for managed).
+- **NEW DEFECT found during P0** (fold into Phase 4 / F3+F9): the runner's retry pass SEARCHES for new results but never fetches/extracts them — retry synthesis reuses the old evidence pool, so retry-search spend is pure waste. Documented in-code.
 | **2 — Measurement** | Eval harness + baseline grounding/cost per consumer + fan-out ablation (15–35 may be over-spend) | M | Can't defend improvements without it |
 | **3 — Trust** | F2b entailment verification + F4 credibility/diversity/recency + F7 concurrency pool | M | The visible-quality tier jump |
 | **4 — Intelligence** | F3 content-aware refinement + one-hop entity following + P2 semantic memory + F9 partial re-synthesis | M–L | The "agentic" tier jump + big cost cut |
