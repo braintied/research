@@ -18,6 +18,7 @@ Updated: 2026-07-05 (post Momus+Metis consolidation audit remediation).
 | **Swishh app** blog pipeline + knowledge ingestion | `inngest/functions/blog-generation.ts` (grounded engine primary), `lib/knowledge-ingestion/*` (`ingestSource`) | `@swishh/research` deleted 2026-07-05 (`packages/research/` + tgzs + root dep). |
 | **`@swishh/blog` package** | dep `@braintied/research ^0.3.1` (v0.2.14+) | External consumers must vendor this package's tgz. |
 | **Watchtower** | `prd-generator.ts` (prd doc type) + `research.ts` web source (searxng→serper→tavily first-wins) | Legacy Gemini PRD path kept as fallback. |
+| **ora-server agentic-research CLI** (`ora-ai/platform/apps/ora-server/scripts/research/agentic-research.ts`) | Engine providers for search (x/tiktok/instagram/youtube engine-first) + deep extraction (provider `fetch` → Tavily raw content → `crawlUrl`); keeps its own query gen, triage, scoring, `ora_core.research_projects` persistence, HTML feed report, knowledge auto-ingest | CONVERGED 2026-07-07 (was an unregistered parallel engine). Reddit search stays local (Tavily-primary hybrid; the package redditProvider's OAuth search rate-limits to 0 after the first call per session — port the hybrid before switching). |
 
 ## Intentionally separate (different-purpose — do NOT consolidate)
 
