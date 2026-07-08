@@ -53,6 +53,13 @@ Near-dup content not deduped (only canonical URL); evidence-empty sections still
 - **Replay proof** (run `012397f6`, worker v346, convergence-smoke): **citation_count 5 / 11 inline anchors vs 0 on both baselines** — first cited cortex report ever. 1,167 words, 41 sources, $0.048. Grounding ratio 0 on this run is the Phase 3 gap by construction (paraphrase prose vs strict 0.6 trigram; only 4 of 152 quote chunks belong to the 5 cited urls) — the package smoke run scores 0.25. Phase 2 evals must baseline grounding per kind before Phase 3 tunes it.
 - **NEW DEFECT #2 (FIXED same day)**: runner persisted grounding to `research_reports.metadata` — column never existed; UPDATE failed every run, swallowed by `.catch(() => undefined)`. Column added to Cortex prod + catch now logs (ora-ai `f5b19c65`).
 | **2 — Measurement** 🟡 HARNESS SHIPPED 2026-07-06 (`evals/`) | Eval harness + baseline grounding/cost per consumer + fan-out ablation (15–35 may be over-spend) | M | Can't defend improvements without it |
+
+### v0.5.0 partial-Phase-3 notes (2026-07-07)
+- **F7 partial** — `mapWithConcurrency` pool applied at the three fan-outs (search: 4 subqueries, fetch: 8, extract: 8). Per-domain delay (`DOMAIN_DELAY_MS`, still unused) remains open.
+- **X provider backend swap** — twitterapi.io primary (~$0.15/1k, no actor spin-up, not Apify-cap-gated), Apify fallback. Two live-verified twitterapi.io traps encoded in-source: `-filter:retweets` returns ZERO results; tweet fields arrive as explicit `null` (schemas must be `.nullable()`). The same `-filter:retweets` bug exists in watchtower's `research.ts` X source.
+- **TikTok fetch fallback** — Bright Data sync-scrape (posts dataset, same ID as Swishh/cortex-worker prod) rescues fetches when Apify is capped/unset; Apify stays primary for comment-rich fetch.
+- **Tavily raw content** — search now requests `include_raw_content`; the pipeline fetch stage short-circuits on it (≥800 chars), skipping the most failure-prone crawl per web result.
+- **Gemini env unified** — `getGeminiKey` accepts `GEMINI_RESEARCH_KEY` or `GEMINI_API_KEY` (README already promised this).
 | **3 — Trust** | F2b entailment verification + F4 credibility/diversity/recency + F7 concurrency pool | M | The visible-quality tier jump |
 | **4 — Intelligence** | F3 content-aware refinement + one-hop entity following + P2 semantic memory + F9 partial re-synthesis | M–L | The "agentic" tier jump + big cost cut |
 | **5 — Polish** | F6 outline + F5 contradictions + streaming onProgress + PDF lane | M | Report craft + UX |

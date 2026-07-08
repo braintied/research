@@ -41,6 +41,7 @@ const TavilyResultItemSchema = z.object({
   title: z.string().default(''),
   url: z.string(),
   content: z.string().default(''),
+  raw_content: z.string().nullable().optional(),
   score: z.number().default(0),
   published_date: z.string().optional(),
 });
@@ -96,7 +97,11 @@ export const tavilyProvider: SearchProvider = {
       search_depth: 'advanced',
       max_results: opts.limit !== undefined ? opts.limit : 10,
       include_answer: false,
-      include_raw_content: false,
+      // Tavily's server-side extraction handles JS/paywalls/bot-walls far
+      // better than a headless re-crawl of the same URL. The pipeline's fetch
+      // stage short-circuits on raw_metadata.raw_content, saving a crawl per
+      // web result (and rescuing pages the crawler can't render at all).
+      include_raw_content: true,
     };
 
     if (opts.include_domains !== undefined && opts.include_domains.length > 0) {
@@ -136,6 +141,10 @@ export const tavilyProvider: SearchProvider = {
     for (const item of parsed.data.results) {
       const publishedAt = item.published_date !== undefined ? toIsoString(item.published_date) : undefined;
 
+      const rawContent = item.raw_content !== undefined && item.raw_content !== null
+        ? item.raw_content
+        : '';
+
       const candidate = {
         provider: 'tavily' as const,
         url: item.url,
@@ -145,7 +154,7 @@ export const tavilyProvider: SearchProvider = {
         engagement: {
           score: item.score,
         },
-        raw_metadata: {},
+        raw_metadata: rawContent.length > 0 ? { raw_content: rawContent } : {},
       };
 
       const validated = SearchResultSchema.safeParse(candidate);

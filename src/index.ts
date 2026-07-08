@@ -33,6 +33,7 @@ import {
   EXTRACTION_MODEL,
   GEMINI_MAX_CONTENT_CHARS,
   CHARS_PER_TOKEN,
+  mapWithConcurrency,
 } from './pipeline-core.js';
 import { planSubqueries } from './planner.js';
 import type { PlannerUsage } from './planner.js';
@@ -811,8 +812,13 @@ async function runSearch(
   cache?: ResearchCacheAdapter,
   minFreeResults: number = DEFAULT_MIN_FREE_RESULTS,
 ): Promise<SearchResult[]> {
-  const perSubqueryResults = await Promise.all(
-    subqueries.map(async (subquery): Promise<SearchResult[]> => {
+  // Bounded fan-out (audit F7): wide mode plans 50-80 subqueries; unbounded
+  // Promise.all ran them all at once and 429-stormed providers and our own
+  // scraper. Per-provider rate limiters bound the inner tier calls.
+  const perSubqueryResults = await mapWithConcurrency(
+    subqueries,
+    4,
+    async (subquery): Promise<SearchResult[]> => {
       const providerNames = new Set<ProviderName>(subquery.providers);
       for (const pn of routeProvidersForSourceTypes(subquery.expected_source_types)) {
         providerNames.add(pn);
@@ -878,7 +884,7 @@ async function runSearch(
       }
 
       return subResults;
-    }),
+    },
   );
 
   // Cross-subquery dedup — MERGE provenance instead of dropping it (audit
@@ -915,12 +921,27 @@ async function fetchContent(
   const markdownByUrl: Record<string, string> = {};
   const crawl4aiProvider = enabledProviders['crawl4ai'];
 
-  await Promise.all(
-    results.map(async (result) => {
+  // Bounded fan-out (audit F7): the previous unbounded Promise.all put every
+  // fetch (≤400) in flight at once — a 429 storm against our own scraper.
+  await mapWithConcurrency(
+    results,
+    8,
+    async (result) => {
       const cacheKey = `fetch:${result.url}`;
       const cachedMarkdown = await cacheGet(cache, cacheKey, log);
       if (cachedMarkdown !== null && cachedMarkdown.length > 0) {
         markdownByUrl[result.url] = cachedMarkdown;
+        return;
+      }
+
+      // Search-time raw content (Tavily include_raw_content): the search API
+      // already extracted the page server-side, which survives JS/paywalls/
+      // bot-walls that break a headless re-crawl of the same URL. Use it and
+      // skip the crawl.
+      const searchRawContent = result.raw_metadata['raw_content'];
+      if (typeof searchRawContent === 'string' && searchRawContent.length >= 800) {
+        markdownByUrl[result.url] = searchRawContent;
+        await cacheSet(cache, cacheKey, searchRawContent, FETCH_CACHE_TTL_SECONDS, log);
         return;
       }
 
@@ -944,7 +965,7 @@ async function fetchContent(
         markdownByUrl[result.url] = markdown;
         await cacheSet(cache, cacheKey, markdown, FETCH_CACHE_TTL_SECONDS, log);
       }
-    }),
+    },
   );
 
   log.info(
@@ -1022,8 +1043,12 @@ async function extractQuotes(
     (r) => markdownByUrl[r.url] !== undefined && markdownByUrl[r.url].length > 0,
   );
 
-  await Promise.all(
-    resultsWithContent.map(async (result) => {
+  // Bounded fan-out (audit F7): extraction is one Gemini call per source —
+  // unbounded Promise.all hammered the API with every source at once.
+  await mapWithConcurrency(
+    resultsWithContent,
+    8,
+    async (result) => {
       const markdown = markdownByUrl[result.url];
       const providerName = result.provider;
       const provider = enabledProviders[providerName];
@@ -1120,7 +1145,7 @@ async function extractQuotes(
           providerCoverageBySection[sectionPath].push(providerName);
         }
       }
-    }),
+    },
   );
 
   log.info(

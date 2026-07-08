@@ -40,4 +40,4 @@ Updated: 2026-07-05 (post Momus+Metis consolidation audit remediation).
 
 ## Env keys (standardized names)
 
-`SEARXNG_URLS` (CSV; cortex-searxng-a/b/c on Fly, scale-to-zero) · `SERPER_API_KEY` · `TAVILY_API_KEY` · `EXA_API_KEY` · `SERPAPI_KEY` · `CRAWL4AI_URL` (default ora-scraper.fly.dev) · `JINA_API_KEY` (optional fetch fallback) · `PERPLEXITY_API_KEY` (managed kind only) · `GEMINI_RESEARCH_KEY`/`GEMINI_API_KEY` · `VOYAGE_API_KEY` · `ANTHROPIC_API_KEY`.
+`SEARXNG_URLS` (CSV; cortex-searxng-a/b/c on Fly, scale-to-zero) · `SERPER_API_KEY` · `TAVILY_API_KEY` · `EXA_API_KEY` · `SERPAPI_KEY` · `CRAWL4AI_URL` (default ora-scraper.fly.dev) · `JINA_API_KEY` (optional fetch fallback) · `TWITTERAPI_IO_KEY` (X primary backend as of v0.5.0; `APIFY_API_TOKEN` is the X fallback + TikTok/IG/FB-groups backend) · `BRIGHTDATA_API_TOKEN` (LinkedIn/FB ingestion + TikTok fetch fallback) · `PERPLEXITY_API_KEY` (managed kind only) · `GEMINI_RESEARCH_KEY`/`GEMINI_API_KEY` (interchangeable as of v0.5.0) · `VOYAGE_API_KEY` · `ANTHROPIC_API_KEY`.

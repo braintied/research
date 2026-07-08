@@ -104,11 +104,15 @@ export const EXTRACTION_MODEL = 'gemini-3.1-flash-lite-preview';
 // ============================================================================
 
 export function getGeminiKey(): string {
+  // GEMINI_RESEARCH_KEY is the dedicated research key; GEMINI_API_KEY is the
+  // documented alias (README promises either works — previously only the
+  // synthesis path honored GEMINI_API_KEY, so planner/extraction failed on
+  // consumers that set just one).
   const key = process.env.GEMINI_RESEARCH_KEY;
-  if (key === undefined || key === '') {
-    throw new Error('GEMINI_RESEARCH_KEY environment variable is not configured');
-  }
-  return key;
+  if (key !== undefined && key !== '') return key;
+  const alias = process.env.GEMINI_API_KEY;
+  if (alias !== undefined && alias !== '') return alias;
+  throw new Error('GEMINI_RESEARCH_KEY (or GEMINI_API_KEY) environment variable is not configured');
 }
 
 export function getVoyageKey(): string {
@@ -127,6 +131,38 @@ export async function sleep(ms: number): Promise<void> {
   return new Promise(resolve => {
     setTimeout(resolve, ms);
   });
+}
+
+/**
+ * Bounded-concurrency map (audit F7): run `fn` over `items` with at most
+ * `limit` in flight. Results keep input order. Rejections are the caller's
+ * concern — wrap `fn` in try/catch when a failed item should not fail the
+ * batch (matches the existing fail-soft fetch/extract semantics).
+ */
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < items.length) {
+      const current = nextIndex;
+      nextIndex += 1;
+      if (current >= items.length) return;
+      results[current] = await fn(items[current], current);
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  const workers: Promise<void>[] = [];
+  for (let i = 0; i < workerCount; i++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+  return results;
 }
 
 export function extractDomain(url: string): string {

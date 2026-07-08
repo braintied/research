@@ -41,7 +41,10 @@ All providers are raw `fetch` — no SDK dependencies. A provider is enabled whe
 | Hacker News | forum | (none) | $0 |
 | RSS | newsletters | (none) | $0 |
 | Podcasts | podcast | `LISTENNOTES_API_KEY` | paid |
-| TikTok / Instagram / X / FB Groups | social | Bright Data: `BRIGHTDATA_API_TOKEN` (+ dataset IDs) | paid |
+| X (Twitter) | social | `TWITTERAPI_IO_KEY` (primary, ~$0.15/1k tweets, datacenter-safe) and/or `APIFY_API_TOKEN` (fallback actor) | cheap |
+| TikTok | social | `APIFY_API_TOKEN` (search + comment-rich fetch) and/or `BRIGHTDATA_API_TOKEN` (fetch fallback, ~$1.50/1k records) | paid |
+| Instagram / FB Groups | social | `APIFY_API_TOKEN` | paid |
+| LinkedIn / FB Groups (ingestion layer) | ingestion | Bright Data: `BRIGHTDATA_API_TOKEN` (+ dataset IDs) | paid |
 | Perplexity | managed deep research | `PERPLEXITY_API_KEY` | ~$0.40–1.30/query (sonar-deep-research) |
 
 Model/pipeline keys: `ANTHROPIC_API_KEY` (synthesis/critique), `GEMINI_RESEARCH_KEY` or `GEMINI_API_KEY` (planner/extraction), `VOYAGE_API_KEY` (rerank/embed), optional `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`.
