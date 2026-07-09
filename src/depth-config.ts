@@ -143,6 +143,9 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
   'deepseek-v4-pro':                      { inputUsdPerM: 0.435, outputUsdPerM: 0.87, cacheHitInputUsdPerM: 0.003625, provider: 'deepseek' },
   // Google Gemini
   'gemini-2.5-flash':                     { inputUsdPerM: 0.30, outputUsdPerM: 2.50, provider: 'google' },
+  // Default synthesis model for the 'quick' and 'answer' kinds (2026-07-09) —
+  // MICRO tier in the Ora model registry, ~6× cheaper than Sonnet synthesis.
+  'gemini-3-flash-preview':               { inputUsdPerM: 0.50, outputUsdPerM: 3.00, provider: 'google' },
   // OpenRouter (US-resold open weights)
   'qwen/qwen3-235b-a22b-instruct-2507':   { inputUsdPerM: 0.071, outputUsdPerM: 0.10, provider: 'openrouter' },
 };

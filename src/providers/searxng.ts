@@ -60,6 +60,22 @@ export interface SearxngSearchOpts {
   timeoutMs?: number;
   /** SearXNG `format=json` is required; this is here only to override category. */
   category?: 'general' | 'news' | 'science';
+  /**
+   * SearXNG native recency filter. Mapped from SearchOpts.recency_days by the
+   * provider — before this existed, recency filtering was a paid-Tavily-only
+   * capability.
+   */
+  timeRange?: 'day' | 'week' | 'month' | 'year';
+}
+
+/** Map a recency window in days onto SearXNG's discrete time_range buckets. */
+export function recencyDaysToTimeRange(days: number | undefined): SearxngSearchOpts['timeRange'] {
+  if (days === undefined || days <= 0) return undefined;
+  if (days <= 1) return 'day';
+  if (days <= 7) return 'week';
+  if (days <= 31) return 'month';
+  if (days <= 366) return 'year';
+  return undefined;
 }
 
 // =============================================================================
@@ -99,6 +115,9 @@ async function callOnce(
   });
   if (opts.category !== undefined) {
     params.set('categories', opts.category);
+  }
+  if (opts.timeRange !== undefined) {
+    params.set('time_range', opts.timeRange);
   }
   const url = `${baseUrl}/search?${params.toString()}`;
   const timeoutMs = opts.timeoutMs !== undefined ? opts.timeoutMs : 12_000;
@@ -216,6 +235,7 @@ export const searxngProvider: SearchProvider = {
   async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
     const outcome = await searxngSearch(query, {
       limit: opts.limit,
+      timeRange: recencyDaysToTimeRange(opts.recency_days),
     });
 
     if (!outcome.success) {

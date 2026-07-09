@@ -150,6 +150,10 @@ export {
 } from './kinds.js';
 export type { ResearchKind, ResearchKindPreset, RunResearchInput, KindResearchResult } from './kinds.js';
 
+// Answer engine — cited quick answers on the self-hosted stack.
+export { runAnswer } from './answer.js';
+export type { RunAnswerInput, RunAnswerResult, AnswerCitation } from './answer.js';
+
 // Managed deep research (Perplexity sonar-deep-research).
 export { runManagedResearch } from './managed-research.js';
 export type { RunManagedResearchInput, RunManagedResearchResult } from './managed-research.js';
@@ -347,6 +351,14 @@ export interface RunDeepResearchInput {
    * every re-plan.
    */
   subqueryBandOverride?: { min: number; max: number };
+  /**
+   * Synthesis/assembly model override (see resolveSynthesisModel for the
+   * accepted prefixes). The stage APIs accepted this since Phase 1 Experiment 1
+   * but the top-level entrypoints never forwarded it — synthesis was
+   * effectively hardcoded to claude-sonnet-4-6, which is ~90% of a quick-run's
+   * cost. The 'quick' kind now defaults this to gemini-3-flash-preview.
+   */
+  synthesisModelOverride?: string;
 }
 
 export interface RunDeepResearchResult {
@@ -533,6 +545,7 @@ export async function runDeepResearch(
     targetWordCount,
     costTracker,
     log,
+    input.synthesisModelOverride,
   );
 
   // ---------------------------------------------------------------------------
@@ -653,6 +666,7 @@ export async function runDeepResearch(
       targetWordCount,
       costTracker,
       log,
+      input.synthesisModelOverride,
     );
 
     critiquePass++;
@@ -666,6 +680,7 @@ export async function runDeepResearch(
     sections,
     gaps: finalGaps,
     sourceMeta: sourceMetaByUrl,
+    synthesisModelOverride: input.synthesisModelOverride,
   });
   recordSynthCost(costTracker, assembly.model, assembly.inputTokens, assembly.cachedReadTokens, assembly.outputTokens, 'assembly');
   const report = assembly.report;
@@ -1163,6 +1178,7 @@ async function synthesizeSections(
   targetWordCount: { min: number; max: number },
   costTracker: CostTracker,
   log: Logger,
+  synthesisModelOverride?: string,
 ): Promise<SectionDraft[]> {
   const sectionPathsSeen = new Set<string>();
   const sectionGoals: Record<string, string[]> = {};
@@ -1230,6 +1246,7 @@ async function synthesizeSections(
     sectionsToWrite,
     quotesByPath: rerankedQuotesByPath,
     claimsByPath: claimsBySection,
+    synthesisModelOverride,
   });
   recordSynthCost(
     costTracker,

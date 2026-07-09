@@ -22,6 +22,7 @@ import type {
   ResearchCacheAdapter,
 } from './index.js';
 import { runManagedResearch } from './managed-research.js';
+import { runAnswer } from './answer.js';
 import type { ResearchDepth } from './depth-config.js';
 import type { Logger } from './logger.js';
 import type { FinalReport, ProviderName, VerbatimQuote } from './types.js';
@@ -31,28 +32,42 @@ import type { GroundingResult } from './grounding.js';
 // Kind definitions
 // =============================================================================
 
-export const RESEARCH_KINDS = ['quick', 'standard', 'deep', 'managed', 'social'] as const;
+export const RESEARCH_KINDS = ['answer', 'quick', 'standard', 'deep', 'managed', 'social'] as const;
 export type ResearchKind = (typeof RESEARCH_KINDS)[number];
 
 export interface ResearchKindPreset {
   kind: ResearchKind;
   description: string;
-  /** Engine: the agentic pipeline or the hosted Perplexity run. */
-  engine: 'pipeline' | 'perplexity';
+  /** Engine: the agentic pipeline, hosted Perplexity, or the single-pass answer engine. */
+  engine: 'pipeline' | 'perplexity' | 'answer';
   /** Depth mapping for pipeline runs. */
   depth?: ResearchDepth;
   /** Provider allowlist for pipeline runs (intersected with env-enabled). */
   providers?: ProviderName[];
   /** Preamble appended to the brief to steer the planner. */
   briefPreamble?: string;
+  /**
+   * Default synthesis model for this kind (callers can still override via
+   * RunResearchInput.synthesisModelOverride). Unset -> claude-sonnet-4-6.
+   */
+  synthesisModelDefault?: string;
 }
 
 export const RESEARCH_KIND_PRESETS: Record<ResearchKind, ResearchKindPreset> = {
+  answer: {
+    kind: 'answer',
+    description: 'Perplexity-style cited quick answer — one search, one cheap synthesis (~5-15s, ~$0.002-0.01)',
+    engine: 'answer',
+    synthesisModelDefault: 'gemini-3-flash-preview',
+  },
   quick: {
     kind: 'quick',
-    description: 'Single-pass cheap research for fast context (~30-90s, ~$0.05-0.50)',
+    description: 'Single-pass cheap research for fast context (~30-90s, ~$0.02-0.10)',
     engine: 'pipeline',
     depth: 'quick',
+    // ~90% of a quick-run's cost was hardcoded Sonnet synthesis (2026-07-09
+    // cost audit) — quick now defaults to the MICRO-tier Gemini flash.
+    synthesisModelDefault: 'gemini-3-flash-preview',
   },
   standard: {
     kind: 'standard',
@@ -119,12 +134,19 @@ export interface RunResearchInput {
   cache?: ResearchCacheAdapter;
   /** Free-first tier threshold override (pipeline kinds only). */
   minFreeResults?: number;
+  /**
+   * Synthesis/assembly model override — forwarded to the pipeline (and the
+   * answer engine). Unset -> the kind's synthesisModelDefault, then Sonnet.
+   */
+  synthesisModelOverride?: string;
+  /** Recency window in days (answer kind: mapped to SearXNG time_range). */
+  recencyDays?: number;
   logger?: Logger;
 }
 
 export interface KindResearchResult {
   kind: ResearchKind;
-  engine: 'pipeline' | 'perplexity';
+  engine: 'pipeline' | 'perplexity' | 'answer';
   report: FinalReport;
   /** Verbatim evidence pool — empty for managed runs (no quote extraction). */
   quotes: VerbatimQuote[];
@@ -143,6 +165,26 @@ export interface KindResearchResult {
 export async function runResearch(input: RunResearchInput): Promise<KindResearchResult> {
   const kind: ResearchKind = input.kind !== undefined ? input.kind : 'standard';
   const preset = RESEARCH_KIND_PRESETS[kind];
+  const synthesisModelOverride = input.synthesisModelOverride !== undefined
+    ? input.synthesisModelOverride
+    : preset.synthesisModelDefault;
+
+  if (preset.engine === 'answer') {
+    const answer = await runAnswer({
+      query: input.brief,
+      recencyDays: input.recencyDays,
+      synthesisModelOverride,
+      logger: input.logger,
+    });
+    return {
+      kind,
+      engine: 'answer',
+      report: answer.report,
+      quotes: [],
+      costUsd: answer.costUsd,
+      grounding: null,
+    };
+  }
 
   if (preset.engine === 'perplexity') {
     const managed = await runManagedResearch({
@@ -173,6 +215,7 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
     onUsage: input.onUsage,
     cache: input.cache,
     minFreeResults: input.minFreeResults,
+    synthesisModelOverride,
   };
 
   const result = await runDeepResearch(pipelineInput);
