@@ -113,7 +113,9 @@ export function deriveSearchQuery(query: string): string {
   if (firstLine.length >= 20) {
     searchable = firstLine;
   }
-  searchable = searchable.replace(/\s+/g, ' ').trim();
+  // Strip double quotes: prompts quote entity names ("Inference-Optimization")
+  // which SearXNG treats as exact-match and returns zero results for.
+  searchable = searchable.replace(/["“”]/g, ' ').replace(/\s+/g, ' ').trim();
   if (searchable.length > 300) {
     const cut = searchable.slice(0, 300);
     const lastSpace = cut.lastIndexOf(' ');
