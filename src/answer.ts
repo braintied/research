@@ -40,6 +40,13 @@ export interface RunAnswerInput {
   maxSources?: number;
   /** Synthesis model (resolveSynthesisModel prefixes). Default gemini-3-flash-preview. */
   synthesisModelOverride?: string;
+  /**
+   * Replace the default cited-answer system prompt entirely — for callers
+   * that want web-grounded STRUCTURED output (e.g. "return only JSON") where
+   * inline [n] citations would corrupt the format. Sources are still passed
+   * as the numbered user-message blocks; grounding language is appended.
+   */
+  systemPromptOverride?: string;
   logger?: Logger;
 }
 
@@ -153,10 +160,12 @@ export async function runAnswer(input: RunAnswerInput): Promise<RunAnswerResult>
     .map((s, i) => `[${i + 1}] ${s.title}\nURL: ${s.url}\n${s.content}`)
     .join('\n\n---\n\n');
 
-  const system = 'You answer questions using ONLY the numbered sources provided. '
-    + 'Write a direct, concise answer in markdown. Cite every factual claim inline with [n] '
-    + 'matching the source numbers. If the sources do not answer the question, say what is '
-    + 'missing instead of guessing. No preamble.';
+  const system = input.systemPromptOverride !== undefined && input.systemPromptOverride.length > 0
+    ? `${input.systemPromptOverride}\n\nBase your response ONLY on the numbered sources provided.`
+    : 'You answer questions using ONLY the numbered sources provided. '
+      + 'Write a direct, concise answer in markdown. Cite every factual claim inline with [n] '
+      + 'matching the source numbers. If the sources do not answer the question, say what is '
+      + 'missing instead of guessing. No preamble.';
   const user = `Question: ${input.query}\n\nSources:\n\n${sourceBlocks}`;
 
   const synth = await synthesisGenerate({
