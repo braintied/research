@@ -107,6 +107,12 @@ export function deriveSearchQuery(query: string): string {
   const formatDirective = /respond with|return only|return exactly|return a json|return json|as a json|output json|json (array|object)|no prose|no markdown/i;
   const match = formatDirective.exec(query);
   let searchable = match !== null ? query.slice(0, match.index) : query;
+  // Multi-line prompts ("Research X\n\nContext: …\nAnswer these questions: …")
+  // search terribly — the first line is the searchable intent.
+  const firstLine = searchable.split('\n')[0].trim();
+  if (firstLine.length >= 20) {
+    searchable = firstLine;
+  }
   searchable = searchable.replace(/\s+/g, ' ').trim();
   if (searchable.length > 300) {
     const cut = searchable.slice(0, 300);
