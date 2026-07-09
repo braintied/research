@@ -97,6 +97,26 @@ async function fetchSourceContent(url: string, snippet: string, log: Logger): Pr
 }
 
 /**
+ * Derive the text to SEARCH from a caller prompt. Migrated Perplexity call
+ * sites pass full LLM prompts ("List 10 competitors… Respond with ONLY a JSON
+ * object matching this schema: {…}") — feeding format instructions to a search
+ * engine returns zero results. Cut at the first output-format directive and
+ * cap length; the FULL prompt still goes to synthesis.
+ */
+export function deriveSearchQuery(query: string): string {
+  const formatDirective = /respond with|return only|return exactly|return a json|return json|as a json|output json|json (array|object)|no prose|no markdown/i;
+  const match = formatDirective.exec(query);
+  let searchable = match !== null ? query.slice(0, match.index) : query;
+  searchable = searchable.replace(/\s+/g, ' ').trim();
+  if (searchable.length > 300) {
+    const cut = searchable.slice(0, 300);
+    const lastSpace = cut.lastIndexOf(' ');
+    searchable = cut.slice(0, lastSpace > 200 ? lastSpace : 300);
+  }
+  return searchable.length > 0 ? searchable : query.slice(0, 300);
+}
+
+/**
  * Answer a question with inline citations using the self-hosted search stack.
  */
 export async function runAnswer(input: RunAnswerInput): Promise<RunAnswerResult> {
@@ -114,7 +134,9 @@ export async function runAnswer(input: RunAnswerInput): Promise<RunAnswerResult>
   const candidates: { title: string; url: string; snippet: string }[] = [];
   const seenUrls = new Set<string>();
 
-  const searxng = await searxngSearch(input.query, {
+  const searchQuery = deriveSearchQuery(input.query);
+
+  const searxng = await searxngSearch(searchQuery, {
     limit: SEARCH_LIMIT,
     timeRange: recencyDaysToTimeRange(input.recencyDays),
   });
@@ -126,7 +148,7 @@ export async function runAnswer(input: RunAnswerInput): Promise<RunAnswerResult>
 
   if (candidates.length < MIN_SEARCH_RESULTS_BEFORE_PAID && serperProvider.enabled) {
     try {
-      const serperResults = await serperProvider.search(input.query, { limit: SEARCH_LIMIT });
+      const serperResults = await serperProvider.search(searchQuery, { limit: SEARCH_LIMIT });
       costUsd += SERPER_COST_USD;
       searchBackend = candidates.length > 0 ? 'searxng+serper' : 'serper';
       for (const r of serperResults) {
