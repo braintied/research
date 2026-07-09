@@ -160,8 +160,13 @@ export async function runAnswer(input: RunAnswerInput): Promise<RunAnswerResult>
     .map((s, i) => `[${i + 1}] ${s.title}\nURL: ${s.url}\n${s.content}`)
     .join('\n\n---\n\n');
 
+  // Override mode uses Perplexity semantics — web results as supporting
+  // context on top of model knowledge (strict source-only grounding made the
+  // model refuse structured-output tasks whenever the SERP was thin). The
+  // default cited-answer mode stays strictly grounded.
   const system = input.systemPromptOverride !== undefined && input.systemPromptOverride.length > 0
-    ? `${input.systemPromptOverride}\n\nBase your response ONLY on the numbered sources provided.`
+    ? `${input.systemPromptOverride}\n\nUse the numbered web sources below as supporting context; `
+      + 'combine them with your own knowledge when they are incomplete.'
     : 'You answer questions using ONLY the numbered sources provided. '
       + 'Write a direct, concise answer in markdown. Cite every factual claim inline with [n] '
       + 'matching the source numbers. If the sources do not answer the question, say what is '
