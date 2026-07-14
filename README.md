@@ -43,13 +43,22 @@ All providers are raw `fetch` — no SDK dependencies. A provider is enabled whe
 | Podcasts | podcast | `LISTENNOTES_API_KEY` | paid |
 | X (Twitter) | social | `TWITTERAPI_IO_KEY` (primary, ~$0.15/1k tweets, datacenter-safe) and/or `APIFY_API_TOKEN` (fallback actor) | cheap |
 | TikTok | social | `APIFY_API_TOKEN` (search + comment-rich fetch) and/or `BRIGHTDATA_API_TOKEN` (fetch fallback, ~$1.50/1k records) | paid |
-| Instagram / FB Groups | social | `APIFY_API_TOKEN` | paid |
+| Instagram | social | `BRIGHTDATA_API_TOKEN` (posts dataset `gd_lk5ns7kz21pck8jpis`; profiles dataset `gd_l1vikfch901nx3by4`) | paid |
+| FB Groups | social | `APIFY_API_TOKEN` | paid |
 | LinkedIn / FB Groups (ingestion layer) | ingestion | Bright Data: `BRIGHTDATA_API_TOKEN` (+ dataset IDs) | paid |
 | Perplexity | managed deep research | `PERPLEXITY_API_KEY` | ~$0.40–1.30/query (sonar-deep-research) |
 
 Model/pipeline keys: `ANTHROPIC_API_KEY` (synthesis/critique), `GEMINI_RESEARCH_KEY` or `GEMINI_API_KEY` (planner/extraction), `VOYAGE_API_KEY` (rerank/embed), optional `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`.
 
 > Env naming is standardized here — `SERPAPI_KEY` (not `SERP_API_KEY`), `SERPER_API_KEY`, `SEARXNG_URLS`.
+
+Instagram has a stricter boundary than the general web-fetch stack. Hashtag
+search uses Bright Data snapshot discovery; direct `/p/`, `/reel/`, and `/tv/`
+links use the Bright Data posts dataset; one-segment profile links use the
+Bright Data profiles dataset. A missing token, provider/snapshot failure,
+timeout, mismatched record, or response without useful post/profile content is
+a failed operation. Instagram does not use Apify, Crawl4AI, Jina, or a browser
+as a recovery path.
 
 ## Usage
 
@@ -76,7 +85,7 @@ npm run pack:release          # → releases/braintied-research-<version>.tgz
 
 ```jsonc
 // consumer package.json
-"@braintied/research": "file:vendor/braintied-research-0.2.0.tgz"
+"@braintied/research": "file:vendor/braintied-research-0.6.4.tgz"
 ```
 
 ## Development
@@ -85,5 +94,6 @@ npm run pack:release          # → releases/braintied-research-<version>.tgz
 npm install
 npm run typecheck
 npm run build
+npm test                 # offline Instagram provider-boundary tests
 npm run smoke:searxng   # requires SEARXNG_URLS
 ```

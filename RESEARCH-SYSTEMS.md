@@ -2,11 +2,11 @@
 
 **One rule: do not build a new research/search/crawl path.** If you need web research, use `@braintied/research` (this repo). If a surface below is marked *different-purpose*, it is intentionally separate — extend it in place, don't fork a new engine. Anything not listed here that searches/crawls the web is a regression (Momus audit 2026-07-05: "no competing systems" requires this registry + the CI guards to stay true).
 
-Updated: 2026-07-05 (post Momus+Metis consolidation audit remediation).
+Updated: 2026-07-14 (Instagram Bright Data-only provider boundary, v0.6.4).
 
 ## The engine
 
-`@braintied/research` — multi-provider search (free-first: searxng $0 → serper free-quota → tavily/exa/serpapi paid, only when free coverage is thin), Crawl4AI→Jina→direct fetch (typed Crawl4AI config — the flat shape is silently ignored by 0.8.x), Gemini quote extraction, Voyage rerank, Claude synthesis + critique loop, globally-renumbered citations + grounded assembly, honest CostTracker (search+extract+rerank+synth all counted; hard cap enforces on the true total), per-stage `onUsage` attribution, `ResearchCacheAdapter`, `indexSink`. Kinds: `quick`/`standard`/`deep`/`managed`(Perplexity, opt-in only)/`social`. Document layer: `prd`, `market-report`, `tech-spec`, `client-brief`, `content-brief`, `estimate-research`.
+`@braintied/research` — multi-provider search (free-first: searxng $0 → serper free-quota → tavily/exa/serpapi paid, only when free coverage is thin), Crawl4AI→Jina→direct fetch for general web pages (typed Crawl4AI config — the flat shape is silently ignored by 0.8.x), strict Bright Data-only Instagram discovery and post/profile fetch, Gemini quote extraction, Voyage rerank, Claude synthesis + critique loop, globally-renumbered citations + grounded assembly, honest CostTracker (search+extract+rerank+synth all counted; hard cap enforces on the true total), per-stage `onUsage` attribution, `ResearchCacheAdapter`, `indexSink`. Kinds: `quick`/`standard`/`deep`/`managed`(Perplexity, opt-in only)/`social`. Document layer: `prd`, `market-report`, `tech-spec`, `client-brief`, `content-brief`, `estimate-research`.
 
 ## Who runs it (consumers of THIS package)
 
@@ -37,8 +37,20 @@ Updated: 2026-07-05 (post Momus+Metis consolidation audit remediation).
 ## Guards
 
 - Sentigen CI: `scripts/check-research-provider-imports.sh` (in `pnpm run guards`) — bans new direct `api.tavily.com` / `api.perplexity.ai` / firecrawl imports outside the allowlist above.
+- Package CI: `.github/workflows/ci.yml` runs locked install, typecheck, the offline Instagram transport boundary, and a package dry-run on every pull request and `main` push. The boundary rejects Apify/Crawl4AI/Jina/browser references in `src/providers/instagram.ts` and verifies strict Bright Data errors plus canonical post/profile URLs.
 - This registry is the allowlist's source of truth — update both together.
 
 ## Env keys (standardized names)
 
-`SEARXNG_URLS` (CSV; cortex-searxng-a/b/c on Fly, scale-to-zero) · `SERPER_API_KEY` · `TAVILY_API_KEY` · `EXA_API_KEY` · `SERPAPI_KEY` · `CRAWL4AI_URL` (default ora-scraper.fly.dev) · `JINA_API_KEY` (optional fetch fallback) · `TWITTERAPI_IO_KEY` (X primary backend as of v0.5.0; `APIFY_API_TOKEN` is the X fallback + TikTok/IG/FB-groups backend) · `BRIGHTDATA_API_TOKEN` (LinkedIn/FB ingestion + TikTok fetch fallback) · `PERPLEXITY_API_KEY` (managed kind only) · `GEMINI_RESEARCH_KEY`/`GEMINI_API_KEY` (interchangeable as of v0.5.0) · `VOYAGE_API_KEY` · `ANTHROPIC_API_KEY`.
+`SEARXNG_URLS` (CSV; cortex-searxng-a/b/c on Fly, scale-to-zero) · `SERPER_API_KEY` · `TAVILY_API_KEY` · `EXA_API_KEY` · `SERPAPI_KEY` · `CRAWL4AI_URL` (default ora-scraper.fly.dev) · `JINA_API_KEY` (optional general-web fetch fallback) · `TWITTERAPI_IO_KEY` (X primary backend as of v0.5.0; `APIFY_API_TOKEN` remains the X fallback plus TikTok/FB-groups backend) · `BRIGHTDATA_API_TOKEN` (the only Instagram transport; also LinkedIn/FB ingestion and TikTok fetch fallback) · `PERPLEXITY_API_KEY` (managed kind only) · `GEMINI_RESEARCH_KEY`/`GEMINI_API_KEY` (interchangeable as of v0.5.0) · `VOYAGE_API_KEY` · `ANTHROPIC_API_KEY`.
+
+### Instagram provider boundary
+
+The package's `instagram` provider uses Bright Data dataset
+`gd_lk5ns7kz21pck8jpis` for hashtag discovery and direct post/reel/tv links,
+and `gd_l1vikfch901nx3by4` for one-segment profile links. Results retain the
+`provider: instagram` SearchProvider contract and record
+`instagram_provider: brightdata` plus the dataset ID in provider metadata.
+Instagram failures remain failures; the general web-fetch stack and other
+social providers are not eligible recovery paths. This policy is specific to
+Instagram and does not change the registered X, TikTok, or Facebook providers.

@@ -144,7 +144,8 @@ export {
 // Re-export the extractor for use outside providers
 export { extractQuotesWithGemini } from './gemini-extractor.js';
 
-// Bright Data Web Scraper API ingestion client (LinkedIn + Facebook groups).
+// Tolerant Bright Data ingestion client (LinkedIn + Facebook groups).
+// Instagram Bright Data routing is strict and encapsulated by instagramProvider.
 export {
   triggerCollection,
   pollSnapshot,

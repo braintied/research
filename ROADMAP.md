@@ -15,7 +15,7 @@
 | Evals | 1/10 | golden-brief harness |
 | UX/streaming | 3/10 | onProgress + surface grounding |
 
-Strengths to keep: 16-provider breadth incl. social (commercial tools lack this), free-first tiering, honest cost core, global citation renumbering, fail-soft posture.
+Strengths to keep: 16-provider breadth incl. social (commercial tools lack this), free-first tiering, honest cost core, global citation renumbering, and explicit failure policies (fail-soft where allowed; fail-closed for strict Instagram transport).
 
 ## Findings register
 
@@ -60,6 +60,24 @@ Near-dup content not deduped (only canonical URL); evidence-empty sections still
 - **TikTok fetch fallback** — Bright Data sync-scrape (posts dataset, same ID as Swishh/cortex-worker prod) rescues fetches when Apify is capped/unset; Apify stays primary for comment-rich fetch.
 - **Tavily raw content** — search now requests `include_raw_content`; the pipeline fetch stage short-circuits on it (≥800 chars), skipping the most failure-prone crawl per web result.
 - **Gemini env unified** — `getGeminiKey` accepts `GEMINI_RESEARCH_KEY` or `GEMINI_API_KEY` (README already promised this).
+
+### v0.6.4 Instagram provider boundary (2026-07-14)
+
+- **Bright Data only** — the `instagram` SearchProvider no longer contains an
+  Instagram-specific Apify path. Hashtag discovery uses Bright Data snapshots;
+  direct posts/reels/tv use dataset `gd_lk5ns7kz21pck8jpis`; one-segment
+  profiles use `gd_l1vikfch901nx3by4`.
+- **Strict failures** — missing credentials, HTTP/schema/provider errors,
+  terminal or timed-out snapshots, mismatched records, and contentless
+  post/profile payloads fail the operation. There is no Instagram generic-crawl
+  or browser recovery path.
+- **Evidence identity** — returned post URLs are canonicalized to stable
+  Instagram permalinks, profile URLs are normalized, and Bright Data transport
+  plus dataset provenance is retained without changing `provider: instagram`.
+- **Regression guard** — seven offline provider tests cover credential routing,
+  strict errors, canonical post/profile fetches, deduplication, provenance, and
+  the source-level no-alternate-transport boundary. Pinned, read-only GitHub CI
+  runs them with typecheck and package validation on every PR and `main` push.
 | **3 — Trust** | F2b entailment verification + F4 credibility/diversity/recency + F7 concurrency pool | M | The visible-quality tier jump |
 | **4 — Intelligence** | F3 content-aware refinement + one-hop entity following + P2 semantic memory + F9 partial re-synthesis | M–L | The "agentic" tier jump + big cost cut |
 | **5 — Polish** | F6 outline + F5 contradictions + streaming onProgress + PDF lane | M | Report craft + UX |

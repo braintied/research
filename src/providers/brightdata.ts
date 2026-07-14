@@ -15,6 +15,9 @@
  * and returns an empty array (tolerated — never crashes the sweep).
  *
  * Auth: Bearer `BRIGHTDATA_API_TOKEN`. Every payload boundary is Zod-validated.
+ * Instagram intentionally does not use this tolerant ingestion wrapper. Its
+ * strict search/post/profile implementation lives in `instagram.ts` so an
+ * empty/error response cannot be converted into a successful empty sweep.
  */
 
 import { z } from 'zod';

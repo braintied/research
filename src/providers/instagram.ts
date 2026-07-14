@@ -1,17 +1,17 @@
 /**
- * Instagram Reels Search Provider
+ * Instagram Search Provider
  *
- * Uses Apify actor `apify/instagram-reel-scraper` to search Reels by hashtag
- * and fetch comment threads. The provider pivots a text query to likely
- * hashtags (e.g. "AI for teachers" → #aiforteachers, #chatgptforteachers).
+ * Strictly uses Bright Data's Instagram datasets for hashtag discovery,
+ * direct post/reel fetches, and one-segment profile fetches. Instagram must
+ * never route through another scraper or a generic web-fetch chain: missing
+ * credentials, provider failures, terminal snapshot states, timeouts, and
+ * contentless records all fail closed.
  *
- * Rate limit: 5-second queue between Apify calls.
- * Env required: APIFY_API_TOKEN (shared with other Apify providers).
+ * Env required: BRIGHTDATA_API_TOKEN.
  */
 
 import { z } from 'zod';
 import { logger } from '../logger.js';
-import { sleep } from '../pipeline-core.js';
 import {
   SearchResultSchema,
   FetchResultSchema,
@@ -23,232 +23,837 @@ import {
 } from '../types.js';
 import { extractQuotesWithGemini } from './gemini-extractor.js';
 
-// =============================================================================
-// Rate limiter — 5-second queue between Apify calls
-// =============================================================================
+const BRIGHTDATA_BASE_URL = 'https://api.brightdata.com/datasets/v3';
+export const BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID = 'gd_lk5ns7kz21pck8jpis';
+export const BRIGHTDATA_INSTAGRAM_PROFILES_DATASET_ID = 'gd_l1vikfch901nx3by4';
 
-const IG_RATE_LIMIT_MS = 5000;
-let lastIgCallAt = 0;
+const TRIGGER_TIMEOUT_MS = 30_000;
+const PROGRESS_TIMEOUT_MS = 15_000;
+const DOWNLOAD_TIMEOUT_MS = 60_000;
+const SCRAPE_TIMEOUT_MS = 90_000;
+const POLL_INTERVAL_MS = 5_000;
+const POLL_MAX_WAIT_MS = 180_000;
+const MAX_SEARCH_RESULTS = 25;
+const MAX_HASHTAGS_PER_SEARCH = 2;
 
-async function rateLimit(): Promise<void> {
-  const now = Date.now();
-  const elapsed = now - lastIgCallAt;
-  if (elapsed < IG_RATE_LIMIT_MS) {
-    await sleep(IG_RATE_LIMIT_MS - elapsed);
-  }
-  lastIgCallAt = Date.now();
+const TriggerResponseSchema = z.object({
+  snapshot_id: z.string().min(1),
+}).passthrough();
+
+const ProgressResponseSchema = z.object({
+  status: z.string().min(1),
+}).passthrough();
+
+const RecordSchema = z.record(z.string(), z.unknown());
+const RecordArraySchema = z.array(z.unknown());
+
+type InstagramRecord = z.infer<typeof RecordSchema>;
+
+interface NormalizedInstagramPost {
+  url: string;
+  canonicalId: string;
+  caption: string;
+  author: string | undefined;
+  publishedAt: string | undefined;
+  mediaUrls: string[];
+  comments: NormalizedInstagramComment[];
+  hashtags: string[];
+  postType: string | undefined;
+  viewCount: number | undefined;
+  likeCount: number | undefined;
+  commentCount: number | undefined;
 }
 
-// =============================================================================
-// Apify API helpers
-// =============================================================================
+interface NormalizedInstagramComment {
+  text: string;
+  author: string | undefined;
+  likeCount: number | undefined;
+}
 
-const APIFY_BASE_URL = 'https://api.apify.com/v2';
-const ACTOR_ID = 'apify/instagram-reel-scraper';
-const POLL_INTERVAL_MS = 5_000;
-const MAX_WAIT_MS = 5 * 60 * 1_000;
+interface NormalizedInstagramProfile {
+  url: string;
+  username: string;
+  fullName: string | undefined;
+  biography: string | undefined;
+  externalUrl: string | undefined;
+  profileImageUrl: string | undefined;
+  businessCategory: string | undefined;
+  followersCount: number | undefined;
+  followingCount: number | undefined;
+  postsCount: number | undefined;
+  verified: boolean | undefined;
+  private: boolean | undefined;
+}
 
-function getApifyToken(): string {
-  const token = process.env.APIFY_API_TOKEN;
-  if (token === undefined || token === '') {
-    throw new Error('APIFY_API_TOKEN environment variable is not configured');
+function getBrightDataToken(): string {
+  const token = process.env.BRIGHTDATA_API_TOKEN;
+  if (token === undefined || token.trim().length === 0) {
+    throw new Error('BRIGHTDATA_API_TOKEN environment variable is not configured');
   }
   return token;
 }
 
 function isEnabled(): boolean {
-  const token = process.env.APIFY_API_TOKEN;
-  return token !== undefined && token !== '';
+  const token = process.env.BRIGHTDATA_API_TOKEN;
+  return token !== undefined && token.trim().length > 0;
 }
 
-interface ApifyRunData {
-  id: string;
-  defaultDatasetId: string;
-  status: string;
-  usageTotalUsd?: number;
+function safeErrorName(error: unknown): string {
+  if (error instanceof DOMException && error.name === 'AbortError') {
+    return 'request aborted';
+  }
+  if (error instanceof Error && error.name.length > 0) {
+    return error.name;
+  }
+  return 'request failed';
 }
 
-async function startApifyRun(
-  actorId: string,
-  input: Record<string, unknown>,
-  token: string,
-): Promise<{ runId: string; datasetId: string }> {
-  const url = `${APIFY_BASE_URL}/acts/${encodeURIComponent(actorId)}/runs?token=${token}`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(input),
-    signal: AbortSignal.timeout(30_000),
-  });
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Apify start error (${actorId}): HTTP ${response.status} ${body.slice(0, 200)}`);
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  externalSignal?: AbortSignal,
+): Promise<Response> {
+  if (externalSignal?.aborted === true) {
+    throw new Error('Bright Data request aborted');
   }
 
-  const json = (await response.json()) as { data: ApifyRunData };
-  const runId = json.data.id;
-  const datasetId = json.data.defaultDatasetId;
+  const controller = new AbortController();
+  let timedOut = false;
+  let callerAborted = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const abortFromCaller = (): void => {
+    callerAborted = true;
+    controller.abort();
+  };
+  externalSignal?.addEventListener('abort', abortFromCaller, { once: true });
 
-  if (runId === '' || runId === undefined) {
-    throw new Error(`Apify actor "${actorId}" start response missing run id`);
-  }
-
-  return { runId, datasetId };
-}
-
-async function pollRunUntilDone(runId: string, token: string): Promise<{ usageUsd: number }> {
-  const startTime = Date.now();
-  const statusUrl = `${APIFY_BASE_URL}/actor-runs/${runId}?token=${token}`;
-
-  while (Date.now() - startTime < MAX_WAIT_MS) {
-    await sleep(POLL_INTERVAL_MS);
-
-    const response = await fetch(statusUrl, { signal: AbortSignal.timeout(15_000) });
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`Apify poll error: HTTP ${response.status} ${body.slice(0, 100)}`);
-    }
-
-    const json = (await response.json()) as { data: ApifyRunData };
-    const status = json.data.status;
-
-    if (status === 'SUCCEEDED') {
-      const usageUsd = json.data.usageTotalUsd !== undefined ? json.data.usageTotalUsd : 0;
-      return { usageUsd };
-    }
-
-    if (status === 'FAILED' || status === 'ABORTED' || status === 'TIMED-OUT') {
-      throw new Error(`Apify run "${runId}" ended with status "${status}"`);
-    }
-  }
-
-  throw new Error(`Apify run "${runId}" timed out after ${MAX_WAIT_MS / 1000}s`);
-}
-
-async function fetchDatasetItems(datasetId: string, token: string): Promise<unknown[]> {
-  const url = `${APIFY_BASE_URL}/datasets/${datasetId}/items?token=${token}`;
-  const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Apify dataset fetch error: HTTP ${response.status} ${body.slice(0, 100)}`);
-  }
-
-  return (await response.json()) as unknown[];
-}
-
-// =============================================================================
-// Hashtag derivation — pivot a free-text query to candidate hashtags
-// =============================================================================
-
-function deriveHashtags(query: string): string[] {
-  // Normalize: lowercase, strip punctuation, split on spaces
-  const normalized = query.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-  const words = normalized.split(/\s+/).filter(w => w.length > 1);
-
-  const hashtags: string[] = [];
-
-  // Full phrase concatenated (e.g. "ai for teachers" → "aiforteachers")
-  const fullSlug = words.join('');
-  if (fullSlug.length > 0 && fullSlug.length <= 30) {
-    hashtags.push(fullSlug);
-  }
-
-  // Key-word pairs that are commonly hashtagged
-  if (words.length >= 2) {
-    const pairSlug = words.slice(0, 2).join('');
-    if (pairSlug !== fullSlug) {
-      hashtags.push(pairSlug);
-    }
-  }
-
-  // Prepend "chatgpt" variant if query mentions "ai" or "chatgpt"
-  if (words.includes('ai') || words.includes('chatgpt')) {
-    const withChatgpt = words
-      .filter(w => w !== 'ai' && w !== 'chatgpt' && w !== 'for' && w !== 'the' && w !== 'and')
-      .slice(0, 2)
-      .join('');
-    if (withChatgpt.length > 0) {
-      hashtags.push(`chatgpt${withChatgpt}`);
-      hashtags.push(`ai${withChatgpt}`);
-    }
-  }
-
-  // Always include a broad "ai" hashtag as fallback
-  if (!hashtags.includes('artificialintelligence')) {
-    hashtags.push('artificialintelligence');
-  }
-
-  // Deduplicate while preserving order
-  const seen = new Set<string>();
-  const unique: string[] = [];
-  for (const tag of hashtags) {
-    if (!seen.has(tag)) {
-      seen.add(tag);
-      unique.push(tag);
-    }
-  }
-
-  return unique.slice(0, 3); // max 3 hashtag searches per query
-}
-
-// =============================================================================
-// Instagram Reel item schema (apify/instagram-reel-scraper output shape)
-// =============================================================================
-
-const IgReelCommentSchema = z.object({
-  text: z.string().optional(),
-  ownerUsername: z.string().optional(),
-  likesCount: z.number().optional(),
-  timestamp: z.string().optional(),
-}).passthrough();
-
-const IgReelItemSchema = z.object({
-  id: z.string().optional(),
-  shortCode: z.string().optional(),
-  url: z.string().optional(),
-  caption: z.string().optional(),
-  ownerUsername: z.string().optional(),
-  timestamp: z.string().optional(),
-  videoViewCount: z.number().optional(),
-  likesCount: z.number().optional(),
-  commentsCount: z.number().optional(),
-  hashtags: z.array(z.string()).optional(),
-  comments: z.array(IgReelCommentSchema).optional(),
-}).passthrough();
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-function toIsoString(dateStr: string): string | undefined {
-  if (dateStr.length === 0) return undefined;
   try {
-    const d = new Date(dateStr);
-    if (isNaN(d.getTime())) return undefined;
-    return d.toISOString();
-  } catch {
-    return undefined;
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(`Bright Data request timed out after ${timeoutMs}ms`);
+    }
+    if (callerAborted) {
+      throw new Error('Bright Data request aborted');
+    }
+    throw new Error(`Bright Data request failed (${safeErrorName(error)})`);
+  } finally {
+    clearTimeout(timeout);
+    externalSignal?.removeEventListener('abort', abortFromCaller);
   }
 }
 
-function extractReelUrl(item: z.infer<typeof IgReelItemSchema>): string | null {
-  if (item.url !== undefined && item.url.length > 0) {
-    return item.url;
+async function readJsonResponse(
+  response: Response,
+  operation: string,
+): Promise<unknown> {
+  if (!response.ok) {
+    throw new Error(`Bright Data ${operation} failed with HTTP ${response.status}`);
   }
-  if (item.shortCode !== undefined && item.shortCode.length > 0) {
-    return `https://www.instagram.com/reel/${item.shortCode}/`;
+  try {
+    return await response.json();
+  } catch {
+    throw new Error(`Bright Data ${operation} returned invalid JSON`);
   }
-  if (item.id !== undefined && item.id.length > 0) {
-    return `https://www.instagram.com/p/${item.id}/`;
+}
+
+function parseRecords(raw: unknown, operation: string): InstagramRecord[] {
+  const arrayResult = RecordArraySchema.safeParse(raw);
+  if (!arrayResult.success) {
+    throw new Error(`Bright Data ${operation} did not return a JSON array`);
+  }
+
+  const records: InstagramRecord[] = [];
+  for (const item of arrayResult.data) {
+    const parsed = RecordSchema.safeParse(item);
+    if (!parsed.success) continue;
+    const providerError = readString(parsed.data, 'error');
+    if (providerError !== null) {
+      throw new Error(`Bright Data ${operation} returned a provider error`);
+    }
+    records.push(parsed.data);
+  }
+  return records;
+}
+
+function readString(record: InstagramRecord, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return value.trim();
+    }
   }
   return null;
 }
 
-// =============================================================================
-// Provider
-// =============================================================================
+function readNumber(record: InstagramRecord, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === 'string' && value.trim().length > 0) {
+      const parsed = Number.parseFloat(value.replace(/[\s,]/g, ''));
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return undefined;
+}
+
+function readBoolean(record: InstagramRecord, ...keys: string[]): boolean | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === 'true') return true;
+      if (normalized === 'false') return false;
+    }
+  }
+  return undefined;
+}
+
+function readStringArray(record: InstagramRecord, ...keys: string[]): string[] {
+  for (const key of keys) {
+    const value = record[key];
+    if (!Array.isArray(value)) continue;
+    const strings = value.filter(
+      (entry): entry is string => typeof entry === 'string' && entry.trim().length > 0,
+    );
+    if (strings.length > 0) return strings.map(entry => entry.trim());
+  }
+  return [];
+}
+
+function readRecordArray(record: InstagramRecord, ...keys: string[]): InstagramRecord[] {
+  for (const key of keys) {
+    const value = record[key];
+    if (!Array.isArray(value)) continue;
+    const records: InstagramRecord[] = [];
+    for (const entry of value) {
+      const parsed = RecordSchema.safeParse(entry);
+      if (parsed.success) records.push(parsed.data);
+    }
+    if (records.length > 0) return records;
+  }
+  return [];
+}
+
+function toIsoString(value: string | null): string | undefined {
+  if (value === null) return undefined;
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return undefined;
+  return date.toISOString();
+}
+
+function normalizeAuthor(value: string | null): string | undefined {
+  if (value === null) return undefined;
+  return value.startsWith('@') ? value : `@${value}`;
+}
+
+function normalizeMediaUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function instagramRouteFromType(postType: string | null): 'p' | 'reel' {
+  const normalized = postType?.toLowerCase() ?? '';
+  return normalized.includes('reel') || normalized.includes('video') || normalized.includes('clip')
+    ? 'reel'
+    : 'p';
+}
+
+export function canonicalizeInstagramPostUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    if (hostname !== 'instagram.com' && hostname !== 'www.instagram.com') return null;
+    const match = url.pathname.match(/^\/(p|reel|reels|tv)\/([A-Za-z0-9_-]+)(?:\/|$)/i);
+    if (match === null || match[1] === undefined || match[2] === undefined) return null;
+    const rawRoute = match[1].toLowerCase();
+    const route = rawRoute === 'reels' ? 'reel' : rawRoute;
+    return `https://www.instagram.com/${route}/${match[2]}/`;
+  } catch {
+    return null;
+  }
+}
+
+const RESERVED_INSTAGRAM_ROUTES = new Set([
+  'about',
+  'accounts',
+  'api',
+  'developer',
+  'direct',
+  'directory',
+  'emails',
+  'explore',
+  'legal',
+  'p',
+  'privacy',
+  'reel',
+  'reels',
+  'stories',
+  'terms',
+  'tv',
+  'web',
+]);
+
+export function canonicalizeInstagramProfileUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    if (hostname !== 'instagram.com' && hostname !== 'www.instagram.com') return null;
+    const segments = url.pathname.split('/').filter(Boolean);
+    if (segments.length !== 1 || segments[0] === undefined) return null;
+    const username = segments[0].replace(/^@/, '').toLowerCase();
+    if (!/^[a-z0-9._]{1,30}$/.test(username) || RESERVED_INSTAGRAM_ROUTES.has(username)) {
+      return null;
+    }
+    return `https://www.instagram.com/${username}/`;
+  } catch {
+    return null;
+  }
+}
+
+function shortcodeFromInstagramUrl(value: string): string | null {
+  const canonical = canonicalizeInstagramPostUrl(value);
+  if (canonical === null) return null;
+  const segments = new URL(canonical).pathname.split('/').filter(Boolean);
+  return segments[1] ?? null;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function extractMediaUrls(record: InstagramRecord): string[] {
+  const candidates = [
+    ...readStringArray(record, 'photos', 'images', 'display_urls'),
+    ...readStringArray(record, 'videos', 'video_urls'),
+  ];
+  for (const key of ['video_url', 'videoUrl', 'display_url', 'displayUrl', 'thumbnail', 'image_url']) {
+    const value = readString(record, key);
+    if (value !== null) candidates.push(value);
+  }
+  return uniqueStrings(
+    candidates
+      .map(normalizeMediaUrl)
+      .filter((value): value is string => value !== null),
+  );
+}
+
+function extractComments(record: InstagramRecord): NormalizedInstagramComment[] {
+  const rawComments = readRecordArray(
+    record,
+    'latest_comments',
+    'top_comments',
+    'comments_data',
+    'comments_list',
+    'comments',
+  );
+  const comments: NormalizedInstagramComment[] = [];
+  for (const raw of rawComments) {
+    const text = readString(raw, 'text', 'comment', 'content');
+    if (text === null) continue;
+    comments.push({
+      text,
+      author: normalizeAuthor(readString(raw, 'owner_username', 'ownerUsername', 'username', 'user_name')),
+      likeCount: readNumber(raw, 'likes', 'likes_count', 'like_count', 'likesCount'),
+    });
+  }
+  return comments.slice(0, 100);
+}
+
+function hashtagsFromCaption(caption: string): string[] {
+  const matches = caption.match(/#[\p{L}\p{N}_]+/gu);
+  return matches === null
+    ? []
+    : uniqueStrings(matches.map(hashtag => hashtag.slice(1).toLowerCase()));
+}
+
+function normalizeInstagramRecord(
+  record: InstagramRecord,
+  expectedUrl?: string,
+): NormalizedInstagramPost | null {
+  const caption = readString(record, 'description', 'caption', 'text') ?? '';
+  const postType = readString(record, 'content_type', 'type', 'product_type', '__typename');
+  const rawUrl = readString(record, 'url', 'post_url');
+  const rawShortcode = readString(record, 'shortcode', 'short_code', 'shortCode');
+  const expectedCanonical = expectedUrl !== undefined
+    ? canonicalizeInstagramPostUrl(expectedUrl)
+    : null;
+  const expectedShortcode = expectedCanonical !== null
+    ? shortcodeFromInstagramUrl(expectedCanonical)
+    : null;
+  const canonicalFromRecord = rawUrl !== null ? canonicalizeInstagramPostUrl(rawUrl) : null;
+  const recordShortcode = rawShortcode ?? (
+    canonicalFromRecord !== null ? shortcodeFromInstagramUrl(canonicalFromRecord) : null
+  );
+
+  if (expectedCanonical !== null) {
+    if (recordShortcode === null || expectedShortcode === null || recordShortcode !== expectedShortcode) {
+      return null;
+    }
+  }
+
+  const canonicalId = recordShortcode;
+  if (canonicalId === null) return null;
+  const url = expectedCanonical
+    ?? canonicalFromRecord
+    ?? `https://www.instagram.com/${instagramRouteFromType(postType)}/${canonicalId}/`;
+
+  const mediaUrls = extractMediaUrls(record);
+  const comments = extractComments(record);
+  if (caption.length === 0 && mediaUrls.length === 0 && comments.length === 0) {
+    return null;
+  }
+
+  const explicitHashtags = readStringArray(record, 'hashtags')
+    .map(value => value.replace(/^#/, '').toLowerCase())
+    .filter(value => value.length > 0);
+
+  return {
+    url,
+    canonicalId,
+    caption,
+    author: normalizeAuthor(readString(record, 'user_posted', 'username', 'owner_username', 'ownerUsername')),
+    publishedAt: toIsoString(readString(record, 'date_posted', 'timestamp', 'taken_at')),
+    mediaUrls,
+    comments,
+    hashtags: uniqueStrings([...explicitHashtags, ...hashtagsFromCaption(caption)]),
+    postType: postType ?? undefined,
+    viewCount: readNumber(record, 'video_view_count', 'views', 'view_count', 'videoViewCount'),
+    likeCount: readNumber(record, 'likes', 'likes_count', 'num_likes', 'likesCount'),
+    commentCount: readNumber(record, 'num_comments', 'comments_count', 'comments', 'commentsCount'),
+  };
+}
+
+function normalizeInstagramProfileRecord(
+  record: InstagramRecord,
+  expectedUrl: string,
+): NormalizedInstagramProfile | null {
+  const expectedCanonical = canonicalizeInstagramProfileUrl(expectedUrl);
+  if (expectedCanonical === null) return null;
+  const expectedUsername = new URL(expectedCanonical).pathname.split('/').filter(Boolean)[0];
+  if (expectedUsername === undefined) return null;
+
+  const rawUsername = readString(record, 'account', 'username', 'user_posted', 'handle');
+  const profileUrl = readString(record, 'url', 'profile_url', 'profileUrl');
+  const usernameFromUrl = profileUrl !== null
+    ? canonicalizeInstagramProfileUrl(profileUrl)
+    : null;
+  const username = (
+    rawUsername?.replace(/^@/, '').trim()
+    ?? (usernameFromUrl !== null
+      ? new URL(usernameFromUrl).pathname.split('/').filter(Boolean)[0]
+      : undefined)
+  )?.toLowerCase();
+  if (username === undefined || username !== expectedUsername) return null;
+
+  const fullName = readString(record, 'full_name', 'fullName', 'name') ?? undefined;
+  const biography = readString(record, 'biography', 'bio') ?? undefined;
+  const externalUrl = readString(record, 'external_url', 'externalUrl', 'website', 'bio_link')
+    ?? undefined;
+  const profileImageUrl = readString(
+    record,
+    'profile_image_link',
+    'profile_pic_url_hd',
+    'profilePicUrlHD',
+    'profile_pic_url',
+    'profilePicUrl',
+    'avatar',
+  ) ?? undefined;
+  const businessCategory = readString(
+    record,
+    'business_category_name',
+    'category',
+    'category_name',
+  ) ?? undefined;
+  const followersCount = readNumber(record, 'followers', 'followers_count', 'followersCount');
+  const followingCount = readNumber(
+    record,
+    'following',
+    'follows_count',
+    'followsCount',
+    'followingCount',
+  );
+  const postsCount = readNumber(record, 'posts_count', 'postsCount', 'media_count', 'posts');
+  const verified = readBoolean(record, 'is_verified', 'verified', 'isVerified');
+  const isPrivate = readBoolean(record, 'is_private', 'private', 'isPrivate');
+
+  const hasUsefulProfileData = fullName !== undefined
+    || biography !== undefined
+    || externalUrl !== undefined
+    || profileImageUrl !== undefined
+    || businessCategory !== undefined
+    || followersCount !== undefined
+    || followingCount !== undefined
+    || postsCount !== undefined
+    || verified !== undefined
+    || isPrivate !== undefined;
+  if (!hasUsefulProfileData) return null;
+
+  return {
+    url: expectedCanonical,
+    username,
+    fullName,
+    biography,
+    externalUrl,
+    profileImageUrl,
+    businessCategory,
+    followersCount,
+    followingCount,
+    postsCount,
+    verified,
+    private: isPrivate,
+  };
+}
+
+function deriveHashtags(query: string): string[] {
+  const normalized = query.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+  const words = normalized.split(/\s+/).filter(word => word.length > 1);
+  const hashtags: string[] = [];
+
+  const fullSlug = words.join('');
+  if (fullSlug.length > 0 && fullSlug.length <= 30) hashtags.push(fullSlug);
+
+  if (words.length >= 2) {
+    const pairSlug = words.slice(0, 2).join('');
+    if (pairSlug !== fullSlug) hashtags.push(pairSlug);
+  }
+
+  if (words.includes('ai') || words.includes('chatgpt')) {
+    const topic = words
+      .filter(word => !['ai', 'chatgpt', 'for', 'the', 'and'].includes(word))
+      .slice(0, 2)
+      .join('');
+    if (topic.length > 0) {
+      hashtags.push(`chatgpt${topic}`, `ai${topic}`);
+    }
+  }
+
+  if (!hashtags.includes('artificialintelligence')) hashtags.push('artificialintelligence');
+  return uniqueStrings(hashtags).slice(0, MAX_HASHTAGS_PER_SEARCH);
+}
+
+function normalizeLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) return 15;
+  return Math.max(1, Math.min(MAX_SEARCH_RESULTS, Math.floor(limit)));
+}
+
+async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted === true) throw new Error('Bright Data request aborted');
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    }, ms);
+    const abort = (): void => {
+      clearTimeout(timeout);
+      reject(new Error('Bright Data request aborted'));
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
+async function triggerHashtagDiscovery(
+  hashtag: string,
+  limit: number,
+  token: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const endpoint = `${BRIGHTDATA_BASE_URL}/trigger`
+    + `?dataset_id=${BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID}`
+    + '&type=discover_new&discover_by=url';
+  const response = await fetchWithTimeout(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify([{
+      url: `https://www.instagram.com/explore/tags/${hashtag}/`,
+      num_of_posts: limit,
+    }]),
+  }, TRIGGER_TIMEOUT_MS, signal);
+  const raw = await readJsonResponse(response, 'Instagram discovery trigger');
+  const parsed = TriggerResponseSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new Error('Bright Data Instagram discovery trigger returned no snapshot_id');
+  }
+  return parsed.data.snapshot_id;
+}
+
+async function waitForSnapshot(
+  snapshotId: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const endpoint = `${BRIGHTDATA_BASE_URL}/progress/${encodeURIComponent(snapshotId)}`;
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < POLL_MAX_WAIT_MS) {
+    const response = await fetchWithTimeout(endpoint, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` },
+    }, PROGRESS_TIMEOUT_MS, signal);
+    const raw = await readJsonResponse(response, 'Instagram snapshot progress');
+    const parsed = ProgressResponseSchema.safeParse(raw);
+    if (!parsed.success) {
+      throw new Error('Bright Data Instagram snapshot progress failed validation');
+    }
+    const status = parsed.data.status.toLowerCase();
+    if (status === 'ready') return;
+    if (['failed', 'error', 'aborted', 'cancelled', 'canceled'].includes(status)) {
+      throw new Error(`Bright Data Instagram snapshot ended with status "${status}"`);
+    }
+    await abortableSleep(POLL_INTERVAL_MS, signal);
+  }
+
+  throw new Error(`Bright Data Instagram snapshot timed out after ${POLL_MAX_WAIT_MS}ms`);
+}
+
+async function downloadSnapshotRecords(
+  snapshotId: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<InstagramRecord[]> {
+  const endpoint = `${BRIGHTDATA_BASE_URL}/snapshot/${encodeURIComponent(snapshotId)}?format=json`;
+  const response = await fetchWithTimeout(endpoint, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` },
+  }, DOWNLOAD_TIMEOUT_MS, signal);
+  const raw = await readJsonResponse(response, 'Instagram snapshot download');
+  return parseRecords(raw, 'Instagram snapshot download');
+}
+
+async function discoverHashtag(
+  hashtag: string,
+  limit: number,
+  token: string,
+  signal?: AbortSignal,
+): Promise<NormalizedInstagramPost[]> {
+  const snapshotId = await triggerHashtagDiscovery(hashtag, limit, token, signal);
+  await waitForSnapshot(snapshotId, token, signal);
+  const records = await downloadSnapshotRecords(snapshotId, token, signal);
+  const posts = records
+    .map(record => normalizeInstagramRecord(record))
+    .filter((post): post is NormalizedInstagramPost => post !== null);
+  if (posts.length === 0) {
+    throw new Error('Bright Data Instagram discovery returned no usable content');
+  }
+  return posts;
+}
+
+async function scrapeDataset(
+  datasetId: string,
+  canonicalUrl: string,
+  operation: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<InstagramRecord[]> {
+  const endpoint = `${BRIGHTDATA_BASE_URL}/scrape`
+    + `?dataset_id=${datasetId}`
+    + '&format=json&include_errors=true';
+  const response = await fetchWithTimeout(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify([{ url: canonicalUrl }]),
+  }, SCRAPE_TIMEOUT_MS, signal);
+  const raw = await readJsonResponse(response, operation);
+  return parseRecords(raw, operation);
+}
+
+async function scrapePost(
+  canonicalUrl: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<NormalizedInstagramPost> {
+  const records = await scrapeDataset(
+    BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID,
+    canonicalUrl,
+    'Instagram post scrape',
+    token,
+    signal,
+  );
+  const post = records
+    .map(record => normalizeInstagramRecord(record, canonicalUrl))
+    .find(candidate => candidate !== null);
+  if (post === undefined || post === null) {
+    throw new Error('Bright Data Instagram post scrape returned no usable matching content');
+  }
+  return post;
+}
+
+async function scrapeProfile(
+  canonicalUrl: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<NormalizedInstagramProfile> {
+  const records = await scrapeDataset(
+    BRIGHTDATA_INSTAGRAM_PROFILES_DATASET_ID,
+    canonicalUrl,
+    'Instagram profile scrape',
+    token,
+    signal,
+  );
+  const profile = records
+    .map(record => normalizeInstagramProfileRecord(record, canonicalUrl))
+    .find(candidate => candidate !== null);
+  if (profile === undefined || profile === null) {
+    throw new Error('Bright Data Instagram profile scrape returned no usable matching content');
+  }
+  return profile;
+}
+
+function postToSearchResult(
+  post: NormalizedInstagramPost,
+  discoveryHashtag: string,
+): SearchResult {
+  return SearchResultSchema.parse({
+    provider: 'instagram',
+    url: post.url,
+    canonical_id: post.canonicalId,
+    title: post.caption.slice(0, 200),
+    snippet: post.caption.slice(0, 500),
+    author: post.author,
+    published_at: post.publishedAt,
+    engagement: {
+      view_count: post.viewCount,
+      like_count: post.likeCount,
+      comment_count: post.commentCount,
+    },
+    raw_metadata: {
+      instagram_provider: 'brightdata',
+      brightdata_dataset_id: BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID,
+      discovered_by: 'hashtag',
+      hashtag: discoveryHashtag,
+      discovery_hashtag: discoveryHashtag,
+      discovery_hashtags: [discoveryHashtag],
+      post_type: post.postType,
+      hashtags: post.hashtags,
+      media_urls: post.mediaUrls,
+    },
+  });
+}
+
+function postToFetchResult(post: NormalizedInstagramPost): FetchResult {
+  const heading = post.caption.length > 0 ? post.caption.slice(0, 100) : 'Instagram post';
+  const lines: string[] = [
+    `# ${heading}`,
+    '',
+    `**Source:** ${post.url}`,
+    `**Creator:** ${post.author ?? 'Unknown'}`,
+    '**Instagram data provider:** Bright Data',
+    '',
+  ];
+
+  if (post.caption.length > 0) {
+    lines.push('## Caption', '', post.caption, '');
+  }
+  if (post.mediaUrls.length > 0) {
+    lines.push('## Media', '');
+    for (const mediaUrl of post.mediaUrls) lines.push(`- ${mediaUrl}`);
+    lines.push('');
+  }
+  if (post.comments.length > 0) {
+    lines.push('## Comments', '');
+    for (const comment of post.comments) {
+      const likes = comment.likeCount !== undefined ? ` (${comment.likeCount} likes)` : '';
+      lines.push(`**${comment.author ?? 'Unknown'}**${likes}`, '', comment.text, '');
+    }
+  }
+
+  return FetchResultSchema.parse({
+    provider: 'instagram',
+    url: post.url,
+    canonical_id: post.canonicalId,
+    title: post.caption.slice(0, 200),
+    author: post.author,
+    published_at: post.publishedAt,
+    raw_content: post.caption,
+    markdown: lines.join('\n').trim(),
+    engagement: {
+      view_count: post.viewCount,
+      like_count: post.likeCount,
+      comment_count: post.commentCount,
+      instagram_provider: 'brightdata',
+      brightdata_dataset_id: BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID,
+      post_type: post.postType,
+      hashtags: post.hashtags,
+      media_urls: post.mediaUrls,
+    },
+    fetch_status: 'ok',
+  });
+}
+
+function profileToFetchResult(profile: NormalizedInstagramProfile): FetchResult {
+  const title = profile.fullName !== undefined
+    ? `${profile.fullName} (@${profile.username})`
+    : `@${profile.username}`;
+  const lines = [
+    `# ${title}`,
+    '',
+    `**Source:** ${profile.url}`,
+    '**Instagram data provider:** Bright Data',
+    '',
+  ];
+  if (profile.biography !== undefined) lines.push('## Bio', '', profile.biography, '');
+  if (profile.businessCategory !== undefined) lines.push(`**Category:** ${profile.businessCategory}`);
+  if (profile.followersCount !== undefined) lines.push(`**Followers:** ${profile.followersCount}`);
+  if (profile.followingCount !== undefined) lines.push(`**Following:** ${profile.followingCount}`);
+  if (profile.postsCount !== undefined) lines.push(`**Posts:** ${profile.postsCount}`);
+  if (profile.verified !== undefined) lines.push(`**Verified:** ${profile.verified ? 'yes' : 'no'}`);
+  if (profile.private !== undefined) lines.push(`**Private:** ${profile.private ? 'yes' : 'no'}`);
+  if (profile.externalUrl !== undefined) lines.push(`**Website:** ${profile.externalUrl}`);
+  if (profile.profileImageUrl !== undefined) lines.push(`**Profile image:** ${profile.profileImageUrl}`);
+
+  const markdown = lines.join('\n').trim();
+  return FetchResultSchema.parse({
+    provider: 'instagram',
+    url: profile.url,
+    canonical_id: profile.username,
+    title,
+    author: `@${profile.username}`,
+    raw_content: profile.biography ?? markdown,
+    markdown,
+    engagement: {
+      followers_count: profile.followersCount,
+      following_count: profile.followingCount,
+      posts_count: profile.postsCount,
+      verified: profile.verified,
+      private: profile.private,
+      instagram_provider: 'brightdata',
+      brightdata_dataset_id: BRIGHTDATA_INSTAGRAM_PROFILES_DATASET_ID,
+      source_kind: 'profile',
+      external_url: profile.externalUrl,
+      profile_image_url: profile.profileImageUrl,
+      business_category: profile.businessCategory,
+    },
+    fetch_status: 'ok',
+  });
+}
+
+function failedFetch(url: string, message: string): FetchResult {
+  return FetchResultSchema.parse({
+    provider: 'instagram',
+    url,
+    fetch_status: 'failed',
+    fetch_error: message.slice(0, 200),
+  });
+}
 
 export const instagramProvider: SearchProvider = {
   name: 'instagram',
@@ -258,220 +863,81 @@ export const instagramProvider: SearchProvider = {
   },
 
   async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
-    const token = getApifyToken();
-    const limit = opts.limit !== undefined ? Math.min(opts.limit, 25) : 15;
-
+    const token = getBrightDataToken();
+    const limit = normalizeLimit(opts.limit);
     const hashtags = deriveHashtags(query);
-    const results: SearchResult[] = [];
+    if (hashtags.length === 0) {
+      throw new Error('Instagram search query did not produce a usable hashtag');
+    }
 
-    // Search up to 2 hashtags per query call
-    for (const hashtag of hashtags.slice(0, 2)) {
-      await rateLimit();
-
-      const input: Record<string, unknown> = {
-        search: hashtag,
-        searchType: 'hashtag',
-        resultsLimit: limit,
-      };
-
-      let items: unknown[] = [];
-
-      try {
-        const { runId, datasetId } = await startApifyRun(ACTOR_ID, input, token);
-        await pollRunUntilDone(runId, token);
-        items = await fetchDatasetItems(datasetId, token);
-        logger.info(
-          { hashtag, items: items.length, query: query.slice(0, 60) },
-          '[Instagram] Hashtag scrape complete',
-        );
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn({ hashtag, error: msg }, '[Instagram] Hashtag scrape failed, skipping');
-        continue;
-      }
-
-      for (const rawItem of items) {
-        const parsed = IgReelItemSchema.safeParse(rawItem);
-        if (!parsed.success) continue;
-
-        const item = parsed.data;
-        const reelUrl = extractReelUrl(item);
-        if (reelUrl === null) continue;
-
-        const caption = item.caption !== undefined ? item.caption : '';
-        const author = item.ownerUsername !== undefined && item.ownerUsername.length > 0
-          ? `@${item.ownerUsername}`
-          : undefined;
-        const publishedAt = item.timestamp !== undefined ? toIsoString(item.timestamp) : undefined;
-
-        const candidate = {
-          provider: 'instagram' as const,
-          url: reelUrl,
-          canonical_id: item.shortCode !== undefined && item.shortCode.length > 0
-            ? item.shortCode
-            : (item.id !== undefined && item.id.length > 0 ? item.id : undefined),
-          title: caption.slice(0, 200),
-          snippet: caption.slice(0, 500),
-          author,
-          published_at: publishedAt,
-          engagement: {
-            view_count: item.videoViewCount,
-            like_count: item.likesCount,
-            comment_count: item.commentsCount,
-          },
-          raw_metadata: {
-            hashtag,
-            hashtags: item.hashtags,
-          },
-        };
-
-        const validated = SearchResultSchema.safeParse(candidate);
-        if (validated.success) {
-          results.push(validated.data);
+    const byUrl = new Map<string, SearchResult>();
+    for (const hashtag of hashtags) {
+      const posts = await discoverHashtag(hashtag, limit, token, opts.signal);
+      for (const post of posts) {
+        const existing = byUrl.get(post.url);
+        if (existing === undefined) {
+          byUrl.set(post.url, postToSearchResult(post, hashtag));
+          continue;
         }
+        const metadata = { ...existing.raw_metadata };
+        const prior = Array.isArray(metadata.discovery_hashtags)
+          ? metadata.discovery_hashtags.filter((value): value is string => typeof value === 'string')
+          : [String(metadata.discovery_hashtag ?? '')].filter(value => value.length > 0);
+        metadata.discovery_hashtags = uniqueStrings([...prior, hashtag]);
+        byUrl.set(post.url, SearchResultSchema.parse({ ...existing, raw_metadata: metadata }));
       }
     }
 
+    const results = [...byUrl.values()].slice(0, limit);
+    if (results.length === 0) {
+      throw new Error('Bright Data Instagram search returned no usable content');
+    }
     logger.info(
-      { query: query.slice(0, 60), count: results.length, hashtags },
-      '[Instagram] Search complete',
+      { resultCount: results.length, hashtagCount: hashtags.length },
+      '[Instagram] Bright Data search complete',
     );
-
     return results;
   },
 
   async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
-    const token = getApifyToken();
-    await rateLimit();
-
-    // signal reserved for future cancellation support
-    void signal;
-
-    const input: Record<string, unknown> = {
-      directUrls: [url],
-      resultsLimit: 1,
-      commentsLimit: 100,
-    };
-
-    let items: unknown[] = [];
+    const canonicalPostUrl = canonicalizeInstagramPostUrl(url);
+    const canonicalProfileUrl = canonicalizeInstagramProfileUrl(url);
+    if (canonicalPostUrl === null && canonicalProfileUrl === null) {
+      return failedFetch(
+        url,
+        'Instagram fetch requires a direct /p/, /reel/, /tv/, or one-segment profile URL',
+      );
+    }
 
     try {
-      const { runId, datasetId } = await startApifyRun(ACTOR_ID, input, token);
-      await pollRunUntilDone(runId, token);
-      items = await fetchDatasetItems(datasetId, token);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return FetchResultSchema.parse({
-        provider: 'instagram',
-        url,
-        fetch_status: 'failed',
-        fetch_error: `Instagram fetch failed: ${msg.slice(0, 200)}`,
-      });
-    }
-
-    const firstItem = items[0];
-    if (firstItem === undefined) {
-      return FetchResultSchema.parse({
-        provider: 'instagram',
-        url,
-        fetch_status: 'failed',
-        fetch_error: 'No items returned from Apify',
-      });
-    }
-
-    const parsed = IgReelItemSchema.safeParse(firstItem);
-    if (!parsed.success) {
-      return FetchResultSchema.parse({
-        provider: 'instagram',
-        url,
-        fetch_status: 'failed',
-        fetch_error: `Invalid item shape: ${parsed.error.message.slice(0, 100)}`,
-      });
-    }
-
-    const item = parsed.data;
-    const caption = item.caption !== undefined ? item.caption : '';
-    const author = item.ownerUsername !== undefined && item.ownerUsername.length > 0
-      ? `@${item.ownerUsername}`
-      : undefined;
-
-    // Build markdown with caption + top comments
-    const lines: string[] = [
-      `# Instagram Reel: ${caption.slice(0, 100)}`,
-      '',
-      `**Creator:** ${author !== undefined ? author : 'Unknown'} | **Views:** ${item.videoViewCount !== undefined ? item.videoViewCount : 0} | **Likes:** ${item.likesCount !== undefined ? item.likesCount : 0}`,
-      '',
-      '## Caption',
-      '',
-      caption,
-      '',
-    ];
-
-    const comments = item.comments;
-    if (comments !== undefined && Array.isArray(comments) && comments.length > 0) {
-      lines.push('## Comments', '');
-
-      const sortedComments = [...comments]
-        .map(c => IgReelCommentSchema.safeParse(c))
-        .filter(r => r.success)
-        .map(r => r.data)
-        .sort((a, b) => (b.likesCount !== undefined ? b.likesCount : 0) - (a.likesCount !== undefined ? a.likesCount : 0))
-        .slice(0, 100);
-
-      for (const comment of sortedComments) {
-        const commentText = comment.text !== undefined ? comment.text : '';
-        if (commentText.length === 0) continue;
-        const commentAuthor = comment.ownerUsername !== undefined ? `@${comment.ownerUsername}` : 'Unknown';
-        lines.push(`**${commentAuthor}** (${comment.likesCount !== undefined ? comment.likesCount : 0} likes)`);
-        lines.push('');
-        lines.push(commentText);
-        lines.push('');
-        lines.push('---');
-        lines.push('');
+      const token = getBrightDataToken();
+      if (canonicalPostUrl !== null) {
+        const post = await scrapePost(canonicalPostUrl, token, signal);
+        logger.info('[Instagram] Bright Data post fetch complete');
+        return postToFetchResult(post);
       }
+      if (canonicalProfileUrl === null) {
+        return failedFetch(url, 'Instagram URL could not be canonicalized');
+      }
+      const profile = await scrapeProfile(canonicalProfileUrl, token, signal);
+      logger.info('[Instagram] Bright Data profile fetch complete');
+      return profileToFetchResult(profile);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Bright Data Instagram fetch failed';
+      return failedFetch(canonicalPostUrl ?? canonicalProfileUrl ?? url, message);
     }
-
-    const markdown = lines.join('\n');
-    const publishedAt = item.timestamp !== undefined ? toIsoString(item.timestamp) : undefined;
-
-    const result = FetchResultSchema.parse({
-      provider: 'instagram',
-      url,
-      canonical_id: item.shortCode !== undefined && item.shortCode.length > 0
-        ? item.shortCode
-        : (item.id !== undefined && item.id.length > 0 ? item.id : undefined),
-      title: caption.slice(0, 200),
-      author,
-      published_at: publishedAt,
-      raw_content: caption,
-      markdown,
-      engagement: {
-        view_count: item.videoViewCount,
-        like_count: item.likesCount,
-        comment_count: item.commentsCount,
-      },
-      fetch_status: 'ok',
-      raw_metadata: {
-        hashtags: item.hashtags,
-        comments: item.comments !== undefined ? item.comments.slice(0, 100) : [],
-      },
-    });
-
-    logger.info(
-      { url: url.slice(0, 60), comments: comments !== undefined ? comments.length : 0 },
-      '[Instagram] Fetch complete',
-    );
-
-    return result;
   },
 
   async extract(raw: FetchResult): Promise<ExtractedQuotes> {
     const content = raw.markdown.length > 0 ? raw.markdown : raw.raw_content;
+    if (raw.fetch_status === 'failed' || content.trim().length === 0) {
+      throw new Error('Cannot extract Instagram evidence from a failed or empty Bright Data fetch');
+    }
     return extractQuotesWithGemini({
       provider: 'instagram',
       url: raw.url,
       content,
-      mode: 'reddit', // closest equivalent — comment threads with engagement
+      mode: 'reddit',
     });
   },
 };
