@@ -2,7 +2,7 @@
 
 **One rule: do not build a new research/search/crawl path.** If you need web research, use `@braintied/research` (this repo). If a surface below is marked *different-purpose*, it is intentionally separate — extend it in place, don't fork a new engine. Anything not listed here that searches/crawls the web is a regression (Momus audit 2026-07-05: "no competing systems" requires this registry + the CI guards to stay true).
 
-Updated: 2026-07-14 (Instagram Bright Data-only provider boundary, v0.6.4).
+Updated: 2026-07-17 (ora-server perplexity-collector converged onto the engine free-first ladder; Perplexity billing dependency removed from the collector pipeline).
 
 ## The engine
 
@@ -18,6 +18,7 @@ Updated: 2026-07-14 (Instagram Bright Data-only provider boundary, v0.6.4).
 | **Swishh app** blog pipeline + knowledge ingestion | `inngest/functions/blog-generation.ts` (grounded engine primary), `lib/knowledge-ingestion/*` (`ingestSource`) | `@swishh/research` deleted 2026-07-05 (`packages/research/` + tgzs + root dep). |
 | **`@swishh/blog` package** | dep `@braintied/research ^0.3.1` (v0.2.14+) | External consumers must vendor this package's tgz. |
 | **Watchtower** | `prd-generator.ts` (prd doc type) + `research.ts` web source (searxng→serper→tavily first-wins) | Legacy Gemini PRD path kept as fallback. |
+| **ora-server research-source collectors** (`ora-ai/platform/apps/ora-server/scripts/research/run-collector.ts` + `collectors/`) | `perplexity-collector.ts` is now the engine web-search collector: free-first `searxngProvider → serperProvider → tavilyProvider` first-wins ladder (converged 2026-07-17 — it previously called api.perplexity.ai directly and sat dark whenever the separate Perplexity account was quota'd; source_type stays `perplexity` so `ora_core.research_sources` rows are untouched) | Runs via the ora-agents host-cron runner (research-all-due-collector). REMAINING DRIFT (open, incremental): `tavily-collector.ts`, `web-collector.ts`/`crawl4ai-client.ts`, `reddit-collector.ts` still call providers directly — port onto package providers next; extend in place, do not fork. |
 | **ora-server agentic-research CLI** (`ora-ai/platform/apps/ora-server/scripts/research/agentic-research.ts`) | Engine providers for search (x/tiktok/instagram/youtube engine-first) + deep extraction (provider `fetch` → Tavily raw content → `crawlUrl`); keeps its own query gen, triage, scoring, `ora_core.research_projects` persistence, HTML feed report, knowledge auto-ingest | CONVERGED 2026-07-07 (was an unregistered parallel engine). Reddit search stays local (Tavily-primary hybrid; the package redditProvider's OAuth search rate-limits to 0 after the first call per session — port the hybrid before switching). |
 
 ## Intentionally separate (different-purpose — do NOT consolidate)
