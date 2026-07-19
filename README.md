@@ -16,12 +16,13 @@ Shared deep-research engine for Braintied products (Sentigen, Swishh, ora-ai, Kr
 6. **Synthesize** — Claude section drafts with inline citations, cost-capped
 7. **Critique loop** — find gaps, re-plan, re-search, re-synthesize
 8. **Assemble** — final report with bibliography
-9. **Ground** — validate citation-to-evidence ratio (diagnostic)
+9. **Ground** — validate citation-to-evidence ratio with explicit quality and pass/fail; weak reports receive a visible warning
 10. **Index (optional)** — hand chunks to an injected `indexSink`
 
 Higher layers (this package):
-- **Research kinds** — presets (`quick` / `standard` / `deep` / `managed` / `social`) so callers say *what kind* of research instead of tuning knobs
+- **Research kinds** — presets (`answer` / `quick` / `standard` / `deep` / `managed` / `social`) so callers say *what kind* of research instead of tuning knobs
 - **Documents** — `generateDocument({ docType, ... })` renders research into typed structured docs: `prd`, `market-report`, `tech-spec`, `client-brief`, `content-brief`, `estimate-research`
+- **Agent skill** — `skills/run-braintied-research/` provides a safe preflight, explicit cost caps, deterministic report/metadata output, and source-verification rules for Codex and other skill-aware agents
 
 ## Providers
 
@@ -63,17 +64,52 @@ as a recovery path.
 ## Usage
 
 ```ts
-import { runDeepResearch } from '@braintied/research';
+import { runResearch } from '@braintied/research';
 
-const { report, quotes, costUsd } = await runDeepResearch({
+const { report, quotes, costUsd } = await runResearch({
   brief: 'Competitive landscape for AI meeting assistants in 2026',
-  depth: 'standard',          // or 'wide'
+  kind: 'standard',
   maxCostUsd: 5,
 });
 console.log(report.full_markdown);
 ```
 
 Composable stages are exported individually (`planSubqueries`, `getEnabledProviders`, `rerankQuotes`, `synthesizeAllSections`, `critiqueDraft`, `assembleFinalReport`, `validateGrounding`) for consumers that orchestrate their own pipelines (e.g. cortex-worker keeps Inngest step boundaries).
+
+## Agent skill
+
+The canonical skill is [`skills/run-braintied-research/`](skills/run-braintied-research/).
+Its name deliberately differs from the existing Braintied Telegram/Cortex
+enrichment-operations skill.
+
+Preflight the package without making a network call:
+
+```bash
+node skills/run-braintied-research/scripts/run-internal-research.mjs \
+  --check \
+  --kind standard \
+  --max-cost-usd 2.50
+```
+
+The internal runner uses Braintied Agent Auth from `BRAINTIED_AGENT_TOKEN` or
+macOS Keychain and keeps all model/search provider credentials in Cortex Worker.
+`run-research.mjs` remains available as an explicit local-provider fallback; it
+supports allowlisted interactive-shell environment loading and build-freshness
+checks.
+
+To make this checkout discoverable in Codex without copying or drifting the
+skill, link the canonical folder once (fail if a path with that name already
+exists; inspect it rather than replacing it):
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+ln -s "$PWD/skills/run-braintied-research" \
+  "${CODEX_HOME:-$HOME/.codex}/skills/run-braintied-research"
+```
+
+Then invoke it as `$run-braintied-research`. See the skill's `SKILL.md` for
+brief classification, mode selection, cost controls, runtime configuration,
+and evidence standards. The `skills` directory is included in package releases.
 
 ## Consuming
 

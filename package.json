@@ -1,6 +1,6 @@
 {
   "name": "@braintied/research",
-  "version": "0.6.4",
+  "version": "0.6.7",
   "description": "Deep-research engine — multi-provider search, quote extraction, synthesis, critique, grounded report assembly, and research-driven document generation (PRDs, briefs, specs)",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -13,14 +13,16 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "skills"
   ],
   "scripts": {
     "build": "tsup",
+    "test": "npm run build && npm run test:unit && npm run test:instagram",
+    "test:unit": "tsx --test test/*.test.ts",
+    "test:instagram": "node --test tests/instagram-brightdata.test.mjs",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "test": "npm run test:instagram",
-    "test:instagram": "npm run build && node --test tests/instagram-brightdata.test.mjs",
     "clean": "rm -rf dist",
     "pack:release": "npm run clean && npm run build && npm pack --pack-destination ./releases",
     "smoke:searxng": "npx tsx scripts/smoke-test-searxng.ts",
@@ -44,7 +46,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ga1ien/braintied-research.git"
+    "url": "git+https://github.com/braintied/research.git"
+  },
+  "homepage": "https://github.com/braintied/research#readme",
+  "bugs": {
+    "url": "https://github.com/braintied/research/issues"
   },
   "engines": {
     "node": ">=18"
@@ -61,6 +67,7 @@
   "devDependencies": {
     "@types/node": "^22.10.6",
     "tsup": "^8.3.5",
+    "tsx": "^4.22.4",
     "typescript": "^5.7.3",
     "zod": "^4.3.4"
   }

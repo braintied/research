@@ -121,9 +121,15 @@ export { critiqueDraft } from './critique.js';
 export { buildReportChunks } from './chunker.js';
 export type { BuildReportChunksInput } from './chunker.js';
 export { embedTexts } from './embedder.js';
-export { validateGrounding } from './grounding.js';
+export {
+  assessGroundingQuality,
+  GROUNDING_PASS_THRESHOLD,
+  GROUNDING_STRONG_THRESHOLD,
+  validateGrounding,
+} from './grounding.js';
 export type {
   GroundingResult,
+  GroundingQuality,
   HallucinatedCitation,
   ValidateGroundingInput,
 } from './grounding.js';
@@ -715,6 +721,27 @@ export async function runDeepResearch(
     { ratio: grounding.ratio, valid: grounding.valid_citations, total: grounding.total_citations },
     '[runDeepResearch] Grounding validation complete',
   );
+
+  if (!grounding.passed) {
+    const groundingWarning = grounding.status === 'ungrounded'
+      ? 'This report contains no citation markers and must not be treated as source-verified.'
+      : `Automated evidence validation matched ${grounding.valid_citations} of ` +
+        `${grounding.total_citations} cited sources (${Math.round(grounding.ratio * 100)}%). ` +
+        'Treat the report as unverified until its claims are checked against primary sources.';
+    const warningBlock = `> **Evidence warning:** ${groundingWarning}`;
+    report.full_markdown = `${warningBlock}\n\n${report.full_markdown}`;
+    report.gaps = [...report.gaps, groundingWarning];
+    report.word_count = report.full_markdown.trim().split(/\s+/).length;
+    log.warn(
+      {
+        quality: grounding.quality,
+        ratio: grounding.ratio,
+        valid: grounding.valid_citations,
+        total: grounding.total_citations,
+      },
+      '[runDeepResearch] Report marked with evidence warning',
+    );
+  }
 
   // ---------------------------------------------------------------------------
   // Step 9: optional indexing

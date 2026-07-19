@@ -1,0 +1,4 @@
+interface:
+  display_name: "Braintied Web Research"
+  short_description: "Run grounded, cited multi-provider research"
+  default_prompt: "Use $run-braintied-research to investigate this question and return a cited decision brief."

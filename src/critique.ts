@@ -117,10 +117,9 @@ export async function critiqueDraft(input: CritiqueDraftInput): Promise<Critique
     `Actual total: ${totalWords} words\n\n` +
     `Draft sections:\n\n${sectionSummaries}`;
 
-  const anthropic = getAnthropicClient();
-
   let rawText = '';
   try {
+    const anthropic = getAnthropicClient();
     const response = await anthropic.messages.create({
       model: CRITIQUE_MODEL,
       max_tokens: 4096,

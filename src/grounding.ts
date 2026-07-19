@@ -27,6 +27,11 @@ export interface HallucinatedCitation {
   /** Best trigram overlap observed across the source's chunks (0–1) — tuning data. */
   best_ratio?: number;
 }
+export type GroundingQuality = 'strong' | 'acceptable' | 'weak' | 'ungrounded';
+
+export const GROUNDING_PASS_THRESHOLD = 0.6;
+export const GROUNDING_STRONG_THRESHOLD = 0.8;
+
 
 export interface GroundingResult {
   ratio: number;                   // valid_citations / total_citations (0–1)
@@ -38,12 +43,26 @@ export interface GroundingResult {
    * best: ratio is forced to 0, not 1). 'validated' — markers were checked.
    */
   status: 'validated' | 'ungrounded';
+  /** Human-facing evidence quality. Unlike status, this is a pass/fail signal. */
+  quality: GroundingQuality;
+  /** True only when the citation match ratio reaches the published threshold. */
+  passed: boolean;
 }
 
 export interface ValidateGroundingInput {
   fullMarkdown: string;
   bibliography: FinalReport['bibliography'];
   chunks: ReportChunkInput[];
+}
+
+export function assessGroundingQuality(
+  ratio: number,
+  totalCitations: number,
+): { quality: GroundingQuality; passed: boolean } {
+  if (totalCitations <= 0) return { quality: 'ungrounded', passed: false };
+  if (ratio >= GROUNDING_STRONG_THRESHOLD) return { quality: 'strong', passed: true };
+  if (ratio >= GROUNDING_PASS_THRESHOLD) return { quality: 'acceptable', passed: true };
+  return { quality: 'weak', passed: false };
 }
 
 // =============================================================================
@@ -181,6 +200,8 @@ export function validateGrounding(input: ValidateGroundingInput): GroundingResul
       valid_citations: 0,
       hallucinated: [],
       status: 'ungrounded',
+      quality: 'ungrounded',
+      passed: false,
     };
   }
 
@@ -258,6 +279,7 @@ export function validateGrounding(input: ValidateGroundingInput): GroundingResul
 
   const totalCitations = uniqueWindows.length;
   const ratio = totalCitations > 0 ? validCount / totalCitations : 0;
+  const assessment = assessGroundingQuality(ratio, totalCitations);
 
   return {
     ratio,
@@ -265,5 +287,6 @@ export function validateGrounding(input: ValidateGroundingInput): GroundingResul
     valid_citations: validCount,
     hallucinated,
     status: 'validated',
+    ...assessment,
   };
 }

@@ -164,9 +164,10 @@ export interface SearxngSearchOutcome {
 }
 
 /**
- * Hit one SearXNG instance (round-robin). On failure, fall back to the next
- * instance once. Returns structured outcome so the smoke test can compute
- * success rate without losing per-instance attribution.
+ * Hit one SearXNG instance (round-robin). On transport failure, invalid
+ * response, or an empty result set, fail over through the remaining pool.
+ * HTTP 200 with zero results commonly means every upstream engine on that
+ * instance is rate-limited, so treating it as healthy prevents useful failover.
  */
 export async function searxngSearch(
   query: string,
@@ -184,30 +185,31 @@ export async function searxngSearch(
 
   const triedUrls: string[] = [];
   const primary = pickPrimaryUrl(urls);
-  triedUrls.push(primary);
+  const candidates = [primary, ...urls.filter((candidate) => candidate !== primary)];
+  let lastError = 'All SearXNG instances returned no results';
 
-  try {
-    const results = await callOnce(primary, query, opts);
-    return { success: true, triedUrls, results };
-  } catch (primaryError) {
-    const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
-    logger.warn({ url: primary, error: primaryMessage, query: query.slice(0, 60) }, '[SearXNG] primary failed; trying fallback');
-
-    // Pick next instance not yet tried
-    for (const candidate of urls) {
-      if (triedUrls.includes(candidate)) continue;
-      triedUrls.push(candidate);
-      try {
-        const results = await callOnce(candidate, query, opts);
+  for (const candidate of candidates) {
+    triedUrls.push(candidate);
+    try {
+      const results = await callOnce(candidate, query, opts);
+      if (results.length > 0) {
         return { success: true, triedUrls, results };
-      } catch (fallbackError) {
-        const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
-        logger.warn({ url: candidate, error: fallbackMessage }, '[SearXNG] fallback failed');
       }
+      lastError = `SearXNG returned no results from ${candidate}`;
+      logger.warn(
+        { url: candidate, query: query.slice(0, 60) },
+        '[SearXNG] empty result set; trying fallback',
+      );
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      logger.warn(
+        { url: candidate, error: lastError, query: query.slice(0, 60) },
+        '[SearXNG] instance failed; trying fallback',
+      );
     }
-
-    return { success: false, triedUrls, results: [], error: primaryMessage };
   }
+
+  return { success: false, triedUrls, results: [], error: lastError };
 }
 
 // =============================================================================
