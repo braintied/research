@@ -7,7 +7,6 @@
  * Output includes paragraph-structured text (grouped by ~30s windows).
  */
 
-import { createRequire } from 'module';
 import { logger } from './logger.js';
 
 interface YTTranscriptSegment {
@@ -26,20 +25,9 @@ let _ytModule: YTTranscriptModule | null = null;
 
 async function getYTModule(): Promise<YTTranscriptModule> {
   if (_ytModule !== null) return _ytModule;
-  try {
-    // youtube-transcript >=1.3 ships a proper exports map; the package root
-    // resolves the ESM build. Resolution stays inside this function so a
-    // packaging change can never crash the worker at module load again
-    // (2026-06-09 incident: top-level require.resolve of the deep dist path
-    // threw ERR_PACKAGE_PATH_NOT_EXPORTED and crash-looped the whole app).
-    _ytModule = (await import('youtube-transcript')) as YTTranscriptModule;
-  } catch {
-    // Older versions (<1.3) lack an exports map and a usable ESM root —
-    // deep-import the ESM build directly.
-    const require = createRequire(import.meta.url);
-    const ytTranscriptPath = require.resolve('youtube-transcript/dist/youtube-transcript.esm.js');
-    _ytModule = (await import(ytTranscriptPath)) as YTTranscriptModule;
-  }
+  // youtube-transcript ^1.3.1 ships a proper exports map. Keep resolution
+  // inside this function so a packaging change cannot crash at module load.
+  _ytModule = (await import('youtube-transcript')) as YTTranscriptModule;
   return _ytModule;
 }
 
