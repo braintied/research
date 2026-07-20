@@ -2,13 +2,15 @@
 
 **One rule: do not build a new research/search/crawl path.** If you need web research, use `@braintied/research` (this repo). If a surface below is marked *different-purpose*, it is intentionally separate — extend it in place, don't fork a new engine. Anything not listed here that searches/crawls the web is a regression (Momus audit 2026-07-05: "no competing systems" requires this registry + the CI guards to stay true).
 
-Updated: 2026-07-19 (domain pipelines revival annotated; ecosystem edge registry linked).
+Updated: 2026-07-20 (0.6.9 synthesis liveness documented; domain pipelines revival annotated; ecosystem edge registry linked).
 
 **Companion registry:** the ecosystem-wide edge map — every research source, pipeline, store, consumer, and feedback loop across Cortex/Sentigen/Swishh with verified 2026-07-19 counts and liveness — is [`docs/research/braintied-research/ASSET-MAP.md`](https://github.com/braintied/ora-ai/blob/main/docs/research/braintied-research/ASSET-MAP.md) in `ora-ai` (platform monorepo). This file stays the one-engine registry for web research/search/crawl; the ASSET-MAP is the whole-ecosystem view.
 
 ## The engine
 
 `@braintied/research` — multi-provider search (free-first: searxng $0 → serper free-quota → tavily/exa/serpapi paid, only when free coverage is thin), Crawl4AI→Jina→direct fetch for general web pages (typed Crawl4AI config — the flat shape is silently ignored by 0.8.x), strict Bright Data-only Instagram discovery and post/profile fetch, Gemini quote extraction, Voyage rerank, Claude synthesis + critique loop, globally-renumbered citations + grounded assembly, honest CostTracker (search+extract+rerank+synth all counted; hard cap enforces on the true total), per-stage `onUsage` attribution, `ResearchCacheAdapter`, `indexSink`. Kinds: `quick`/`standard`/`deep`/`managed`(Perplexity, opt-in only)/`social`. Document layer: `prd`, `market-report`, `tech-spec`, `client-brief`, `content-brief`, `estimate-research`.
+
+**Synthesis liveness (0.6.9, 2026-07-20):** every per-section provider call carries `SYNTHESIS_REQUEST_TIMEOUT_MS` (15 min; SDK-level on Anthropic/OpenAI clients + an explicit `withTimeout` wrap on all three providers incl. Gemini) and raises `SynthesisTimeoutError` on expiry — a wedged provider socket can no longer hang a synthesis step forever (the WS-D incident class: 12/12 runs frozen in `synthesizing`). `synthesizeAllSections` also accepts `onSectionComplete?: (progress: SynthesisSectionProgress) => void`, fired after each section draft; the contract is non-blocking + self-swallowing (a heartbeat failure must never kill synthesis) — cortex-worker uses it to heartbeat `research_prompt_runs.updated_at`, which the `deep-research-stuck-run-sweeper` cron reads to fail wedged runs.
 
 ## Who runs it (consumers of THIS package)
 
