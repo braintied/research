@@ -3,7 +3,7 @@
  *
  * Three-stage synthesis pipeline:
  *   1. synthesizeSection  — per-section Claude Sonnet call with quotes + claims
- *   2. synthesizeAllSections — parallel runner (chunked by 5)
+ *   2. synthesizeAllSections — parallel runner (chunked by 2)
  *   3. assembleFinalReport — exec summary + bibliography + full markdown
  */
 
@@ -38,6 +38,51 @@ const ASSEMBLY_MODEL_DEFAULT = 'claude-sonnet-4-6';
 
 const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
+
+/**
+ * Hard ceiling on a single provider synthesis call. Root-cause fix for the
+ * 2026-07-20 synthesis-hang incident: 12/12 prompt runs froze in
+ * status='synthesizing' for 90+ minutes because none of the provider SDK
+ * clients had a request timeout — a wedged socket stalls the promise
+ * forever and the run never advances, never fails, and never writes a
+ * heartbeat. 15 minutes is far above the p99 for a Sonnet section call
+ * (1-5 min at 4-16k max tokens); it is a death sentence for a wedged
+ * request, not a performance target.
+ */
+export const SYNTHESIS_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
+
+/** Thrown when a provider synthesis call exceeds SYNTHESIS_REQUEST_TIMEOUT_MS. */
+export class SynthesisTimeoutError extends Error {
+  constructor(
+    public readonly model: string,
+    public readonly timeoutMs: number,
+  ) {
+    super(`Synthesis call to ${model} timed out after ${timeoutMs}ms`);
+    this.name = 'SynthesisTimeoutError';
+  }
+}
+
+/**
+ * Race a provider call against a hard deadline with explicit timer cleanup.
+ * Belt-and-suspenders alongside SDK-level `timeout` options: the observed
+ * hang was an SDK-level wait that never fired, so the watchdog does not
+ * trust any single SDK to bound its own sockets.
+ */
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, model: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new SynthesisTimeoutError(model, timeoutMs));
+      }, timeoutMs);
+      promise.then(resolve, reject);
+    });
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
 
 /**
  * Phase 1.b — unified synthesis call that dispatches to the right provider
@@ -85,14 +130,18 @@ export async function synthesisGenerate(args: {
       );
     }
     const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
+    const response = await withTimeout(
+      ai.models.generateContent({
+        model,
+        contents: user,
+        config: {
+          systemInstruction: system,
+          maxOutputTokens: maxTokens,
+        },
+      }),
+      SYNTHESIS_REQUEST_TIMEOUT_MS,
       model,
-      contents: user,
-      config: {
-        systemInstruction: system,
-        maxOutputTokens: maxTokens,
-      },
-    });
+    );
     const text = response.text;
     const usage = response.usageMetadata;
     // Gemini reports `cachedContentTokenCount` as a SLICE of `promptTokenCount`,
@@ -131,15 +180,19 @@ export async function synthesisGenerate(args: {
           + 'Set it on the cortex-worker Fly.io app.',
       );
     }
-    const openai = new OpenAI({ apiKey, baseURL: OPENROUTER_BASE_URL });
-    const response = await openai.chat.completions.create({
+    const openai = new OpenAI({ apiKey, baseURL: OPENROUTER_BASE_URL, timeout: SYNTHESIS_REQUEST_TIMEOUT_MS });
+    const response = await withTimeout(
+      openai.chat.completions.create({
+        model,
+        max_tokens: maxTokens,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+      }),
+      SYNTHESIS_REQUEST_TIMEOUT_MS,
       model,
-      max_tokens: maxTokens,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-    });
+    );
     const content = response.choices[0]?.message.content;
     return {
       text: typeof content === 'string' ? content : '',
@@ -168,13 +221,19 @@ export async function synthesisGenerate(args: {
       throw new Error('ANTHROPIC_API_KEY environment variable is not configured');
     }
   }
-  const client = baseURL !== undefined ? new Anthropic({ apiKey, baseURL }) : new Anthropic({ apiKey });
-  const response = await client.messages.create({
+  const client = baseURL !== undefined
+    ? new Anthropic({ apiKey, baseURL, timeout: SYNTHESIS_REQUEST_TIMEOUT_MS })
+    : new Anthropic({ apiKey, timeout: SYNTHESIS_REQUEST_TIMEOUT_MS });
+  const response = await withTimeout(
+    client.messages.create({
+      model,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: user }],
+    }),
+    SYNTHESIS_REQUEST_TIMEOUT_MS,
     model,
-    max_tokens: maxTokens,
-    system,
-    messages: [{ role: 'user', content: user }],
-  });
+  );
   let text = '';
   for (const block of response.content) {
     if (block.type === 'text') {
@@ -429,6 +488,13 @@ export interface SectionSpec {
   targetWords: number;
 }
 
+/** Progress signal emitted after each section finishes synthesizing. */
+export interface SynthesisSectionProgress {
+  sectionPath: string;
+  sectionsCompleted: number;
+  sectionsTotal: number;
+}
+
 export interface SynthesizeAllInput {
   sectionsToWrite: SectionSpec[];
   quotesByPath: Record<string, VerbatimQuote[]>;
@@ -437,6 +503,15 @@ export interface SynthesizeAllInput {
   synthesisModelOverride?: string;
   /** Phase 1 Experiment 3 — Gemini cache-hit measurement attribution. */
   telemetry?: { organizationId?: string; promptRunId?: string };
+  /**
+   * Optional per-section progress hook (2026-07-20 synthesis-hang fix).
+   * Called synchronously after each section completes; the caller uses it
+   * to write a liveness heartbeat (research_prompt_runs.updated_at) so the
+   * stuck-run sweeper can distinguish "actively synthesizing" from "wedged".
+   * Implementations MUST be non-blocking and swallow their own errors —
+   * a heartbeat failure must never kill synthesis.
+   */
+  onSectionComplete?: (progress: SynthesisSectionProgress) => void;
 }
 
 const PARALLEL_CHUNK_SIZE = 2;
@@ -453,7 +528,7 @@ export interface SynthesizeAllSectionsResult {
 export async function synthesizeAllSections(
   input: SynthesizeAllInput,
 ): Promise<SynthesizeAllSectionsResult> {
-  const { sectionsToWrite, quotesByPath, claimsByPath, synthesisModelOverride, telemetry } = input;
+  const { sectionsToWrite, quotesByPath, claimsByPath, synthesisModelOverride, telemetry, onSectionComplete } = input;
   const synthModel = resolveSynthesisModel(synthesisModelOverride, SYNTH_MODEL_DEFAULT);
 
   const results: SectionDraft[] = [];
@@ -486,6 +561,14 @@ export async function synthesizeAllSections(
       totalInputTokens += sectionResult.inputTokens;
       totalCachedReadTokens += sectionResult.cachedReadTokens;
       totalOutputTokens += sectionResult.outputTokens;
+
+      if (onSectionComplete !== undefined) {
+        onSectionComplete({
+          sectionPath: sectionResult.draft.section_path,
+          sectionsCompleted: results.length,
+          sectionsTotal: sectionsToWrite.length,
+        });
+      }
     }
 
     logger.info(

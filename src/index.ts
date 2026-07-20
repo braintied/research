@@ -110,11 +110,14 @@ export {
   synthesizeSection,
   synthesizeAllSections,
   assembleFinalReport,
+  SynthesisTimeoutError,
+  SYNTHESIS_REQUEST_TIMEOUT_MS,
 } from './synthesis.js';
 export type {
   SectionSpec,
   SynthesizeSectionInput,
   SynthesizeAllInput,
+  SynthesisSectionProgress,
   AssembleFinalReportInput,
 } from './synthesis.js';
 export { critiqueDraft } from './critique.js';
