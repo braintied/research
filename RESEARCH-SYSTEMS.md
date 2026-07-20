@@ -2,7 +2,9 @@
 
 **One rule: do not build a new research/search/crawl path.** If you need web research, use `@braintied/research` (this repo). If a surface below is marked *different-purpose*, it is intentionally separate — extend it in place, don't fork a new engine. Anything not listed here that searches/crawls the web is a regression (Momus audit 2026-07-05: "no competing systems" requires this registry + the CI guards to stay true).
 
-Updated: 2026-07-17 (ora-server perplexity-collector converged onto the engine free-first ladder; Perplexity billing dependency removed from the collector pipeline).
+Updated: 2026-07-19 (domain pipelines revival annotated; ecosystem edge registry linked).
+
+**Companion registry:** the ecosystem-wide edge map — every research source, pipeline, store, consumer, and feedback loop across Cortex/Sentigen/Swishh with verified 2026-07-19 counts and liveness — is [`docs/research/braintied-research/ASSET-MAP.md`](https://github.com/braintied/ora-ai/blob/main/docs/research/braintied-research/ASSET-MAP.md) in `ora-ai` (platform monorepo). This file stays the one-engine registry for web research/search/crawl; the ASSET-MAP is the whole-ecosystem view.
 
 ## The engine
 
@@ -30,7 +32,7 @@ Updated: 2026-07-17 (ora-server perplexity-collector converged onto the engine f
 | **Sentigen `web-research.ts`** (`src/lib/research/`) | `Result<T>` scrape utility with circuit breaker + title/metadata extraction — a richer single-URL contract than the package's `crawlUrl`. Its typed-Crawl4AI fix was ported INTO the package (v0.3.1). Uses no search APIs. |
 | **Sentigen Perplexity one-offs** (`ip-intelligence/deep-web-research.ts`, `entity-intelligence/news-perplexity-client.ts` via `scraping/perplexity-client.ts`) | Need Perplexity's answer-engine grounding specifically (brand clearance, entity news); `perplexity-client.ts` carries the circuit breaker + quota handling + `admin_ai_usage_log` tracking. Already attributed. |
 | **cortex-worker advice/content discovery** (`advice-tavily.ts`, `content-tavily.ts`) | Depend on Tavily advanced search `include_raw_content` (pre-extraction snippets that avoid a crawl) + relevance scores for quality filtering — free metasearch provides neither. Revisit only if volume makes the spend material. |
-| **cortex-worker domain pipelines** (advice/content/product/legal/writing on `research-pipeline-core.ts`) | Domain orchestration + ora_core writes; their crawl/extract primitives mirror the package and can adopt package stages incrementally (open, low priority). |
+| **cortex-worker domain pipelines** (advice/content/product/legal/writing on `research-pipeline-core.ts`) | Domain orchestration + ora_core writes; their crawl/extract primitives mirror the package and can adopt package stages incrementally (open, low priority). **2026-07-19 revival in flight:** these pipelines went stale Apr–May 2026 (last KB writes 2026-04-02→2026-05-22). The revival approach is corpus-seeded backfill `<domain>/research.start` events that re-feed the EXISTING corpus through the pipelines — deliberately no re-crawl of seed sources — plus `CONTENT_PIPELINE_ENABLED=1` for the content pipeline, which is additionally feature-gated (`content-research-pipeline.ts`). |
 | **Lens** (`ora-ai/projects/lens` deep-research) | Bookmark-KB synthesis — starts from user bookmarks, no web search/crawl at all. |
 | **Swishh `lib/scrape/`** | Social/public-data ingestion (Bright Data, twitterapi.io, ScrapeCreators, yt-dlp) — influencer discovery, not research. |
 | **Swishh `lib/research/`** (legacy SYSTEM 2: Gemini Deep Research + Firecrawl + Jina) | Blog FALLBACK path + engine/video research surfaces. Firecrawl retirement is GATED: instrument the grounded-engine fallback rate; retire when <1% of runs fall back over 7 days. Do not build new features on it. |
