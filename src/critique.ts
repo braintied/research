@@ -7,12 +7,14 @@
  * - Sections missing primary evidence from key providers
  * - Factual gaps warranting new subqueries
  *
- * Uses glm-5.2 (z.ai, Anthropic-compatible) for editorial judgment; a claude-*
- * override routes back to the Anthropic API once that key is funded.
+ * Routes through the unified synthesisGenerate() dispatcher, so the critique
+ * model is prefix-routed like every other synthesis call: gemini-3.6-flash is
+ * the working default today; glm-5.2 (z.ai) and claude-* become premium options
+ * by editing CRITIQUE_MODEL once their quota/credits restore.
  */
 
-import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
+import { synthesisGenerate } from './synthesis.js';
 import { logger } from './logger.js';
 import { CritiqueSchema } from './types.js';
 import type { Critique, SectionDraft, ProviderName } from './types.js';
@@ -21,33 +23,10 @@ import type { Critique, SectionDraft, ProviderName } from './types.js';
 // Constants
 // =============================================================================
 
-const CRITIQUE_MODEL = 'glm-5.2';
-
-// z.ai's Anthropic-compatible endpoint — glm-* models route here via baseURL
-// override on the same Anthropic SDK client (mirrors synthesis.ts).
-const GLM_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
-
-// =============================================================================
-// Anthropic client helper
-// =============================================================================
-
-function getAnthropicClient(model: string): Anthropic {
-  if (model.startsWith('glm-')) {
-    const apiKey = process.env.ZAI_API_KEY;
-    if (apiKey === undefined || apiKey === '') {
-      throw new Error(
-        'ZAI_API_KEY environment variable is not configured — required for glm-* models. '
-          + 'Set it on the cortex-worker Fly.io app.',
-      );
-    }
-    return new Anthropic({ apiKey, baseURL: GLM_ANTHROPIC_BASE_URL });
-  }
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (apiKey === undefined || apiKey === '') {
-    throw new Error('ANTHROPIC_API_KEY environment variable is not configured');
-  }
-  return new Anthropic({ apiKey });
-}
+// gemini-3.6-flash is the working default today; glm-5.2 (z.ai quota resets
+// 2026-07-25) and claude-sonnet-5 (Anthropic key) are premium overrides once
+// live. synthesisGenerate() prefix-routes all three.
+const CRITIQUE_MODEL = 'gemini-3.6-flash';
 
 // =============================================================================
 // Permissive fallback critique (no gaps, never loop)
@@ -134,21 +113,15 @@ export async function critiqueDraft(input: CritiqueDraftInput): Promise<Critique
 
   let rawText = '';
   try {
-    const anthropic = getAnthropicClient(CRITIQUE_MODEL);
-    const response = await anthropic.messages.create({
-      model: CRITIQUE_MODEL,
-      max_tokens: 4096,
+    const result = await synthesisGenerate({
       system: systemPrompt,
-      messages: [{ role: 'user', content: userMessage }],
+      user: userMessage,
+      model: CRITIQUE_MODEL,
+      maxTokens: 4096,
     });
-
-    for (const block of response.content) {
-      if (block.type === 'text') {
-        rawText += block.text;
-      }
-    }
+    rawText = result.text;
   } catch (err: unknown) {
-    logger.error({ err: String(err) }, '[critique] Claude API call failed, returning permissive critique');
+    logger.error({ err: String(err) }, '[critique] synthesis call failed, returning permissive critique');
     return buildPermissiveCritique(sections);
   }
 
@@ -158,7 +131,7 @@ export async function critiqueDraft(input: CritiqueDraftInput): Promise<Critique
   const jsonEnd = trimmed.lastIndexOf('}');
 
   if (jsonStart === -1 || jsonEnd === -1) {
-    logger.warn({ rawText }, '[critique] No JSON found in Claude response, returning permissive critique');
+    logger.warn({ rawText }, '[critique] No JSON found in synthesis response, returning permissive critique');
     return buildPermissiveCritique(sections);
   }
 

@@ -66,7 +66,7 @@ export type OnUsage = (event: DocUsageEvent) => void | Promise<void>;
 // generateDocument
 // =============================================================================
 
-const DEFAULT_DOC_MODEL = 'glm-5.2';
+const DEFAULT_DOC_MODEL = 'gemini-3.6-flash';
 const DOC_MAX_TOKENS = 8192;
 const MAX_PARSE_RETRIES = 1;
 
@@ -84,7 +84,7 @@ export interface GenerateDocumentInput {
   researchKind?: ResearchKind;
   /** Caller context woven into the prompt (client name, codebase, region…). */
   context?: string;
-  /** Doc-synthesis model — prefix-routed. Default glm-5.2. */
+  /** Doc-synthesis model — prefix-routed. Default gemini-3.6-flash. */
   model?: string;
   /** Fires once per LLM call with real token counts, for spend attribution. */
   onUsage?: OnUsage;

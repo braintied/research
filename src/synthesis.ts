@@ -29,10 +29,11 @@ import type {
 // Constants
 // =============================================================================
 
-// primary=glm-5.2 (independent, verified); claude-sonnet-5 is the quality
-// fallback via synthesis_model_override once the Anthropic key is funded.
-const SYNTH_MODEL_DEFAULT = 'glm-5.2';
-const ASSEMBLY_MODEL_DEFAULT = 'glm-5.2';
+// gemini-3.6-flash is the working default today; glm-5.2 (z.ai quota resets
+// 2026-07-25) and claude-sonnet-5 (Anthropic key) are premium overrides once
+// live, selected via synthesis_model_override.
+const SYNTH_MODEL_DEFAULT = 'gemini-3.6-flash';
+const ASSEMBLY_MODEL_DEFAULT = 'gemini-3.6-flash';
 
 // =============================================================================
 // Multi-provider synthesis dispatcher
