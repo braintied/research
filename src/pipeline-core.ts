@@ -97,7 +97,7 @@ export const MIN_CONTENT_CHARS_FOR_EXTRACTION = 500;
 export const VOYAGE_MODEL = 'voyage-4-large';
 export const VOYAGE_API_URL = 'https://api.voyageai.com/v1/embeddings';
 export const GEMINI_MAX_CONTENT_CHARS = 12000;
-export const EXTRACTION_MODEL = 'gemini-3.1-flash-lite-preview';
+export const EXTRACTION_MODEL = 'gemini-3.5-flash-lite';
 
 // ============================================================================
 // Helpers — Environment

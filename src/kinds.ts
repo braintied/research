@@ -48,7 +48,7 @@ export interface ResearchKindPreset {
   briefPreamble?: string;
   /**
    * Default synthesis model for this kind (callers can still override via
-   * RunResearchInput.synthesisModelOverride). Unset -> claude-sonnet-4-6.
+   * RunResearchInput.synthesisModelOverride). Unset -> glm-5.2.
    */
   synthesisModelDefault?: string;
 }
@@ -58,7 +58,7 @@ export const RESEARCH_KIND_PRESETS: Record<ResearchKind, ResearchKindPreset> = {
     kind: 'answer',
     description: 'Perplexity-style cited quick answer — one search, one cheap synthesis (~5-15s, ~$0.002-0.01)',
     engine: 'answer',
-    synthesisModelDefault: 'gemini-3-flash-preview',
+    synthesisModelDefault: 'gemini-3.6-flash',
   },
   quick: {
     kind: 'quick',
@@ -67,7 +67,7 @@ export const RESEARCH_KIND_PRESETS: Record<ResearchKind, ResearchKindPreset> = {
     depth: 'quick',
     // ~90% of a quick-run's cost was hardcoded Sonnet synthesis (2026-07-09
     // cost audit) — quick now defaults to the MICRO-tier Gemini flash.
-    synthesisModelDefault: 'gemini-3-flash-preview',
+    synthesisModelDefault: 'gemini-3.6-flash',
   },
   standard: {
     kind: 'standard',

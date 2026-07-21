@@ -7,7 +7,8 @@
  * - Sections missing primary evidence from key providers
  * - Factual gaps warranting new subqueries
  *
- * Uses Claude Opus 4.7 (1M context) for high-quality editorial judgment.
+ * Uses glm-5.2 (z.ai, Anthropic-compatible) for editorial judgment; a claude-*
+ * override routes back to the Anthropic API once that key is funded.
  */
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -20,13 +21,27 @@ import type { Critique, SectionDraft, ProviderName } from './types.js';
 // Constants
 // =============================================================================
 
-const CRITIQUE_MODEL = 'claude-sonnet-4-6';
+const CRITIQUE_MODEL = 'glm-5.2';
+
+// z.ai's Anthropic-compatible endpoint — glm-* models route here via baseURL
+// override on the same Anthropic SDK client (mirrors synthesis.ts).
+const GLM_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 
 // =============================================================================
 // Anthropic client helper
 // =============================================================================
 
-function getAnthropicClient(): Anthropic {
+function getAnthropicClient(model: string): Anthropic {
+  if (model.startsWith('glm-')) {
+    const apiKey = process.env.ZAI_API_KEY;
+    if (apiKey === undefined || apiKey === '') {
+      throw new Error(
+        'ZAI_API_KEY environment variable is not configured — required for glm-* models. '
+          + 'Set it on the cortex-worker Fly.io app.',
+      );
+    }
+    return new Anthropic({ apiKey, baseURL: GLM_ANTHROPIC_BASE_URL });
+  }
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (apiKey === undefined || apiKey === '') {
     throw new Error('ANTHROPIC_API_KEY environment variable is not configured');
@@ -119,7 +134,7 @@ export async function critiqueDraft(input: CritiqueDraftInput): Promise<Critique
 
   let rawText = '';
   try {
-    const anthropic = getAnthropicClient();
+    const anthropic = getAnthropicClient(CRITIQUE_MODEL);
     const response = await anthropic.messages.create({
       model: CRITIQUE_MODEL,
       max_tokens: 4096,

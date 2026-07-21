@@ -365,7 +365,7 @@ export interface RunDeepResearchInput {
    * accepted prefixes). The stage APIs accepted this since Phase 1 Experiment 1
    * but the top-level entrypoints never forwarded it — synthesis was
    * effectively hardcoded to claude-sonnet-4-6, which is ~90% of a quick-run's
-   * cost. The 'quick' kind now defaults this to gemini-3-flash-preview.
+   * cost. The 'quick' kind now defaults this to gemini-3.6-flash.
    */
   synthesisModelOverride?: string;
 }

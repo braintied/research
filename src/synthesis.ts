@@ -29,14 +29,17 @@ import type {
 // Constants
 // =============================================================================
 
-const SYNTH_MODEL_DEFAULT = 'claude-sonnet-4-6';
-const ASSEMBLY_MODEL_DEFAULT = 'claude-sonnet-4-6';
+// primary=glm-5.2 (independent, verified); claude-sonnet-5 is the quality
+// fallback via synthesis_model_override once the Anthropic key is funded.
+const SYNTH_MODEL_DEFAULT = 'glm-5.2';
+const ASSEMBLY_MODEL_DEFAULT = 'glm-5.2';
 
 // =============================================================================
 // Multi-provider synthesis dispatcher
 // =============================================================================
 
 const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
+const GLM_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
 /**
@@ -91,6 +94,8 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, model: str
  *   claude-*   → Anthropic SDK (ANTHROPIC_API_KEY)
  *   deepseek-* → Anthropic SDK with baseURL override (DEEPSEEK_API_KEY) —
  *                DeepSeek's Anthropic-compatible endpoint
+ *   glm-*      → Anthropic SDK with baseURL override (ZAI_API_KEY) —
+ *                z.ai's Anthropic-compatible endpoint
  *   gemini-*   → @google/genai SDK (GEMINI_API_KEY)
  *   qwen*      → OpenAI SDK with OpenRouter baseURL (OPENROUTER_API_KEY) —
  *                supports both `qwen-` short names and `qwen/qwen3-...`
@@ -215,6 +220,15 @@ export async function synthesisGenerate(args: {
           + 'use only for synthetic eval / non-customer-tagged data).',
       );
     }
+  } else if (model.startsWith('glm-')) {
+    apiKey = process.env.ZAI_API_KEY;
+    baseURL = GLM_ANTHROPIC_BASE_URL;
+    if (apiKey === undefined || apiKey === '') {
+      throw new Error(
+        'ZAI_API_KEY environment variable is not configured — required for glm-* models. '
+          + 'Set it on the cortex-worker Fly.io app.',
+      );
+    }
   } else {
     apiKey = process.env.ANTHROPIC_API_KEY;
     if (apiKey === undefined || apiKey === '') {
@@ -270,6 +284,7 @@ export async function synthesisGenerate(args: {
  * all four providers needed by the 7-model bake-off:
  *   - Anthropic (claude-*)              via Anthropic SDK
  *   - DeepSeek (deepseek-*)             via Anthropic-compatible endpoint
+ *   - GLM / z.ai (glm-*)                via Anthropic-compatible endpoint
  *   - Gemini (gemini-*)                 via @google/genai
  *   - Qwen3 + any OpenRouter model      via OpenAI SDK + OpenRouter baseURL
  *
@@ -281,11 +296,12 @@ function resolveSynthesisModel(override: string | undefined, fallback: string): 
   if (override === undefined || override.length === 0) return fallback;
   if (override.startsWith('claude-')) return override;
   if (override.startsWith('deepseek-')) return override;
+  if (override.startsWith('glm-')) return override;
   if (override.startsWith('gemini-')) return override;
   if (override.startsWith('qwen')) return override;
   throw new Error(
     `synthesis_model_override='${override}' not recognized. Supported prefixes: `
-      + `claude-*, deepseek-*, gemini-*, qwen* (or qwen/<openrouter-id>).`,
+      + `claude-*, deepseek-*, glm-*, gemini-*, qwen* (or qwen/<openrouter-id>).`,
   );
 }
 
@@ -334,7 +350,7 @@ export interface SynthesizeSectionInput {
   quotes: VerbatimQuote[];
   keyClaims: { claim: string; source_url: string; provider: ProviderName }[];
   targetWords: number;
-  /** Phase 1 Experiment 1 — see resolveSynthesisModel(). undefined → claude-sonnet-4-6. */
+  /** Phase 1 Experiment 1 — see resolveSynthesisModel(). undefined → glm-5.2. */
   synthesisModelOverride?: string;
   /** Phase 1 Experiment 3 — Gemini cache-hit measurement attribution. */
   telemetry?: { organizationId?: string; promptRunId?: string };
