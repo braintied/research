@@ -224,7 +224,7 @@ npm run pack:release          # → releases/braintied-research-<version>.tgz
 
 ```jsonc
 // consumer package.json
-"@braintied/research": "file:vendor/braintied-research-0.8.2.tgz"
+"@braintied/research": "file:vendor/braintied-research-0.8.3.tgz"
 ```
 
 ## Development

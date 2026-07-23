@@ -7,7 +7,12 @@
 
 import { z } from 'zod';
 import { getGeminiKey, fetchWithRetry, EXTRACTION_MODEL } from '../pipeline-core.js';
-import { ExtractedQuotesSchema, type ExtractedQuotes, type ProviderName } from '../types.js';
+import {
+  ExtractedQuotesSchema,
+  resolveSameSourceCitationUrl,
+  type ExtractedQuotes,
+  type ProviderName,
+} from '../types.js';
 import { logger } from '../logger.js';
 
 // =============================================================================
@@ -43,19 +48,23 @@ const GeminiResponseEnvelopeSchema = z.object({
 // Raw quote schema (what Gemini returns per quote in its JSON array)
 // =============================================================================
 
+const SENTIMENT_VALUES = ['positive', 'negative', 'neutral', 'mixed'] as const;
+type QuoteSentiment = (typeof SENTIMENT_VALUES)[number];
+const SENTIMENT_VALUE_SET = new Set<string>(SENTIMENT_VALUES);
+
 const RawQuoteSchema = z.object({
-  quote: z.string().default(''),
+  quote: z.string().min(1),
   context: z.string().default(''),
   source_url: z.string().default(''),
   author: z.string().optional(),
-  published_at: z.string().optional(),
+  published_at: z.string().datetime({ offset: true }).optional(),
   engagement: z.object({
     upvotes: z.number().optional(),
     likes: z.number().optional(),
     replies: z.number().optional(),
     views: z.number().optional(),
   }).default({}),
-  sentiment: z.enum(['positive', 'negative', 'neutral', 'mixed']).optional(),
+  sentiment: z.enum(SENTIMENT_VALUES).optional(),
   category: z.string().optional(),
 });
 
@@ -64,14 +73,152 @@ const RawQuoteSchema = z.object({
 // =============================================================================
 
 const RawExtractedSchema = z.object({
-  source_url: z.string().default(''),
-  source_provider: z.string().default('tavily'),
-  key_claims: z.array(z.string()).default([]),
-  verbatim_quotes: z.array(RawQuoteSchema).default([]),
-  dates_mentioned: z.array(z.string()).default([]),
-  entities_mentioned: z.array(z.string()).default([]),
-  themes: z.array(z.string()).default([]),
-});
+  // Treat model-generated collections as untrusted here, then salvage valid
+  // entries individually. One malformed optional field must not erase every
+  // valid quote and key claim extracted from the same page.
+  key_claims: z.unknown().optional(),
+  verbatim_quotes: z.unknown().optional(),
+  dates_mentioned: z.unknown().optional(),
+  entities_mentioned: z.unknown().optional(),
+  themes: z.unknown().optional(),
+}).passthrough();
+
+function stringEntries(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === 'string');
+}
+
+function normalizeSentiment(value: unknown): QuoteSentiment | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim().toLowerCase();
+  return SENTIMENT_VALUE_SET.has(normalized) ? normalized as QuoteSentiment : undefined;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function optionalPublishedAt(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  return z.string().datetime({ offset: true }).safeParse(value).success ? value : undefined;
+}
+
+function sanitizedEngagement(value: unknown): {
+  upvotes?: number;
+  likes?: number;
+  replies?: number;
+  views?: number;
+} {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return {};
+  const record = value as Record<string, unknown>;
+  const engagement: { upvotes?: number; likes?: number; replies?: number; views?: number } = {};
+  for (const key of ['upvotes', 'likes', 'replies', 'views'] as const) {
+    const candidate = record[key];
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) engagement[key] = candidate;
+  }
+  return engagement;
+}
+
+const ANCHORED_SOURCE_MODES = new Set<GeminiExtractInput['mode']>(['reddit', 'youtube', 'hn']);
+
+/**
+ * Bind model-returned quote URLs to the page that was actually fetched.
+ * Long-form/SERP evidence always cites that parent page. Thread/video modes
+ * may preserve a fragment (comment/timestamp), but only when resolving the
+ * candidate produces the same origin and canonical source as the parent.
+ */
+function validatedQuoteSourceUrl(input: GeminiExtractInput, candidate: unknown): string {
+  if (!ANCHORED_SOURCE_MODES.has(input.mode) || typeof candidate !== 'string' || candidate.length === 0) {
+    return input.url;
+  }
+  return resolveSameSourceCitationUrl(input.url, candidate);
+}
+
+function parseRawQuote(value: unknown, input: GeminiExtractInput): z.infer<typeof RawQuoteSchema> | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.quote !== 'string' || record.quote.trim().length === 0) return null;
+
+  const candidate = {
+    quote: record.quote,
+    context: typeof record.context === 'string' ? record.context : '',
+    source_url: validatedQuoteSourceUrl(input, record.source_url),
+    author: optionalString(record.author),
+    published_at: optionalPublishedAt(record.published_at),
+    engagement: sanitizedEngagement(record.engagement),
+    sentiment: normalizeSentiment(record.sentiment),
+    category: optionalString(record.category),
+  };
+  const parsed = RawQuoteSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : null;
+}
+
+export interface GeminiExtractionUsage {
+  promptTokenCount: number;
+  candidatesTokenCount: number;
+}
+
+/** @internal Pure normalization boundary, exported for offline contract tests. */
+export function normalizeGeminiExtractionPayload(
+  payload: unknown,
+  input: GeminiExtractInput,
+  usageMeta?: GeminiExtractionUsage,
+): ExtractedQuotes {
+  const rawResult = RawExtractedSchema.safeParse(payload);
+  if (!rawResult.success) {
+    logger.warn({ url: input.url, errors: rawResult.error.message }, '[GeminiExtractor] Invalid extracted schema');
+    return buildEmptyResult(input);
+  }
+
+  const rawQuotes = Array.isArray(rawResult.data.verbatim_quotes)
+    ? rawResult.data.verbatim_quotes
+    : [];
+  const validQuotes = rawQuotes.flatMap((quote) => {
+    const parsedQuote = parseRawQuote(quote, input);
+    return parsedQuote === null ? [] : [parsedQuote];
+  });
+  const droppedQuotes = rawQuotes.length - validQuotes.length;
+  if (droppedQuotes > 0) {
+    logger.warn(
+      { url: input.url, dropped_quotes: droppedQuotes },
+      '[GeminiExtractor] Dropped malformed quote entries',
+    );
+  }
+
+  const assembled = {
+    source_url: input.url,
+    source_provider: input.provider,
+    usage: usageMeta !== undefined
+      ? {
+          prompt_tokens: usageMeta.promptTokenCount,
+          candidate_tokens: usageMeta.candidatesTokenCount,
+        }
+      : undefined,
+    key_claims: stringEntries(rawResult.data.key_claims),
+    verbatim_quotes: validQuotes,
+    dates_mentioned: stringEntries(rawResult.data.dates_mentioned),
+    entities_mentioned: stringEntries(rawResult.data.entities_mentioned),
+    themes: stringEntries(rawResult.data.themes),
+  };
+
+  const final = ExtractedQuotesSchema.safeParse(assembled);
+  if (!final.success) {
+    logger.warn({ url: input.url, errors: final.error.message }, '[GeminiExtractor] Final schema validation failed');
+    return buildEmptyResult(input);
+  }
+
+  logger.info(
+    {
+      url: input.url.slice(0, 60),
+      mode: input.mode,
+      quotes: final.data.verbatim_quotes.length,
+      claims: final.data.key_claims.length,
+    },
+    '[GeminiExtractor] Extraction complete',
+  );
+
+  return final.data;
+}
 
 // =============================================================================
 // Mode-specific prompt builders
@@ -94,7 +241,7 @@ Return ONLY valid JSON matching this exact schema — no prose, no markdown fenc
       "source_url": "<permalink or anchored URL>",
       "author": "<author if known>",
       "engagement": { "upvotes": 0, "likes": 0 },
-      "sentiment": "positive|negative|neutral|mixed",
+      "sentiment": "neutral",
       "category": "helpful|critical|scammy|promotional|informational"
     }
   ],
@@ -102,6 +249,8 @@ Return ONLY valid JSON matching this exact schema — no prose, no markdown fenc
   "entities_mentioned": [],
   "themes": []
 }
+
+For sentiment, emit exactly one of "positive", "negative", "neutral", or "mixed". Omit sentiment when it cannot be classified confidently.
 
 Source URL: ${url}`;
 
@@ -276,57 +425,7 @@ export async function extractQuotesWithGemini(input: GeminiExtractInput): Promis
     return buildEmptyResult(input);
   }
 
-  const rawResult = RawExtractedSchema.safeParse(parsed);
-  if (!rawResult.success) {
-    logger.warn({ url: input.url, errors: rawResult.error.message }, '[GeminiExtractor] Invalid extracted schema');
-    return buildEmptyResult(input);
-  }
-
-  const usageMeta = envelopeResult.data.usageMetadata;
-
-  // Build and Zod-validate the final ExtractedQuotes
-  const assembled = {
-    source_url: input.url,
-    source_provider: input.provider,
-    usage: usageMeta !== undefined
-      ? {
-          prompt_tokens: usageMeta.promptTokenCount,
-          candidate_tokens: usageMeta.candidatesTokenCount,
-        }
-      : undefined,
-    key_claims: rawResult.data.key_claims,
-    verbatim_quotes: rawResult.data.verbatim_quotes.map(q => ({
-      quote: q.quote,
-      context: q.context,
-      source_url: q.source_url.length > 0 ? q.source_url : input.url,
-      author: q.author,
-      published_at: q.published_at,
-      engagement: q.engagement,
-      sentiment: q.sentiment,
-      category: q.category,
-    })),
-    dates_mentioned: rawResult.data.dates_mentioned,
-    entities_mentioned: rawResult.data.entities_mentioned,
-    themes: rawResult.data.themes,
-  };
-
-  const final = ExtractedQuotesSchema.safeParse(assembled);
-  if (!final.success) {
-    logger.warn({ url: input.url, errors: final.error.message }, '[GeminiExtractor] Final schema validation failed');
-    return buildEmptyResult(input);
-  }
-
-  logger.info(
-    {
-      url: input.url.slice(0, 60),
-      mode: input.mode,
-      quotes: final.data.verbatim_quotes.length,
-      claims: final.data.key_claims.length,
-    },
-    '[GeminiExtractor] Extraction complete',
-  );
-
-  return final.data;
+  return normalizeGeminiExtractionPayload(parsed, input, envelopeResult.data.usageMetadata);
 }
 
 function buildEmptyResult(input: GeminiExtractInput): ExtractedQuotes {

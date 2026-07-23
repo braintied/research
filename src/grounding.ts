@@ -15,6 +15,7 @@
  * Pure TS, no external deps.
  */
 
+import { resolveSameSourceCitationUrl } from './types.js';
 import type {
   FinalReport,
   ProviderName,
@@ -89,7 +90,11 @@ export function buildGroundingEvidenceChunks(
 
   for (const [sourceUrl, quotes] of Object.entries(input.sourceQuotesByUrl)) {
     for (const quote of quotes) {
-      const key = `quote\u0000${sourceUrl}\u0000${normalizeForMatch(quote.quote)}`;
+      // Revalidate at the grounding boundary because native provider
+      // extractors can also supply quote URLs. Preserve only a same-source
+      // anchor so the bibliography and evidence pool share one safe identity.
+      const quoteSourceUrl = resolveSameSourceCitationUrl(sourceUrl, quote.source_url);
+      const key = `quote\u0000${quoteSourceUrl}\u0000${normalizeForMatch(quote.quote)}`;
       if (seen.has(key)) continue;
       seen.add(key);
       chunks.push({
@@ -97,7 +102,7 @@ export function buildGroundingEvidenceChunks(
         section_path: '',
         heading: null,
         content: quote.quote,
-        source_url: sourceUrl,
+        source_url: quoteSourceUrl,
         source_provider: null,
         source_author: quote.author !== undefined ? quote.author : null,
         source_published_at: quote.published_at !== undefined ? quote.published_at : null,

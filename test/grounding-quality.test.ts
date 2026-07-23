@@ -95,6 +95,55 @@ test('grounding evidence mirrors the quotes and source-bound key claims offered 
   );
 });
 
+test('grounding preserves a validated anchored quote URL instead of its parent map key', () => {
+  const parentUrl = 'https://www.youtube.com/watch?v=abc123';
+  const anchoredUrl = `${parentUrl}#t=42`;
+  const claim = 'The speaker describes a durable workflow boundary';
+  const chunks = buildGroundingEvidenceChunks({
+    sourceQuotesByUrl: {
+      [parentUrl]: [{
+        quote: claim,
+        context: '',
+        source_url: anchoredUrl,
+        engagement: {},
+      }],
+    },
+    claimsBySection: {},
+  });
+
+  assert.equal(chunks[0]?.source_url, anchoredUrl);
+  const result = validateGrounding({
+    fullMarkdown: `${claim} [^1].`,
+    bibliography: [{
+      citation_anchor: '[^1]',
+      source_url: anchoredUrl,
+      title: 'Video source',
+      author: '',
+      provider: 'youtube',
+    }],
+    chunks,
+  });
+  assert.equal(result.ratio, 1);
+  assert.equal(result.passed, true);
+});
+
+test('grounding falls back to the fetched parent for a cross-source quote URL', () => {
+  const parentUrl = 'https://docs.example/source';
+  const chunks = buildGroundingEvidenceChunks({
+    sourceQuotesByUrl: {
+      [parentUrl]: [{
+        quote: 'Evidence remains attached to the page that was fetched.',
+        context: '',
+        source_url: 'https://attacker.example/redirected-evidence',
+        engagement: {},
+      }],
+    },
+    claimsBySection: {},
+  });
+
+  assert.equal(chunks[0]?.source_url, parentUrl);
+});
+
 test('a conservative paraphrase of a source-bound key claim validates without lowering the threshold', () => {
   const chunks = buildGroundingEvidenceChunks({
     sourceQuotesByUrl: {},

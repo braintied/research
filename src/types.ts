@@ -445,3 +445,21 @@ export function canonicalizeUrl(url: string): string {
     return url;
   }
 }
+
+/**
+ * Preserve a comment/timestamp anchor only when it resolves to the same origin
+ * and canonical document as the fetched parent. Invalid, cross-origin, or
+ * different-document candidates fall back to the parent URL.
+ */
+export function resolveSameSourceCitationUrl(parentUrl: string, candidateUrl: string): string {
+  if (candidateUrl.length === 0) return parentUrl;
+  try {
+    const parent = new URL(parentUrl);
+    const resolved = new URL(candidateUrl, parent);
+    if (resolved.origin !== parent.origin) return parentUrl;
+    if (canonicalizeUrl(resolved.toString()) !== canonicalizeUrl(parent.toString())) return parentUrl;
+    return resolved.toString();
+  } catch {
+    return parentUrl;
+  }
+}

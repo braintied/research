@@ -15,6 +15,7 @@ import { logger } from './logger.js';
 import { getGeminiKey } from './pipeline-core.js';
 import { recordGeminiUsage } from './cache-hit-measurement.js';
 import {
+  canonicalizeUrl,
   SectionDraftSchema,
   FinalReportSchema,
   ProviderNameSchema,
@@ -712,6 +713,18 @@ export async function assembleFinalReport(
     })
     .join('\n\n');
 
+  // Validated comment/timestamp anchors intentionally differ from the fetched
+  // parent URL only by a fragment (or stripped tracking parameters). Make the
+  // parent search metadata available under that canonical identity so anchored
+  // citations do not lose their real provider/title/author provenance.
+  const sourceMetaByCanonical = new Map<string, NonNullable<typeof sourceMeta>[string]>();
+  if (sourceMeta !== undefined) {
+    for (const [sourceUrl, metadata] of Object.entries(sourceMeta)) {
+      const canonical = canonicalizeUrl(sourceUrl);
+      if (!sourceMetaByCanonical.has(canonical)) sourceMetaByCanonical.set(canonical, metadata);
+    }
+  }
+
   // Bibliography in global numeric order — bibliography[N-1] ⇔ [^N].
   // Provenance (audit m3): fill provider/title/author from the search phase's
   // sourceMeta instead of hardcoding placeholders. Unknown providers fall back
@@ -719,7 +732,9 @@ export async function assembleFinalReport(
   const bibliography = Array.from(urlToGlobal.entries())
     .sort((a, b) => a[1] - b[1])
     .map(([sourceUrl, num]) => {
-      const meta = sourceMeta !== undefined ? sourceMeta[sourceUrl] : undefined;
+      const meta = sourceMeta !== undefined
+        ? sourceMeta[sourceUrl] ?? sourceMetaByCanonical.get(canonicalizeUrl(sourceUrl))
+        : undefined;
       const providerParse = ProviderNameSchema.safeParse(
         meta !== undefined && meta.provider !== undefined ? meta.provider : '',
       );
