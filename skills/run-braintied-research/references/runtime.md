@@ -58,13 +58,28 @@ tool request requires an agent identity, `cortex` product access, and an
 execution-capable scope (`execute`, `write`, `admin`, `master`, or `*`). The
 initial registry exposes `research.run`; provider keys are never returned.
 
-Deep requests default to a 3,600-second client deadline; other kinds default to
-1,200 seconds. The Cortex route commits response headers immediately for long
-work and emits JSON-whitespace heartbeats every 15 seconds before one final JSON
-envelope. Do not place a buffering proxy in this path. A transport failure
-reports only its sanitized error name/cause code and request ID. A streamed
-HTTP 200 is not itself success: the client requires `ok: true` and a non-empty
-report before it writes any artifact.
+Live runs require internal-tools protocol v2. The client POSTs the request once
+to the catalog-advertised durable submission path, then polls the advertised
+tenant-bound status path until it receives a terminal result. Cortex persists
+the validated input before Inngest dispatch, binds idempotency to the complete
+organization/user/agent/request identity, and retains results for 24 hours.
+Submission retries, temporary `404`/`429`/`5xx` responses, and transport loss
+reuse the same request ID. A response lost after persistence therefore
+reattaches instead of paying for a second run.
+
+Deep requests default to a 3,600-second local client deadline; other kinds
+default to 1,200 seconds. The deadline stops polling, not the server-owned run.
+Preserve the request ID from the diagnostic and repeat the same invocation with
+`--request-id <id>` to resume. Metadata records both `request_id` and
+`durable_run_id`. A successful HTTP response is not itself success: the client
+requires the strict completed result envelope and a non-empty report before it
+writes artifacts.
+
+Cortex deployments acquire an atomic database exclusion lease. Lease
+acquisition fails while any unexpired research run is queued/running, and new
+submissions receive retryable `503` responses while the lease is held. The
+lease has a bounded expiry so a killed deploy client cannot pause research
+indefinitely.
 
 ## Local provider fallback: package and build
 
