@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 
 import { execFile } from 'node:child_process';
-import { access, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { access, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { assessGrounding } from './grounding-quality.mjs';
+import { parseAllowlistedEnvFile } from './research-env-file.mjs';
 
 const VALID_KINDS = ['answer', 'quick', 'standard', 'deep', 'managed', 'social'];
 const PIPELINE_KINDS = new Set(['quick', 'standard', 'deep', 'social']);
@@ -22,10 +24,15 @@ const SYNTHESIS_DEFAULTS = new Map([
   ['deep', 'claude-sonnet-4-6'],
   ['social', 'claude-sonnet-4-6'],
 ]);
-const SHELL_ENV_NAMES = [
-  'ANTHROPIC_API_KEY',
+const GEMINI_KEY_NAMES = [
   'GEMINI_RESEARCH_KEY',
+  'GOOGLE_GEMINI_API_KEY',
+  'GOOGLE_GENERATIVE_AI_API_KEY',
   'GEMINI_API_KEY',
+];
+const RESEARCH_ENV_NAMES = [
+  'ANTHROPIC_API_KEY',
+  ...GEMINI_KEY_NAMES,
   'VOYAGE_API_KEY',
   'PERPLEXITY_API_KEY',
   'SEARXNG_URLS',
@@ -51,7 +58,11 @@ const SHELL_ENV_NAMES = [
   'GITHUB_TOKEN',
   'GH_TOKEN',
 ];
-const SHELL_ENV_NAME_SET = new Set(SHELL_ENV_NAMES);
+const SHARED_ENV_FILE_VARIABLE = 'BRAINTIED_RESEARCH_ENV_FILE';
+const GEMINI_KEY_NAME_VARIABLE = 'BRAINTIED_GEMINI_KEY_NAME';
+const IMPORTABLE_ENV_NAMES = [...RESEARCH_ENV_NAMES, GEMINI_KEY_NAME_VARIABLE];
+const IMPORTABLE_ENV_NAME_SET = new Set(IMPORTABLE_ENV_NAMES);
+const SHELL_CAPTURE_NAME_SET = new Set([...IMPORTABLE_ENV_NAMES, SHARED_ENV_FILE_VARIABLE]);
 const BRAINTIED_SEARXNG_URLS = 'https://cortex-searxng-a.fly.dev,https://cortex-searxng-b.fly.dev';
 const PACKAGE_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 const DIST_ENTRY = path.join(PACKAGE_ROOT, 'dist', 'index.mjs');
@@ -75,6 +86,9 @@ Options:
                             (default: standard)
   --max-cost-usd <number>   Required for pipeline kinds; must be > 0
   --synthesis-model <id>    Override the synthesis model/provider
+  --research-env-file <path>
+                            Import allowlisted settings from a secure dotenv file
+  --gemini-key-name <name>  Select one Gemini alias when configured values conflict
   --load-shell-env          Import allowlisted settings from an interactive shell
   --recency-days <integer>  Recency window for answer or pipeline searches
   --sources <csv>           Explicit lanes: web,x,reddit,youtube,github,community,...
@@ -88,9 +102,12 @@ Options:
   --help                    Show this help
 
 Environment:
-  Existing process variables take precedence. --load-shell-env imports only
-  allowlisted research settings and supplies Braintied's SearXNG pool when no
-  search provider is configured. Load only project-authorized credentials.
+  --research-env-file (or BRAINTIED_RESEARCH_ENV_FILE) accepts an absolute path
+  and imports only allowlisted research settings. Do not use Node's --env-file,
+  which loads every entry before this runner starts. Every supplied file must be
+  owner-only and regular; blank assignments explicitly disable inherited values.
+  --load-shell-env fills unmasked gaps and can discover the shared file pointer.
+  Use --gemini-key-name (or BRAINTIED_GEMINI_KEY_NAME) when aliases differ.
 `;
 
 function parseCli() {
@@ -104,6 +121,8 @@ function parseCli() {
       kind: { type: 'string', default: 'standard' },
       'max-cost-usd': { type: 'string' },
       'synthesis-model': { type: 'string' },
+      'research-env-file': { type: 'string' },
+      'gemini-key-name': { type: 'string' },
       'load-shell-env': { type: 'boolean' },
       'recency-days': { type: 'string' },
       sources: { type: 'string' },
@@ -149,8 +168,19 @@ function hasEnv(name) {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-async function loadInteractiveShellEnvironment(enabled) {
-  if (!enabled) return { source: null, loadedNames: [], defaultedNames: [] };
+function emptyRuntimeEnvironment() {
+  return {
+    source: null,
+    loadedNames: [],
+    overriddenNames: [],
+    maskedNames: [],
+    defaultedNames: [],
+    envFiles: [],
+  };
+}
+
+async function captureInteractiveShellEnvironment(enabled) {
+  if (!enabled) return new Map();
 
   const shell = process.env.SHELL !== undefined && process.env.SHELL.trim().length > 0
     ? process.env.SHELL
@@ -164,29 +194,187 @@ async function loadInteractiveShellEnvironment(enabled) {
     encoding: 'utf8',
     maxBuffer: 4 * 1024 * 1024,
   });
-  const loadedNames = [];
+  const captured = new Map();
   for (const entry of stdout.split('\0')) {
     const separator = entry.indexOf('=');
     if (separator <= 0) continue;
     const name = entry.slice(0, separator);
-    const value = entry.slice(separator + 1);
-    if (!SHELL_ENV_NAME_SET.has(name) || hasEnv(name) || value.trim().length === 0) continue;
+    if (!SHELL_CAPTURE_NAME_SET.has(name)) continue;
+    captured.set(name, entry.slice(separator + 1));
+  }
+  return captured;
+}
+
+function resolveEnvironmentFilePath(cliPath, shellEnvironment) {
+  if (cliPath !== undefined && cliPath.trim().length === 0) {
+    throw new Error('--research-env-file requires a non-empty absolute path.');
+  }
+  let configuredPath = cliPath;
+  if (configuredPath === undefined) {
+    const inheritedPointer = process.env[SHARED_ENV_FILE_VARIABLE];
+    configuredPath = inheritedPointer !== undefined && inheritedPointer.trim().length > 0
+      ? inheritedPointer
+      : shellEnvironment.get(SHARED_ENV_FILE_VARIABLE);
+  }
+  if (configuredPath === undefined || configuredPath.trim().length === 0) return null;
+  if (!path.isAbsolute(configuredPath)) {
+    throw new Error(`${SHARED_ENV_FILE_VARIABLE} and --research-env-file must use an absolute path.`);
+  }
+  return path.normalize(configuredPath);
+}
+
+function rejectNodeEnvironmentPreload() {
+  if (process.execArgv.some((argument) => (
+    argument === '--env-file'
+    || argument.startsWith('--env-file=')
+    || argument === '--env-file-if-exists'
+    || argument.startsWith('--env-file-if-exists=')
+  ))) {
+    throw new Error("Refusing Node's env-file preload because it bypasses the research allowlist; use --research-env-file instead.");
+  }
+}
+
+async function loadAllowlistedEnvironmentFile(absolutePath) {
+  if (absolutePath === null) return emptyRuntimeEnvironment();
+  if (process.platform === 'win32') {
+    throw new Error('Secure --research-env-file loading is unavailable on Windows; inject approved process environment variables instead.');
+  }
+  if (typeof fsConstants.O_NOFOLLOW !== 'number') {
+    throw new Error('This platform cannot safely reject symlinked research environment files.');
+  }
+
+  let fileHandle;
+  try {
+    fileHandle = await open(
+      absolutePath,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | (fsConstants.O_NONBLOCK ?? 0),
+    );
+  } catch (error) {
+    if (error !== null && typeof error === 'object' && 'code' in error && error.code === 'ELOOP') {
+      throw new Error(`Research environment file must not be a symbolic link: ${absolutePath}.`);
+    }
+    throw error;
+  }
+
+  let contents;
+  try {
+    const fileStats = await fileHandle.stat();
+    if (!fileStats.isFile()) {
+      throw new Error(`Research environment path is not a regular file: ${absolutePath}.`);
+    }
+    if ((fileStats.mode & 0o077) !== 0) {
+      throw new Error(`Research environment file must have owner-only permissions (0600 or stricter): ${absolutePath}.`);
+    }
+    contents = await fileHandle.readFile({ encoding: 'utf8' });
+  } finally {
+    await fileHandle.close();
+  }
+
+  const parsed = parseAllowlistedEnvFile(contents, absolutePath, IMPORTABLE_ENV_NAME_SET);
+
+  const loadedNames = [];
+  const overriddenNames = [];
+  const maskedNames = [];
+  for (const [name, value] of parsed) {
+    if (value.trim().length === 0) {
+      if (hasEnv(name)) overriddenNames.push(name);
+      delete process.env[name];
+      maskedNames.push(name);
+      continue;
+    }
+    if (process.env[name] !== undefined && process.env[name] !== value) {
+      overriddenNames.push(name);
+    }
+    process.env[name] = value;
+    loadedNames.push(name);
+  }
+  return {
+    source: 'env-file',
+    loadedNames,
+    overriddenNames: [...new Set(overriddenNames)],
+    maskedNames,
+    defaultedNames: [],
+    envFiles: [absolutePath],
+  };
+}
+
+function applyInteractiveShellEnvironment(shellEnvironment, enabled, maskedNames) {
+  if (!enabled) return emptyRuntimeEnvironment();
+  const masked = new Set(maskedNames);
+  const loadedNames = [];
+  for (const name of IMPORTABLE_ENV_NAMES) {
+    const value = shellEnvironment.get(name);
+    if (value === undefined || masked.has(name) || hasEnv(name) || value.trim().length === 0) continue;
     process.env[name] = value;
     loadedNames.push(name);
   }
 
   const defaultedNames = [];
-  if (!hasEnv('SEARXNG_URLS')) {
+  if (!masked.has('SEARXNG_URLS') && !hasEnv('SEARXNG_URLS')) {
     process.env.SEARXNG_URLS = BRAINTIED_SEARXNG_URLS;
     defaultedNames.push('SEARXNG_URLS');
   }
-  return { source: 'interactive-shell', loadedNames, defaultedNames };
+  return {
+    source: 'interactive-shell',
+    loadedNames,
+    overriddenNames: [],
+    maskedNames: [],
+    defaultedNames,
+    envFiles: [],
+  };
 }
 
-function applyGeminiAlias() {
-  if (!hasEnv('GEMINI_API_KEY') && hasEnv('GEMINI_RESEARCH_KEY')) {
-    process.env.GEMINI_API_KEY = process.env.GEMINI_RESEARCH_KEY;
+function combineRuntimeEnvironments(...environments) {
+  const active = environments.filter((environment) => environment.source !== null);
+  return {
+    source: active.length > 0 ? active.map((environment) => environment.source).join('+') : null,
+    loadedNames: [...new Set(active.flatMap((environment) => environment.loadedNames))].sort(),
+    overriddenNames: [...new Set(active.flatMap((environment) => environment.overriddenNames))].sort(),
+    maskedNames: [...new Set(active.flatMap((environment) => environment.maskedNames))].sort(),
+    defaultedNames: [...new Set(active.flatMap((environment) => environment.defaultedNames))].sort(),
+    envFiles: [...new Set(active.flatMap((environment) => environment.envFiles))],
+    resolvedGeminiKeyName: null,
+  };
+}
+
+function resolveGeminiEnvironment(cliKeyName, runtimeEnvironment) {
+  const configuredKeyName = cliKeyName ?? process.env[GEMINI_KEY_NAME_VARIABLE];
+  if (configuredKeyName !== undefined && configuredKeyName.trim().length === 0) {
+    throw new Error('--gemini-key-name must name a supported Gemini environment variable.');
   }
+  const selectedByName = configuredKeyName?.trim();
+  if (selectedByName !== undefined && !GEMINI_KEY_NAMES.includes(selectedByName)) {
+    throw new Error(`Unsupported Gemini key name ${selectedByName}; expected one of: ${GEMINI_KEY_NAMES.join(', ')}.`);
+  }
+
+  const candidates = GEMINI_KEY_NAMES
+    .filter(hasEnv)
+    .map((name) => ({ name, value: process.env[name] }));
+  let selected = null;
+  if (selectedByName !== undefined) {
+    selected = candidates.find((candidate) => candidate.name === selectedByName) ?? null;
+    if (selected === null) {
+      throw new Error(`Selected Gemini key ${selectedByName} is not configured.`);
+    }
+  } else {
+    const distinctValues = new Set(candidates.map((candidate) => candidate.value));
+    if (distinctValues.size > 1) {
+      const names = candidates.map((candidate) => candidate.name).join(', ');
+      throw new Error(`Conflicting Gemini aliases are configured (${names}); choose one with --gemini-key-name.`);
+    }
+    selected = candidates[0] ?? null;
+  }
+
+  if (selected === null) return;
+  for (const canonicalName of ['GEMINI_RESEARCH_KEY', 'GEMINI_API_KEY']) {
+    if (hasEnv(canonicalName) && process.env[canonicalName] !== selected.value) {
+      runtimeEnvironment.overriddenNames.push(canonicalName);
+    }
+    process.env[canonicalName] = selected.value;
+  }
+  runtimeEnvironment.overriddenNames = [...new Set(runtimeEnvironment.overriddenNames)].sort();
+  runtimeEnvironment.resolvedGeminiKeyName = selected.name;
+  process.env[GEMINI_KEY_NAME_VARIABLE] = selected.name;
 }
 
 async function loadPackage() {
@@ -196,7 +384,6 @@ async function loadPackage() {
     throw new Error(`Built package not found at ${DIST_ENTRY}. Run npm run build first.`);
   }
 
-  applyGeminiAlias();
   const research = await import(pathToFileURL(DIST_ENTRY).href);
   if (typeof research.runResearch !== 'function') {
     throw new Error('Built package does not export runResearch. Run npm run build from current source.');
@@ -216,8 +403,9 @@ function addMissing(missing, name) {
 function requireSynthesisCredential(model, missing) {
   if (model === null) return;
   if (model.startsWith('gemini-')) {
-    if (!hasEnv('GEMINI_RESEARCH_KEY') && !hasEnv('GEMINI_API_KEY')) {
-      addMissing(missing, 'GEMINI_RESEARCH_KEY or GEMINI_API_KEY');
+    if (!hasEnv('GEMINI_RESEARCH_KEY') && !hasEnv('GEMINI_API_KEY')
+      && !hasEnv('GOOGLE_GENERATIVE_AI_API_KEY') && !hasEnv('GOOGLE_GEMINI_API_KEY')) {
+      addMissing(missing, 'a supported Gemini API key');
     }
   } else if (model.startsWith('deepseek-')) {
     if (!hasEnv('DEEPSEEK_API_KEY')) addMissing(missing, 'DEEPSEEK_API_KEY');
@@ -231,7 +419,8 @@ function requireSynthesisCredential(model, missing) {
 function requiredConfiguration(kind, enabledProviders, synthesisModel) {
   const missing = [];
   const warnings = [];
-  const geminiPresent = hasEnv('GEMINI_RESEARCH_KEY') || hasEnv('GEMINI_API_KEY');
+  const geminiPresent = hasEnv('GEMINI_RESEARCH_KEY') || hasEnv('GEMINI_API_KEY')
+    || hasEnv('GOOGLE_GENERATIVE_AI_API_KEY') || hasEnv('GOOGLE_GEMINI_API_KEY');
   const generalSearchPresent = enabledProviders.some((provider) => GENERAL_SEARCH_PROVIDERS.has(provider));
   const socialProviders = new Set(['reddit', 'youtube', 'x', 'tiktok', 'instagram', 'facebook_groups', 'podcasts']);
   const socialSearchPresent = enabledProviders.some((provider) => socialProviders.has(provider));
@@ -242,7 +431,7 @@ function requiredConfiguration(kind, enabledProviders, synthesisModel) {
     if (!generalSearchPresent) addMissing(missing, 'at least one enabled general search provider');
     requireSynthesisCredential(synthesisModel, missing);
   } else {
-    if (!geminiPresent) addMissing(missing, 'GEMINI_RESEARCH_KEY or GEMINI_API_KEY');
+    if (!geminiPresent) addMissing(missing, 'a supported Gemini API key');
     requireSynthesisCredential(synthesisModel, missing);
     if (!hasEnv('VOYAGE_API_KEY')) {
       warnings.push('VOYAGE_API_KEY is absent; quote reranking will use stable provider order.');
@@ -381,11 +570,15 @@ async function preflight(
     enabled_providers: enabled,
     enabled_search_providers: enabledSearch,
     source_plan: sourcePlan,
-    configured_key_names: SHELL_ENV_NAMES.filter(hasEnv),
+    configured_key_names: RESEARCH_ENV_NAMES.filter(hasEnv),
     runtime_environment: {
       source: runtimeEnvironment.source,
       loaded_names: runtimeEnvironment.loadedNames,
+      overridden_names: runtimeEnvironment.overriddenNames,
+      masked_names: runtimeEnvironment.maskedNames,
       defaulted_names: runtimeEnvironment.defaultedNames,
+      env_files: runtimeEnvironment.envFiles,
+      resolved_gemini_key_name: runtimeEnvironment.resolvedGeminiKeyName,
     },
     missing: config.missing,
     warnings: config.warnings,
@@ -422,6 +615,7 @@ async function readBrief(values) {
 }
 
 async function main() {
+  rejectNodeEnvironmentPreload();
   let values;
   try {
     values = parseCli();
@@ -464,7 +658,17 @@ async function main() {
   if (!PIPELINE_KINDS.has(kind) && maxCostUsd !== undefined) {
     throw new Error(`--max-cost-usd is not enforced by ${kind} research; omit it and choose this kind deliberately.`);
   }
-  const runtimeEnvironment = await loadInteractiveShellEnvironment(values['load-shell-env'] === true);
+  const loadShellEnvironment = values['load-shell-env'] === true;
+  const capturedShellEnvironment = await captureInteractiveShellEnvironment(loadShellEnvironment);
+  const environmentFilePath = resolveEnvironmentFilePath(values['research-env-file'], capturedShellEnvironment);
+  const fileEnvironment = await loadAllowlistedEnvironmentFile(environmentFilePath);
+  const shellEnvironment = applyInteractiveShellEnvironment(
+    capturedShellEnvironment,
+    loadShellEnvironment,
+    fileEnvironment.maskedNames,
+  );
+  const runtimeEnvironment = combineRuntimeEnvironments(fileEnvironment, shellEnvironment);
+  resolveGeminiEnvironment(values['gemini-key-name'], runtimeEnvironment);
   const research = await loadPackage();
   const knownProviders = new Set(Array.isArray(research.PROVIDER_NAMES) ? research.PROVIDER_NAMES : []);
   const invalidProviders = requiredProviders.filter((provider) => !knownProviders.has(provider));

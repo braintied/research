@@ -103,16 +103,46 @@ export const EXTRACTION_MODEL = 'gemini-3.5-flash-lite';
 // Helpers — Environment
 // ============================================================================
 
+export const GEMINI_KEY_ENV_NAMES = [
+  'GEMINI_RESEARCH_KEY',
+  'GOOGLE_GEMINI_API_KEY',
+  'GOOGLE_GENERATIVE_AI_API_KEY',
+  'GEMINI_API_KEY',
+] as const;
+
+export const GEMINI_KEY_NAME_ENV = 'BRAINTIED_GEMINI_KEY_NAME';
+
 export function getGeminiKey(): string {
-  // GEMINI_RESEARCH_KEY is the dedicated research key; GEMINI_API_KEY is the
-  // documented alias (README promises either works — previously only the
-  // synthesis path honored GEMINI_API_KEY, so planner/extraction failed on
-  // consumers that set just one).
-  const key = process.env.GEMINI_RESEARCH_KEY;
-  if (key !== undefined && key !== '') return key;
-  const alias = process.env.GEMINI_API_KEY;
-  if (alias !== undefined && alias !== '') return alias;
-  throw new Error('GEMINI_RESEARCH_KEY (or GEMINI_API_KEY) environment variable is not configured');
+  // The package has consumers in both Braintied and Vercel AI SDK ecosystems.
+  // Keep one resolver so planning, extraction, and synthesis cannot select
+  // different/stale aliases for the same Gemini request path.
+  const configuredName = process.env[GEMINI_KEY_NAME_ENV]?.trim();
+  if (configuredName !== undefined && configuredName.length > 0
+    && !GEMINI_KEY_ENV_NAMES.includes(configuredName as (typeof GEMINI_KEY_ENV_NAMES)[number])) {
+    throw new Error(
+      `${GEMINI_KEY_NAME_ENV} must name one of: ${GEMINI_KEY_ENV_NAMES.join(', ')}`,
+    );
+  }
+
+  const candidates = GEMINI_KEY_ENV_NAMES.flatMap((name) => {
+    const value = process.env[name];
+    return value === undefined || value.trim().length === 0 ? [] : [{ name, value }];
+  });
+  if (configuredName !== undefined && configuredName.length > 0) {
+    const selected = candidates.find((candidate) => candidate.name === configuredName);
+    if (selected === undefined) {
+      throw new Error(`${GEMINI_KEY_NAME_ENV} selects ${configuredName}, but that variable is not configured`);
+    }
+    return selected.value;
+  }
+
+  if (new Set(candidates.map((candidate) => candidate.value)).size > 1) {
+    throw new Error(
+      `Conflicting Gemini aliases are configured (${candidates.map((candidate) => candidate.name).join(', ')}); set ${GEMINI_KEY_NAME_ENV}`,
+    );
+  }
+  if (candidates[0] !== undefined) return candidates[0].value;
+  throw new Error(`One of ${GEMINI_KEY_ENV_NAMES.join(', ')} must be configured`);
 }
 
 export function getVoyageKey(): string {

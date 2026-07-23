@@ -106,6 +106,34 @@ the common case where source supports newer behavior but ignored `dist/` still
 contains an older build. Published packages intentionally omit source and report
 freshness as unavailable; built-kind and export checks still apply there.
 
+For project-owned dotenv credentials, use the runner's allowlisted loader:
+
+```bash
+node skills/run-braintied-research/scripts/run-research.mjs \
+  --check \
+  --kind standard \
+  --max-cost-usd 2 \
+  --research-env-file /absolute/path/to/.env.production.local
+```
+
+Never use Node's built-in `--env-file` for this runner: Node loads every entry
+before the runner starts, bypassing its allowlist; the runner refuses when it
+detects that preload. `--research-env-file`
+deliberately replaces stale allowlisted values and treats an explicit blank as
+a mask that prevents shell fallback. It never imports unrelated dotenv entries.
+On POSIX, every supplied file must be a regular non-symlink with owner-only
+permissions (0600 or stricter), and it is checked and read through one open file
+handle. Secure dotenv loading fails closed on Windows; inject approved process
+environment values there instead. `BRAINTIED_RESEARCH_ENV_FILE` may point to the
+same approved absolute path so commands work from any workspace; an explicit
+`--research-env-file` wins. The pointer contains no secret value, but access to
+the target file still controls credential authority.
+
+The allowlisted parser intentionally accepts single-line dotenv assignments
+only: optional `export`, unquoted values with `#` comments, and single-, double-,
+or backtick-quoted values. Multiline values are rejected. Double-quoted `\\n`
+and `\\r` escapes are expanded; other backslashes are preserved.
+
 ## Local fallback credential matrix
 
 The runner reports only whether a variable is present. Never print, echo, or
@@ -144,18 +172,24 @@ Recommended role/order:
 - GitHub REST performs repository/issue/PR discovery; an optional project-owned
   token raises the restrictive unauthenticated quota.
 
-For compatibility, the runner maps `GEMINI_RESEARCH_KEY` to `GEMINI_API_KEY`
-inside its child process when the latter is absent. It never persists the alias.
+The Gemini resolver accepts `GEMINI_RESEARCH_KEY`, `GOOGLE_GEMINI_API_KEY`,
+`GOOGLE_GENERATIVE_AI_API_KEY`, and `GEMINI_API_KEY`. If multiple aliases contain
+different values, the shared package resolver fails without printing them.
+Direct package consumers must set `BRAINTIED_GEMINI_KEY_NAME=NAME`; the runner
+also accepts `--gemini-key-name NAME`. The chosen value becomes the canonical
+planning/extraction/synthesis key for that process. Preflight reports only the
+selected variable name, and the runner never persists the value.
 
 `VOYAGE_API_KEY` is optional: without it, reranking preserves provider order.
 Anthropic is optional for Gemini-backed runs: planner retries lose their Claude
 fallback, and critique returns its documented permissive fallback.
 
 Use credentials owned and approved for the project being researched. In Codex
-Desktop, `--load-shell-env` imports only allowlisted provider variables and
-defaults search to Braintied's two SearXNG instances. It never prints values.
-Do not inspect or reuse a neighboring project's environment file merely because
-it exists.
+Desktop, `--research-env-file` imports only allowlisted values from the explicit
+approved file. `--load-shell-env` then fills unmasked gaps from the interactive
+shell and defaults search to Braintied's two SearXNG instances. Neither prints
+values. Do not inspect or reuse a neighboring project's environment file merely
+because it exists.
 
 ## Result contract
 
@@ -236,12 +270,13 @@ node skills/run-braintied-research/scripts/run-research.mjs \
   --synthesis-model gemini-3-flash-preview \
   --load-shell-env
 
-node --env-file=/path/owned-by-this-project/.env \
-  skills/run-braintied-research/scripts/run-research.mjs \
+node skills/run-braintied-research/scripts/run-research.mjs \
   --check \
   --kind quick \
   --max-cost-usd 0.25 \
-  --synthesis-model gemini-3-flash-preview
+  --synthesis-model gemini-3-flash-preview \
+  --research-env-file /absolute/path/owned-by-this-project/.env \
+  --gemini-key-name GOOGLE_GEMINI_API_KEY
 
 node skills/run-braintied-research/scripts/run-research.mjs \
   --check \

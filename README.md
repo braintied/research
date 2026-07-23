@@ -52,7 +52,17 @@ All providers are raw `fetch` — no SDK dependencies. A provider is enabled whe
 | LinkedIn / FB Groups (ingestion layer) | ingestion | Bright Data: `BRIGHTDATA_API_TOKEN` (+ dataset IDs) | paid |
 | Perplexity | managed deep research | `PERPLEXITY_API_KEY` | ~$0.40–1.30/query (sonar-deep-research) |
 
-Model/pipeline keys: `ANTHROPIC_API_KEY` (synthesis/critique), `GEMINI_RESEARCH_KEY` or `GEMINI_API_KEY` (planner/extraction), `VOYAGE_API_KEY` (rerank/embed), optional `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`.
+Model/pipeline keys: `ANTHROPIC_API_KEY` (synthesis/critique),
+`GEMINI_RESEARCH_KEY`, `GOOGLE_GEMINI_API_KEY`,
+`GOOGLE_GENERATIVE_AI_API_KEY`, or `GEMINI_API_KEY` (one shared resolver for
+planning/extraction/synthesis),
+`VOYAGE_API_KEY` (rerank/embed), optional `OPENROUTER_API_KEY`,
+`DEEPSEEK_API_KEY`.
+
+If multiple Gemini aliases contain different values, the shared package
+resolver fails closed. Set `BRAINTIED_GEMINI_KEY_NAME` to the approved variable
+name; the local runner also accepts `--gemini-key-name` and reports the selected
+name without printing its value.
 
 > Env naming is standardized here — `SERPAPI_KEY` (not `SERP_API_KEY`), `SERPER_API_KEY`, `SEARXNG_URLS`.
 
@@ -140,8 +150,15 @@ the run, that checkpoint also records the durable run ID; terminal success
 replaces it with final metadata. Preserve the checkpoint and use
 `--request-id <id>` to reattach after a local timeout or interruption.
 `run-research.mjs` remains available as an explicit local-provider fallback; it
-supports allowlisted interactive-shell environment loading and build-freshness
-checks. Exact lane preflight requires an as-of date:
+supports permission-checked, allowlisted dotenv loading, allowlisted
+interactive-shell environment loading, and build-freshness checks. Use
+`--research-env-file /absolute/path/to/.env` (or the
+`BRAINTIED_RESEARCH_ENV_FILE` pointer) when approved credentials live in a
+project file; this intentionally replaces or masks stale inherited research
+variables without importing unrelated env entries. Never use Node's built-in
+`--env-file` for this runner because Node imports every entry before the
+allowlist can run; the runner refuses when it detects that preload. Exact lane
+preflight requires an as-of date:
 
 ```bash
 node skills/run-braintied-research/scripts/run-research.mjs \

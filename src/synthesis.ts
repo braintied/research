@@ -12,6 +12,7 @@ import { GoogleGenAI } from '@google/genai';
 import OpenAI from 'openai';
 import { z } from 'zod';
 import { logger } from './logger.js';
+import { getGeminiKey } from './pipeline-core.js';
 import { recordGeminiUsage } from './cache-hit-measurement.js';
 import {
   SectionDraftSchema,
@@ -144,13 +145,7 @@ export async function synthesisGenerate(args: {
   const { system, user, model, maxTokens, telemetry } = args;
 
   if (model.startsWith('gemini-')) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (apiKey === undefined || apiKey === '') {
-      throw new Error(
-        'GEMINI_API_KEY environment variable is not configured — required for gemini-* models. '
-          + 'Set it on the cortex-worker Fly.io app.',
-      );
-    }
+    const apiKey = getGeminiKey();
     const ai = new GoogleGenAI({ apiKey });
     const response = await withTimeout(
       ai.models.generateContent({
