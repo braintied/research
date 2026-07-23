@@ -19,7 +19,7 @@ import type { FinalReport } from './types.js';
 import { logger as defaultLogger } from './logger.js';
 import type { Logger } from './logger.js';
 
-const ANSWER_SYNTH_MODEL_DEFAULT = 'gemini-3-flash-preview';
+const ANSWER_SYNTH_MODEL_DEFAULT = 'gemini-3.6-flash';
 const SEARCH_LIMIT = 8;
 const MIN_SEARCH_RESULTS_BEFORE_PAID = 3;
 const MAX_SOURCES_TO_READ = 5;
@@ -38,7 +38,7 @@ export interface RunAnswerInput {
   recencyDays?: number;
   /** How many sources to read (default 5, max 8). */
   maxSources?: number;
-  /** Synthesis model (resolveSynthesisModel prefixes). Default gemini-3-flash-preview. */
+  /** Synthesis model (resolveSynthesisModel prefixes). Default gemini-3.6-flash. */
   synthesisModelOverride?: string;
   /**
    * Replace the default cited-answer system prompt entirely — for callers

@@ -26,6 +26,7 @@ import { runAnswer } from './answer.js';
 import type { ResearchDepth } from './depth-config.js';
 import type { Logger } from './logger.js';
 import type { FinalReport, ProviderName, VerbatimQuote } from './types.js';
+import type { SearchOpts, SearchResult, Subquery } from './types.js';
 import type { GroundingResult } from './grounding.js';
 
 // =============================================================================
@@ -48,7 +49,7 @@ export interface ResearchKindPreset {
   briefPreamble?: string;
   /**
    * Default synthesis model for this kind (callers can still override via
-   * RunResearchInput.synthesisModelOverride). Unset -> claude-sonnet-4-6.
+   * RunResearchInput.synthesisModelOverride). Unset -> glm-5.2.
    */
   synthesisModelDefault?: string;
 }
@@ -58,7 +59,7 @@ export const RESEARCH_KIND_PRESETS: Record<ResearchKind, ResearchKindPreset> = {
     kind: 'answer',
     description: 'Perplexity-style cited quick answer — one search, one cheap synthesis (~5-15s, ~$0.002-0.01)',
     engine: 'answer',
-    synthesisModelDefault: 'gemini-3-flash-preview',
+    synthesisModelDefault: 'gemini-3.6-flash',
   },
   quick: {
     kind: 'quick',
@@ -67,7 +68,7 @@ export const RESEARCH_KIND_PRESETS: Record<ResearchKind, ResearchKindPreset> = {
     depth: 'quick',
     // ~90% of a quick-run's cost was hardcoded Sonnet synthesis (2026-07-09
     // cost audit) — quick now defaults to the MICRO-tier Gemini flash.
-    synthesisModelDefault: 'gemini-3-flash-preview',
+    synthesisModelDefault: 'gemini-3.6-flash',
   },
   standard: {
     kind: 'standard',
@@ -141,6 +142,12 @@ export interface RunResearchInput {
   synthesisModelOverride?: string;
   /** Recency window in days (answer kind: mapped to SearXNG time_range). */
   recencyDays?: number;
+  /** Low-level provider allowlist; source-mode callers normally use runResearchProgram. */
+  providers?: ProviderName[];
+  /** Deterministic required searches compiled by a source execution plan. */
+  seedSubqueries?: Subquery[];
+  searchOptions?: Omit<SearchOpts, 'limit'>;
+  providerSearchOptions?: Partial<Record<ProviderName, Omit<SearchOpts, 'limit'>>>;
   logger?: Logger;
 }
 
@@ -156,6 +163,8 @@ export interface KindResearchResult {
    * does its own citation pipeline and exposes no quote-level evidence.
    */
   grounding: GroundingResult | null;
+  /** Search discoveries are populated by pipeline runs. */
+  discoveries: SearchResult[];
 }
 
 /**
@@ -183,6 +192,7 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
       quotes: [],
       costUsd: answer.costUsd,
       grounding: null,
+      discoveries: [],
     };
   }
 
@@ -198,6 +208,7 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
       quotes: [],
       costUsd: managed.costUsd,
       grounding: null,
+      discoveries: [],
     };
   }
 
@@ -211,11 +222,17 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
     maxCostUsd: input.maxCostUsd,
     logger: input.logger,
     indexSink: input.indexSink,
-    providers: preset.providers,
+    providers: input.providers ?? preset.providers,
     onUsage: input.onUsage,
     cache: input.cache,
     minFreeResults: input.minFreeResults,
     synthesisModelOverride,
+    seedSubqueries: input.seedSubqueries,
+    searchOptions: {
+      ...input.searchOptions,
+      ...(input.recencyDays !== undefined ? { recency_days: input.recencyDays } : {}),
+    },
+    providerSearchOptions: input.providerSearchOptions,
   };
 
   const result = await runDeepResearch(pipelineInput);
@@ -226,5 +243,6 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
     quotes: result.quotes,
     costUsd: result.costUsd,
     grounding: result.grounding,
+    discoveries: result.discoveries,
   };
 }

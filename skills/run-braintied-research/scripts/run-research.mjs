@@ -11,6 +11,10 @@ import { assessGrounding } from './grounding-quality.mjs';
 const VALID_KINDS = ['answer', 'quick', 'standard', 'deep', 'managed', 'social'];
 const PIPELINE_KINDS = new Set(['quick', 'standard', 'deep', 'social']);
 const GENERAL_SEARCH_PROVIDERS = new Set(['searxng', 'serper', 'tavily', 'exa', 'serpapi']);
+const VALID_SOURCE_MODES = new Set([
+  'web', 'x', 'reddit', 'youtube', 'github', 'community', 'instagram', 'tiktok',
+  'facebook_groups', 'cortex', 'telegram', 'all_public', 'all_social', 'all',
+]);
 const SYNTHESIS_DEFAULTS = new Map([
   ['answer', 'gemini-3-flash-preview'],
   ['quick', 'gemini-3-flash-preview'],
@@ -31,6 +35,21 @@ const SHELL_ENV_NAMES = [
   'SERPAPI_KEY',
   'OPENROUTER_API_KEY',
   'DEEPSEEK_API_KEY',
+  'REDDIT_CLIENT_ID',
+  'REDDIT_CLIENT_SECRET',
+  'REDDIT_USER_AGENT',
+  'YOUTUBE_API_KEY',
+  'X_BEARER_TOKEN',
+  'TWITTER_BEARER_TOKEN',
+  'X_APP_BEARER_TOKEN',
+  'TWITTERAPI_IO_KEY',
+  'TWITTERAPI_KEY',
+  'APIFY_API_TOKEN',
+  'BRIGHTDATA_API_TOKEN',
+  'JINA_API_KEY',
+  'CRAWL4AI_URL',
+  'GITHUB_TOKEN',
+  'GH_TOKEN',
 ];
 const SHELL_ENV_NAME_SET = new Set(SHELL_ENV_NAMES);
 const BRAINTIED_SEARXNG_URLS = 'https://cortex-searxng-a.fly.dev,https://cortex-searxng-b.fly.dev';
@@ -57,7 +76,11 @@ Options:
   --max-cost-usd <number>   Required for pipeline kinds; must be > 0
   --synthesis-model <id>    Override the synthesis model/provider
   --load-shell-env          Import allowlisted settings from an interactive shell
-  --recency-days <integer>  Answer-kind recency window
+  --recency-days <integer>  Recency window for answer or pipeline searches
+  --sources <csv>           Explicit lanes: web,x,reddit,youtube,github,community,...
+  --require-providers <csv> Fail preflight unless these providers are enabled
+  --as-of <ISO date/time>   Reproducible upper boundary (required with --sources/profile)
+  --profile <ref>           Versioned research profile (for example ora-agent-runtime@1)
   --output <path>           Required Markdown report output
   --metadata <path>         Required JSON run metadata output
   --allow-external          Acknowledge that the brief goes to external services
@@ -83,6 +106,10 @@ function parseCli() {
       'synthesis-model': { type: 'string' },
       'load-shell-env': { type: 'boolean' },
       'recency-days': { type: 'string' },
+      sources: { type: 'string' },
+      'require-providers': { type: 'string' },
+      'as-of': { type: 'string' },
+      profile: { type: 'string' },
       output: { type: 'string' },
       metadata: { type: 'string' },
       'allow-external': { type: 'boolean' },
@@ -90,6 +117,13 @@ function parseCli() {
     strict: true,
     allowPositionals: false,
   }).values;
+}
+
+function parseCsv(raw, label) {
+  if (raw === undefined) return [];
+  const values = [...new Set(raw.split(',').map((value) => value.trim()).filter((value) => value.length > 0))];
+  if (values.length === 0) throw new Error(`${label} must contain at least one value.`);
+  return values;
 }
 
 function parsePositiveNumber(raw, label) {
@@ -276,7 +310,14 @@ async function buildFreshness() {
   };
 }
 
-async function preflight(research, kind, maxCostUsd, synthesisModel, runtimeEnvironment) {
+async function preflight(
+  research,
+  kind,
+  maxCostUsd,
+  synthesisModel,
+  runtimeEnvironment,
+  { sources, requiredProviders, asOf, profileRef },
+) {
   const builtKinds = Array.isArray(research.RESEARCH_KINDS) ? research.RESEARCH_KINDS : [];
   if (!builtKinds.includes(kind)) {
     throw new Error(`Kind ${kind} is absent from built dist (available: ${builtKinds.join(', ') || 'none'}). Run npm run build.`);
@@ -285,7 +326,45 @@ async function preflight(research, kind, maxCostUsd, synthesisModel, runtimeEnvi
   const enabled = typeof research.getEnabledProviders === 'function'
     ? Object.keys(research.getEnabledProviders()).sort()
     : [];
+  const enabledSearch = typeof research.getEnabledSearchProviders === 'function'
+    ? Object.keys(research.getEnabledSearchProviders()).sort()
+    : enabled.filter((provider) => provider !== 'crawl4ai');
   const config = requiredConfiguration(kind, enabled, synthesisModel);
+  let sourcePlan = null;
+  if ((sources.length > 0 || profileRef !== undefined) && asOf === undefined) {
+    config.missing.push('--as-of is required with --sources or --profile');
+  }
+  if (typeof research.resolveSourceExecutionPlan === 'function' && asOf !== undefined && (sources.length > 0 || profileRef !== undefined)) {
+    let effectiveSources = sources;
+    if (profileRef !== undefined) {
+      if (typeof research.compileProfileExecution !== 'function') {
+        config.missing.push('built package does not export compileProfileExecution');
+      } else {
+        try {
+          const profileExecution = research.compileProfileExecution(
+            profileRef,
+            { question: 'Preflight research question for source capability validation.', asOf: asOf.slice(0, 10) },
+            enabledSearch,
+          );
+          if (effectiveSources.length === 0) effectiveSources = profileExecution.sourceModes;
+        } catch (error) {
+          config.missing.push(`profile preflight failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+    if (effectiveSources.length > 0) {
+      sourcePlan = research.resolveSourceExecutionPlan({
+        question: 'Preflight research question for source capability validation.',
+        modes: effectiveSources,
+        availableProviders: enabledSearch,
+        availableTrustedAdapters: [],
+        requiredProviders,
+        asOf,
+      });
+      for (const mode of sourcePlan.missingModes) addMissing(config.missing, `source mode unavailable: ${mode}`);
+      for (const provider of sourcePlan.missingRequiredProviders) addMissing(config.missing, `required provider unavailable: ${provider}`);
+    }
+  }
   const freshness = await buildFreshness();
   if (freshness.build_input_newer_than_dist) {
     config.missing.push('dist/index.mjs is older than a package build input; run npm run build');
@@ -300,6 +379,8 @@ async function preflight(research, kind, maxCostUsd, synthesisModel, runtimeEnvi
     built_kinds: builtKinds,
     build_freshness: freshness,
     enabled_providers: enabled,
+    enabled_search_providers: enabledSearch,
+    source_plan: sourcePlan,
     configured_key_names: SHELL_ENV_NAMES.filter(hasEnv),
     runtime_environment: {
       source: runtimeEnvironment.source,
@@ -360,6 +441,22 @@ async function main() {
 
   const maxCostUsd = parsePositiveNumber(values['max-cost-usd'], '--max-cost-usd');
   const recencyDays = parsePositiveInteger(values['recency-days'], '--recency-days');
+  const sources = parseCsv(values.sources, '--sources');
+  const requiredProviders = parseCsv(values['require-providers'], '--require-providers');
+  const asOf = values['as-of'];
+  const profileRef = values.profile;
+  const invalidSources = sources.filter((source) => !VALID_SOURCE_MODES.has(source));
+  if (invalidSources.length > 0) {
+    throw new Error(`Unknown --sources value(s): ${invalidSources.join(', ')}.`);
+  }
+  if (asOf !== undefined) {
+    const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(asOf);
+    const timestamp = /^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(asOf)
+      && !Number.isNaN(new Date(asOf).getTime());
+    if (!dateOnly && !timestamp) {
+      throw new Error('--as-of must be YYYY-MM-DD or an RFC3339 timestamp with an explicit offset.');
+    }
+  }
   const synthesisModel = effectiveSynthesisModel(kind, values['synthesis-model']);
   if (PIPELINE_KINDS.has(kind) && maxCostUsd === undefined) {
     throw new Error(`--max-cost-usd is required for ${kind} research.`);
@@ -367,13 +464,16 @@ async function main() {
   if (!PIPELINE_KINDS.has(kind) && maxCostUsd !== undefined) {
     throw new Error(`--max-cost-usd is not enforced by ${kind} research; omit it and choose this kind deliberately.`);
   }
-  if (recencyDays !== undefined && kind !== 'answer') {
-    throw new Error('--recency-days is supported only by the answer kind.');
-  }
-
   const runtimeEnvironment = await loadInteractiveShellEnvironment(values['load-shell-env'] === true);
   const research = await loadPackage();
-  const check = await preflight(research, kind, maxCostUsd, synthesisModel, runtimeEnvironment);
+  const knownProviders = new Set(Array.isArray(research.PROVIDER_NAMES) ? research.PROVIDER_NAMES : []);
+  const invalidProviders = requiredProviders.filter((provider) => !knownProviders.has(provider));
+  if (invalidProviders.length > 0) {
+    throw new Error(`Unknown --require-providers value(s): ${invalidProviders.join(', ')}.`);
+  }
+  const check = await preflight(research, kind, maxCostUsd, synthesisModel, runtimeEnvironment, {
+    sources, requiredProviders, asOf, profileRef,
+  });
   if (values.check === true || values['dry-run'] === true) {
     process.stdout.write(`${JSON.stringify(check, null, 2)}\n`);
     if (!check.ready) process.exitCode = 2;
@@ -396,13 +496,34 @@ async function main() {
   const brief = await readBrief(values);
   const startedAt = new Date();
   const startedMonotonic = process.hrtime.bigint();
-  const result = await research.runResearch({
-    brief,
-    kind,
-    ...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
-    ...(recencyDays !== undefined ? { recencyDays } : {}),
-    ...(synthesisModel !== null ? { synthesisModelOverride: synthesisModel } : {}),
-  });
+  let programResult = null;
+  let result;
+  if (sources.length > 0 || profileRef !== undefined) {
+    if (typeof research.runResearchProgram !== 'function') {
+      throw new Error('Built package does not export runResearchProgram. Run npm run build.');
+    }
+    programResult = await research.runResearchProgram({
+      brief,
+      asOf,
+      ...(sources.length > 0 ? { sourceModes: sources } : {}),
+      ...(profileRef !== undefined ? { profileRef } : {}),
+      kind,
+      ...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
+      ...(recencyDays !== undefined ? { recencyDays } : {}),
+      ...(requiredProviders.length > 0 ? { requiredProviders } : {}),
+      ...(synthesisModel !== null ? { synthesisModelOverride: synthesisModel } : {}),
+    });
+    result = programResult.publicResearch;
+    if (result === null) throw new Error('Source program completed without a public report.');
+  } else {
+    result = await research.runResearch({
+      brief,
+      kind,
+      ...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
+      ...(recencyDays !== undefined ? { recencyDays } : {}),
+      ...(synthesisModel !== null ? { synthesisModelOverride: synthesisModel } : {}),
+    });
+  }
   const finishedAt = new Date();
   const durationMs = Number(process.hrtime.bigint() - startedMonotonic) / 1_000_000;
 
@@ -429,6 +550,12 @@ async function main() {
     grounding: result.grounding,
     grounding_quality: groundingAssessment.quality,
     grounding_passed: groundingAssessment.passed,
+    discovery_count: Array.isArray(result.discoveries) ? result.discoveries.length : 0,
+    source_program_status: programResult?.status ?? null,
+    source_plan: programResult?.sourcePlan ?? null,
+    source_coverage: programResult?.sourceCoverage ?? null,
+    profile_coverage: programResult?.profileCoverage ?? null,
+    trusted_recall_failures: programResult?.trustedRecallFailures ?? [],
     warnings: check.warnings,
   };
 
@@ -436,7 +563,7 @@ async function main() {
   const metadataPath = await atomicWrite(values.metadata, `${JSON.stringify(metadata, null, 2)}\n`);
 
   process.stdout.write(`${JSON.stringify({
-    ok: true,
+    ok: programResult === null || programResult.status === 'complete',
     report: reportPath,
     metadata: metadataPath,
     kind: metadata.kind,
@@ -447,7 +574,11 @@ async function main() {
     grounding_check_status: metadata.grounding?.status ?? null,
     grounding_ratio: groundingAssessment.ratio,
     grounding_passed: metadata.grounding_passed,
+    source_program_status: metadata.source_program_status,
+    source_coverage_passed: metadata.source_coverage?.passed ?? null,
+    profile_coverage_passed: metadata.profile_coverage?.passed ?? null,
   }, null, 2)}\n`);
+  if (programResult !== null && programResult.status !== 'complete') process.exitCode = 2;
 }
 
 main().catch((error) => {

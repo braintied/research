@@ -34,12 +34,13 @@ const BRIGHTDATA_BASE_URL = 'https://api.brightdata.com/datasets/v3';
 const TRIGGER_TIMEOUT_MS = 30_000;
 const PROGRESS_TIMEOUT_MS = 15_000;
 const DOWNLOAD_TIMEOUT_MS = 60_000;
+const SCRAPE_TIMEOUT_MS = 90_000;
 
 // Snapshot polling — backoff-capped total wait so a slow snapshot returns a
 // tolerated timeout error rather than blocking the whole sweep.
 const POLL_INITIAL_INTERVAL_MS = 5_000;
 const POLL_MAX_INTERVAL_MS = 15_000;
-const POLL_MAX_WAIT_MS = 120_000;
+const POLL_MAX_WAIT_MS = 180_000;
 
 const MIN_CONTENT_CHARS = 80;
 
@@ -109,7 +110,7 @@ const BrightDataRecordSchema = z
   })
   .passthrough();
 
-type BrightDataRecord = z.infer<typeof BrightDataRecordSchema>;
+export type BrightDataRecord = z.infer<typeof BrightDataRecordSchema>;
 
 // =============================================================================
 // Low-level client — trigger / poll / download
@@ -119,6 +120,10 @@ export interface PollSnapshotOptions {
   maxWaitMs?: number;
   initialIntervalMs?: number;
   maxIntervalMs?: number;
+}
+
+export interface ScrapeDatasetOptions extends PollSnapshotOptions {
+  signal?: AbortSignal;
 }
 
 /**
@@ -171,13 +176,17 @@ export async function pollSnapshot(
   const startedAt = Date.now();
   let intervalMs = initialIntervalMs;
 
-  while (Date.now() - startedAt < maxWaitMs) {
-    await sleep(intervalMs);
+  while (true) {
+    const remainingBeforeSleep = maxWaitMs - (Date.now() - startedAt);
+    if (remainingBeforeSleep <= 0) break;
+    await sleep(Math.min(intervalMs, remainingBeforeSleep));
+    const remainingForRequest = maxWaitMs - (Date.now() - startedAt);
+    if (remainingForRequest <= 0) break;
 
     const response = await fetch(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(PROGRESS_TIMEOUT_MS),
+      signal: AbortSignal.timeout(Math.max(1, Math.min(PROGRESS_TIMEOUT_MS, remainingForRequest))),
     });
 
     if (!response.ok) {
@@ -238,6 +247,56 @@ export async function downloadSnapshot(snapshotId: string): Promise<BrightDataRe
     }
   }
   return records;
+}
+
+/**
+ * Run Bright Data's nominally synchronous scrape endpoint. The API may return
+ * records immediately or accept the request as an asynchronous snapshot (HTTP
+ * 202). Both contracts are handled so callers never mistake acceptance for an
+ * empty result.
+ */
+export async function scrapeDataset(
+  datasetId: string,
+  inputs: Array<Record<string, unknown>>,
+  opts: ScrapeDatasetOptions = {},
+): Promise<BrightDataRecord[]> {
+  const token = getBrightDataToken();
+  const endpoint = `${BRIGHTDATA_BASE_URL}/scrape`
+    + `?dataset_id=${encodeURIComponent(datasetId)}`
+    + '&format=json&include_errors=true';
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(inputs),
+    signal: opts.signal ?? AbortSignal.timeout(SCRAPE_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Bright Data scrape error (${datasetId}): HTTP ${response.status} ${body.slice(0, 100)}`);
+  }
+
+  const raw: unknown = await response.json();
+  if (Array.isArray(raw)) {
+    const records: BrightDataRecord[] = [];
+    for (const entry of raw) {
+      const parsed = BrightDataRecordSchema.safeParse(entry);
+      if (parsed.success) records.push(parsed.data);
+    }
+    return records;
+  }
+
+  const accepted = TriggerResponseSchema.safeParse(raw);
+  if (accepted.success) {
+    await pollSnapshot(accepted.data.snapshot_id, opts);
+    return downloadSnapshot(accepted.data.snapshot_id);
+  }
+
+  const single = BrightDataRecordSchema.safeParse(raw);
+  if (single.success) return [single.data];
+  throw new Error(`Bright Data scrape (${datasetId}) returned neither records nor a snapshot id`);
 }
 
 // =============================================================================

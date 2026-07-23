@@ -230,6 +230,13 @@ function toIsoString(dateStr: string): string | undefined {
 export const searxngProvider: SearchProvider = {
   name: 'searxng',
 
+  capabilities: {
+    search: true,
+    fetch: false,
+    extract: false,
+    backends: ['searxng'],
+  },
+
   get enabled(): boolean {
     return getInstanceUrls().length > 0;
   },
@@ -259,7 +266,7 @@ export const searxngProvider: SearchProvider = {
         engagement: {
           score: item.score,
         },
-        raw_metadata: item.engine !== undefined ? { engine: item.engine } : {},
+        raw_metadata: { backend: 'searxng', ...(item.engine !== undefined ? { engine: item.engine } : {}) },
       };
 
       const validated = SearchResultSchema.safeParse(candidate);

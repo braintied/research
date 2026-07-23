@@ -1,0 +1,25 @@
+{
+  "has_next_page": true,
+  "next_cursor": "fixture-page-2",
+  "tweets": [
+    {
+      "id": "8001",
+      "text": "Fixture result from the current status-less envelope",
+      "author": {
+        "id": "fixture-author-1",
+        "name": "Fixture Author",
+        "userName": "fixture_author"
+      },
+      "conversationId": "8001",
+      "createdAt": "2026-07-21T18:00:00.000Z",
+      "lang": "en",
+      "likeCount": 8,
+      "viewCount": 80,
+      "replyCount": 2,
+      "retweetCount": 3,
+      "quoteCount": 1,
+      "isReply": false,
+      "url": "https://x.com/fixture_author/status/8001"
+    }
+  ]
+}

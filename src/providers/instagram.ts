@@ -673,6 +673,11 @@ async function scrapeDataset(
     body: JSON.stringify([{ url: canonicalUrl }]),
   }, SCRAPE_TIMEOUT_MS, signal);
   const raw = await readJsonResponse(response, operation);
+  const accepted = TriggerResponseSchema.safeParse(raw);
+  if (accepted.success) {
+    await waitForSnapshot(accepted.data.snapshot_id, token, signal);
+    return downloadSnapshotRecords(accepted.data.snapshot_id, token, signal);
+  }
   return parseRecords(raw, operation);
 }
 

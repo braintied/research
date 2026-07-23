@@ -3,7 +3,7 @@
  *
  * Three-stage synthesis pipeline:
  *   1. synthesizeSection  — per-section Claude Sonnet call with quotes + claims
- *   2. synthesizeAllSections — parallel runner (chunked by 5)
+ *   2. synthesizeAllSections — parallel runner (chunked by 2)
  *   3. assembleFinalReport — exec summary + bibliography + full markdown
  */
 
@@ -29,15 +29,80 @@ import type {
 // Constants
 // =============================================================================
 
-const SYNTH_MODEL_DEFAULT = 'claude-sonnet-4-6';
-const ASSEMBLY_MODEL_DEFAULT = 'claude-sonnet-4-6';
+// gemini-3.6-flash is the working default today; glm-5.2 (z.ai quota resets
+// 2026-07-25) and claude-sonnet-5 (Anthropic key) are premium overrides once
+// live, selected via synthesis_model_override.
+const SYNTH_MODEL_DEFAULT = 'gemini-3.6-flash';
+const ASSEMBLY_MODEL_DEFAULT = 'gemini-3.6-flash';
+
+/**
+ * Keep synthesized claims mechanically auditable against their evidence.
+ * The validator is intentionally lexical and exact about numbers; fluent but
+ * lossy rewrites (for example, replacing an HTTP status code with a generic
+ * success description) turn supported claims into unverifiable ones.
+ */
+export const SECTION_SYNTHESIS_SYSTEM_PROMPT =
+  'You are a research writer. Write a well-structured markdown section using the provided quotes and claims as primary evidence. ' +
+  'Embed inline citations using [^N] notation exactly where the evidence appears in the text. ' +
+  'Do not invent citations or facts not present in the evidence below. ' +
+  'Keep every cited sentence source-near and mechanically traceable to its evidence. Preserve every number, percentage, date, named entity, standard identifier, protocol or status code, and technical term exactly as stated in the evidence. ' +
+  'Do not replace numeric or protocol details with looser qualitative wording, and do not combine separate evidence fragments into a broader claim unless the same citation supports the entire resulting sentence. ' +
+  'Place each citation immediately after the smallest sentence fully supported by that source. ' +
+  'Write in flowing paragraphs with a clear section heading. ' +
+  'Match the requested word count as closely as possible.';
 
 // =============================================================================
 // Multi-provider synthesis dispatcher
 // =============================================================================
 
 const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
+const GLM_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
+
+/**
+ * Hard ceiling on a single provider synthesis call. Root-cause fix for the
+ * 2026-07-20 synthesis-hang incident: 12/12 prompt runs froze in
+ * status='synthesizing' for 90+ minutes because none of the provider SDK
+ * clients had a request timeout — a wedged socket stalls the promise
+ * forever and the run never advances, never fails, and never writes a
+ * heartbeat. 15 minutes is far above the p99 for a Sonnet section call
+ * (1-5 min at 4-16k max tokens); it is a death sentence for a wedged
+ * request, not a performance target.
+ */
+export const SYNTHESIS_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
+
+/** Thrown when a provider synthesis call exceeds SYNTHESIS_REQUEST_TIMEOUT_MS. */
+export class SynthesisTimeoutError extends Error {
+  constructor(
+    public readonly model: string,
+    public readonly timeoutMs: number,
+  ) {
+    super(`Synthesis call to ${model} timed out after ${timeoutMs}ms`);
+    this.name = 'SynthesisTimeoutError';
+  }
+}
+
+/**
+ * Race a provider call against a hard deadline with explicit timer cleanup.
+ * Belt-and-suspenders alongside SDK-level `timeout` options: the observed
+ * hang was an SDK-level wait that never fired, so the watchdog does not
+ * trust any single SDK to bound its own sockets.
+ */
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, model: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new SynthesisTimeoutError(model, timeoutMs));
+      }, timeoutMs);
+      promise.then(resolve, reject);
+    });
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
 
 /**
  * Phase 1.b — unified synthesis call that dispatches to the right provider
@@ -46,6 +111,8 @@ const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
  *   claude-*   → Anthropic SDK (ANTHROPIC_API_KEY)
  *   deepseek-* → Anthropic SDK with baseURL override (DEEPSEEK_API_KEY) —
  *                DeepSeek's Anthropic-compatible endpoint
+ *   glm-*      → Anthropic SDK with baseURL override (ZAI_API_KEY) —
+ *                z.ai's Anthropic-compatible endpoint
  *   gemini-*   → @google/genai SDK (GEMINI_API_KEY)
  *   qwen*      → OpenAI SDK with OpenRouter baseURL (OPENROUTER_API_KEY) —
  *                supports both `qwen-` short names and `qwen/qwen3-...`
@@ -85,14 +152,18 @@ export async function synthesisGenerate(args: {
       );
     }
     const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
+    const response = await withTimeout(
+      ai.models.generateContent({
+        model,
+        contents: user,
+        config: {
+          systemInstruction: system,
+          maxOutputTokens: maxTokens,
+        },
+      }),
+      SYNTHESIS_REQUEST_TIMEOUT_MS,
       model,
-      contents: user,
-      config: {
-        systemInstruction: system,
-        maxOutputTokens: maxTokens,
-      },
-    });
+    );
     const text = response.text;
     const usage = response.usageMetadata;
     // Gemini reports `cachedContentTokenCount` as a SLICE of `promptTokenCount`,
@@ -131,15 +202,19 @@ export async function synthesisGenerate(args: {
           + 'Set it on the cortex-worker Fly.io app.',
       );
     }
-    const openai = new OpenAI({ apiKey, baseURL: OPENROUTER_BASE_URL });
-    const response = await openai.chat.completions.create({
+    const openai = new OpenAI({ apiKey, baseURL: OPENROUTER_BASE_URL, timeout: SYNTHESIS_REQUEST_TIMEOUT_MS });
+    const response = await withTimeout(
+      openai.chat.completions.create({
+        model,
+        max_tokens: maxTokens,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+      }),
+      SYNTHESIS_REQUEST_TIMEOUT_MS,
       model,
-      max_tokens: maxTokens,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-    });
+    );
     const content = response.choices[0]?.message.content;
     return {
       text: typeof content === 'string' ? content : '',
@@ -162,19 +237,34 @@ export async function synthesisGenerate(args: {
           + 'use only for synthetic eval / non-customer-tagged data).',
       );
     }
+  } else if (model.startsWith('glm-')) {
+    apiKey = process.env.ZAI_API_KEY;
+    baseURL = GLM_ANTHROPIC_BASE_URL;
+    if (apiKey === undefined || apiKey === '') {
+      throw new Error(
+        'ZAI_API_KEY environment variable is not configured — required for glm-* models. '
+          + 'Set it on the cortex-worker Fly.io app.',
+      );
+    }
   } else {
     apiKey = process.env.ANTHROPIC_API_KEY;
     if (apiKey === undefined || apiKey === '') {
       throw new Error('ANTHROPIC_API_KEY environment variable is not configured');
     }
   }
-  const client = baseURL !== undefined ? new Anthropic({ apiKey, baseURL }) : new Anthropic({ apiKey });
-  const response = await client.messages.create({
+  const client = baseURL !== undefined
+    ? new Anthropic({ apiKey, baseURL, timeout: SYNTHESIS_REQUEST_TIMEOUT_MS })
+    : new Anthropic({ apiKey, timeout: SYNTHESIS_REQUEST_TIMEOUT_MS });
+  const response = await withTimeout(
+    client.messages.create({
+      model,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: user }],
+    }),
+    SYNTHESIS_REQUEST_TIMEOUT_MS,
     model,
-    max_tokens: maxTokens,
-    system,
-    messages: [{ role: 'user', content: user }],
-  });
+  );
   let text = '';
   for (const block of response.content) {
     if (block.type === 'text') {
@@ -211,6 +301,7 @@ export async function synthesisGenerate(args: {
  * all four providers needed by the 7-model bake-off:
  *   - Anthropic (claude-*)              via Anthropic SDK
  *   - DeepSeek (deepseek-*)             via Anthropic-compatible endpoint
+ *   - GLM / z.ai (glm-*)                via Anthropic-compatible endpoint
  *   - Gemini (gemini-*)                 via @google/genai
  *   - Qwen3 + any OpenRouter model      via OpenAI SDK + OpenRouter baseURL
  *
@@ -222,11 +313,12 @@ function resolveSynthesisModel(override: string | undefined, fallback: string): 
   if (override === undefined || override.length === 0) return fallback;
   if (override.startsWith('claude-')) return override;
   if (override.startsWith('deepseek-')) return override;
+  if (override.startsWith('glm-')) return override;
   if (override.startsWith('gemini-')) return override;
   if (override.startsWith('qwen')) return override;
   throw new Error(
     `synthesis_model_override='${override}' not recognized. Supported prefixes: `
-      + `claude-*, deepseek-*, gemini-*, qwen* (or qwen/<openrouter-id>).`,
+      + `claude-*, deepseek-*, glm-*, gemini-*, qwen* (or qwen/<openrouter-id>).`,
   );
 }
 
@@ -275,7 +367,7 @@ export interface SynthesizeSectionInput {
   quotes: VerbatimQuote[];
   keyClaims: { claim: string; source_url: string; provider: ProviderName }[];
   targetWords: number;
-  /** Phase 1 Experiment 1 — see resolveSynthesisModel(). undefined → claude-sonnet-4-6. */
+  /** Phase 1 Experiment 1 — see resolveSynthesisModel(). undefined → glm-5.2. */
   synthesisModelOverride?: string;
   /** Phase 1 Experiment 3 — Gemini cache-hit measurement attribution. */
   telemetry?: { organizationId?: string; promptRunId?: string };
@@ -331,13 +423,6 @@ export async function synthesizeSection(
     .map(([url, num]) => `[^${num}]: ${url}`)
     .join('\n');
 
-  const systemPrompt =
-    'You are a research writer. Write a well-structured markdown section using the provided quotes and claims as primary evidence. ' +
-    'Embed inline citations using [^N] notation exactly where the evidence appears in the text. ' +
-    'Do not invent citations or facts not present in the evidence below. ' +
-    'Write in flowing paragraphs with a clear section heading. ' +
-    'Match the requested word count as closely as possible.';
-
   const userMessage =
     `Section: ${sectionPath}\n` +
     `Goal: ${sectionGoal}\n` +
@@ -348,7 +433,7 @@ export async function synthesizeSection(
     `Write the section now. Start with a markdown heading (## or ###). Use [^N] inline citations.`;
 
   const callResult = await synthesisGenerate({
-    system: systemPrompt,
+    system: SECTION_SYNTHESIS_SYSTEM_PROMPT,
     user: userMessage,
     model: synthModel,
     maxTokens: Math.max(4096, targetWords * 2),
@@ -429,6 +514,13 @@ export interface SectionSpec {
   targetWords: number;
 }
 
+/** Progress signal emitted after each section finishes synthesizing. */
+export interface SynthesisSectionProgress {
+  sectionPath: string;
+  sectionsCompleted: number;
+  sectionsTotal: number;
+}
+
 export interface SynthesizeAllInput {
   sectionsToWrite: SectionSpec[];
   quotesByPath: Record<string, VerbatimQuote[]>;
@@ -437,6 +529,15 @@ export interface SynthesizeAllInput {
   synthesisModelOverride?: string;
   /** Phase 1 Experiment 3 — Gemini cache-hit measurement attribution. */
   telemetry?: { organizationId?: string; promptRunId?: string };
+  /**
+   * Optional per-section progress hook (2026-07-20 synthesis-hang fix).
+   * Called synchronously after each section completes; the caller uses it
+   * to write a liveness heartbeat (research_prompt_runs.updated_at) so the
+   * stuck-run sweeper can distinguish "actively synthesizing" from "wedged".
+   * Implementations MUST be non-blocking and swallow their own errors —
+   * a heartbeat failure must never kill synthesis.
+   */
+  onSectionComplete?: (progress: SynthesisSectionProgress) => void;
 }
 
 const PARALLEL_CHUNK_SIZE = 2;
@@ -453,7 +554,7 @@ export interface SynthesizeAllSectionsResult {
 export async function synthesizeAllSections(
   input: SynthesizeAllInput,
 ): Promise<SynthesizeAllSectionsResult> {
-  const { sectionsToWrite, quotesByPath, claimsByPath, synthesisModelOverride, telemetry } = input;
+  const { sectionsToWrite, quotesByPath, claimsByPath, synthesisModelOverride, telemetry, onSectionComplete } = input;
   const synthModel = resolveSynthesisModel(synthesisModelOverride, SYNTH_MODEL_DEFAULT);
 
   const results: SectionDraft[] = [];
@@ -486,6 +587,14 @@ export async function synthesizeAllSections(
       totalInputTokens += sectionResult.inputTokens;
       totalCachedReadTokens += sectionResult.cachedReadTokens;
       totalOutputTokens += sectionResult.outputTokens;
+
+      if (onSectionComplete !== undefined) {
+        onSectionComplete({
+          sectionPath: sectionResult.draft.section_path,
+          sectionsCompleted: results.length,
+          sectionsTotal: sectionsToWrite.length,
+        });
+      }
     }
 
     logger.info(

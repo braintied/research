@@ -131,6 +131,7 @@ const RedditChildSchema = z.object({
 const RedditListingSchema = z.object({
   data: z.object({
     children: z.array(RedditChildSchema).default([]),
+    after: z.string().nullable().optional(),
   }),
 });
 
@@ -167,11 +168,13 @@ function isEnabled(): boolean {
   return cid !== undefined && cid !== '' && cs !== undefined && cs !== '';
 }
 
-function recencyToSort(recencyDays: number | undefined): string {
-  if (recencyDays === undefined) return 'year';
+function recencyToTimeFilter(recencyDays: number | undefined): string {
+  if (recencyDays === undefined) return 'all';
+  if (recencyDays <= 1) return 'day';
   if (recencyDays <= 7) return 'week';
   if (recencyDays <= 30) return 'month';
-  return 'year';
+  if (recencyDays <= 365) return 'year';
+  return 'all';
 }
 
 function permalinkToUrl(permalink: string): string {
@@ -236,12 +239,126 @@ function flattenCommentTree(children: unknown[], maxDepth: number, currentDepth:
   return flat;
 }
 
+function redditSort(sort: SearchOpts['sort']): 'relevance' | 'top' | 'new' | 'comments' {
+  if (sort === 'latest' || sort === 'new') return 'new';
+  if (sort === 'top') return 'top';
+  if (sort === 'comments' || sort === 'views') return 'comments';
+  return 'relevance';
+}
+
+function redditSearchEndpoint(opts: SearchOpts): string {
+  const communities = (opts.communities ?? [])
+    .map((community) => community.replace(/^r\//, '').trim())
+    .filter((community) => /^[A-Za-z0-9_]+$/.test(community));
+  if (communities.length === 0) return 'https://oauth.reddit.com/search.json';
+  return `https://oauth.reddit.com/r/${communities.join('+')}/search.json`;
+}
+
+async function searchRedditListing(
+  query: string,
+  opts: SearchOpts,
+  token: string,
+  userAgent: string,
+  sort: 'relevance' | 'top' | 'new' | 'comments',
+  target: number,
+): Promise<SearchResult[]> {
+  const maxPages = Math.max(1, Math.min(opts.max_pages ?? 1, 10));
+  const perPage = Math.max(2, Math.min(100, Math.ceil(target / maxPages)));
+  const results: SearchResult[] = [];
+  let after: string | null = null;
+
+  for (let page = 0; page < maxPages && results.length < target; page++) {
+    await rateLimit();
+    const params = new URLSearchParams({
+      q: query,
+      sort,
+      limit: String(perPage),
+      t: recencyToTimeFilter(opts.recency_days),
+      type: 'link',
+      raw_json: '1',
+    });
+    if ((opts.communities ?? []).length > 0) params.set('restrict_sr', 'on');
+    if (after !== null) params.set('after', after);
+
+    const response = await fetch(`${redditSearchEndpoint(opts)}?${params.toString()}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'User-Agent': userAgent,
+      },
+      signal: opts.signal !== undefined ? opts.signal : AbortSignal.timeout(20_000),
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Reddit search error: ${response.status} ${body.slice(0, 200)}`);
+    }
+
+    const rawJson: unknown = await response.json();
+    const parsed = RedditListingSchema.safeParse(rawJson);
+    if (!parsed.success) {
+      throw new Error(`Reddit search response invalid: ${parsed.error.message}`);
+    }
+    for (const child of parsed.data.data.children) {
+      const post = child.data;
+      if (post.permalink.length === 0) continue;
+      const candidate = SearchResultSchema.safeParse({
+        provider: 'reddit',
+        url: permalinkToUrl(post.permalink),
+        canonical_id: post.id.length > 0 ? post.id : undefined,
+        title: post.title,
+        snippet: post.selftext.slice(0, 500),
+        author: post.author.length > 0 ? `u/${post.author}` : undefined,
+        published_at: post.created_utc > 0 ? unixToIso(post.created_utc) : undefined,
+        engagement: { upvotes: post.ups, comment_count: post.num_comments },
+        raw_metadata: {
+          backend: 'reddit_oauth_api',
+          subreddit: post.subreddit,
+          external_url: post.url,
+          search_sort: sort,
+          page: page + 1,
+        },
+      });
+      if (candidate.success) results.push(candidate.data);
+      if (results.length >= target) break;
+    }
+    after = parsed.data.data.after ?? null;
+    if (after === null) break;
+  }
+  return results;
+}
+
+function interleaveRedditResults(groups: SearchResult[][], limit: number): SearchResult[] {
+  const results: SearchResult[] = [];
+  const seen = new Set<string>();
+  let index = 0;
+  while (results.length < limit) {
+    let found = false;
+    for (const group of groups) {
+      const item = group[index];
+      if (item === undefined || seen.has(item.url)) continue;
+      seen.add(item.url);
+      results.push(item);
+      found = true;
+      if (results.length >= limit) break;
+    }
+    if (!found && groups.every((group) => index >= group.length)) break;
+    index += 1;
+  }
+  return results;
+}
+
 // =============================================================================
 // Provider
 // =============================================================================
 
 export const redditProvider: SearchProvider = {
   name: 'reddit',
+
+  capabilities: {
+    search: true,
+    fetch: true,
+    extract: true,
+    backends: ['reddit_oauth_api'],
+  },
 
   get enabled(): boolean {
     return isEnabled();
@@ -250,75 +367,19 @@ export const redditProvider: SearchProvider = {
   async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
     const token = await getAccessToken();
     const userAgent = getUserAgent();
-    await rateLimit();
-
-    const timeFilter = recencyToSort(opts.recency_days);
     const limit = opts.limit !== undefined ? Math.min(opts.limit, 100) : 25;
-
-    const params = new URLSearchParams({
-      q: query,
-      sort: 'relevance',
-      limit: String(limit),
-      t: timeFilter,
-      type: 'link',
-    });
-
-    const response = await fetch(`https://oauth.reddit.com/search.json?${params.toString()}`, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'User-Agent': userAgent,
-      },
-      signal: opts.signal !== undefined ? opts.signal : AbortSignal.timeout(20000),
-    });
-
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`Reddit search error: ${response.status} ${body.slice(0, 200)}`);
+    const sorts: Array<'relevance' | 'top' | 'new' | 'comments'> = opts.sort === 'mixed'
+      ? ['relevance', 'top', 'new', 'comments']
+      : [redditSort(opts.sort)];
+    const groups: SearchResult[][] = [];
+    const perSortLimit = Math.max(2, Math.ceil(limit / sorts.length));
+    for (const sort of sorts) {
+      groups.push(await searchRedditListing(query, opts, token, userAgent, sort, perSortLimit));
     }
-
-    const rawJson: unknown = await response.json();
-    const parsed = RedditListingSchema.safeParse(rawJson);
-
-    if (!parsed.success) {
-      logger.warn({ query: query.slice(0, 60), errors: parsed.error.message }, '[Reddit] Invalid response shape');
-      return [];
-    }
-
-    const results: SearchResult[] = [];
-
-    for (const child of parsed.data.data.children) {
-      const post = child.data;
-      if (post.permalink.length === 0) continue;
-
-      const postUrl = permalinkToUrl(post.permalink);
-      const snippet = post.selftext.slice(0, 500);
-
-      const candidate = {
-        provider: 'reddit' as const,
-        url: postUrl,
-        canonical_id: post.id.length > 0 ? post.id : undefined,
-        title: post.title,
-        snippet,
-        author: post.author.length > 0 ? `u/${post.author}` : undefined,
-        published_at: post.created_utc > 0 ? unixToIso(post.created_utc) : undefined,
-        engagement: {
-          upvotes: post.ups,
-          comment_count: post.num_comments,
-        },
-        raw_metadata: {
-          subreddit: post.subreddit,
-          external_url: post.url,
-        },
-      };
-
-      const validated = SearchResultSchema.safeParse(candidate);
-      if (validated.success) {
-        results.push(validated.data);
-      }
-    }
+    const results = interleaveRedditResults(groups, limit);
 
     logger.info(
-      { query: query.slice(0, 60), count: results.length, timeFilter },
+      { query: query.slice(0, 60), count: results.length, sorts, timeFilter: recencyToTimeFilter(opts.recency_days) },
       '[Reddit] Search complete',
     );
 
@@ -478,6 +539,7 @@ export const redditProvider: SearchProvider = {
       },
       fetch_status: 'ok',
       raw_metadata: {
+        backend: 'reddit_oauth_api',
         subreddit: post.subreddit,
         top_comments: topComments,
       },

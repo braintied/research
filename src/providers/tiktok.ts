@@ -5,13 +5,14 @@
  * (searches by query string, returns videos with inline comments when
  * `shouldDownloadComments: true`).
  *
- * Fetch fallback: Bright Data Web Scraper sync API (TikTok posts dataset
+ * Preferred URL fetch: Bright Data Web Scraper API (TikTok posts dataset
  * `gd_lu702nij2f790tmv9h` — the same dataset the Swishh scrape stack and the
- * cortex-worker enrichment fleet run in production). One synchronous HTTP
- * call, ~10-90s, ~$0.0015/record, NOT gated by the Apify account cap. Returns
+ * cortex-worker enrichment fleet run in production). The adapter accepts both
+ * immediate records and asynchronous snapshots, ~$0.0015/record, and is NOT
+ * gated by the Apify account cap. Returns
  * caption + stats (no comments — the comments live in a separate dataset), so
- * Apify stays primary when available and Bright Data rescues fetches when
- * Apify is capped, failing, or unset.
+ * Apify remains the keyword-discovery and comment-rich fallback until a
+ * Bright Data keyword-discovery contract is configured.
  *
  * Rate limit: 5-second queue between Apify calls.
  * Env: APIFY_API_TOKEN and/or BRIGHTDATA_API_TOKEN — the provider is enabled
@@ -31,6 +32,7 @@ import {
   type SearchOpts,
 } from '../types.js';
 import { extractQuotesWithGemini } from './gemini-extractor.js';
+import { scrapeDataset } from './brightdata.js';
 
 // =============================================================================
 // Rate limiter — 5-second queue between Apify calls
@@ -151,12 +153,10 @@ async function fetchDatasetItems(datasetId: string, token: string): Promise<unkn
 }
 
 // =============================================================================
-// Bright Data sync-scrape fallback (TikTok posts dataset)
+// Bright Data scrape fallback (TikTok posts dataset)
 // =============================================================================
 
-const BRIGHTDATA_SCRAPE_URL = 'https://api.brightdata.com/datasets/v3/scrape';
 const BRIGHTDATA_TIKTOK_POSTS_DATASET = 'gd_lu702nij2f790tmv9h';
-const BRIGHTDATA_TIMEOUT_MS = 90_000;
 
 // Bright Data dataset field names drift between snake_case variants across
 // dataset versions — read every observed candidate, first defined wins.
@@ -219,34 +219,15 @@ function bdPublishedAt(record: BrightDataTikTokRecord): string | undefined {
 }
 
 /**
- * Fetch a single TikTok video via the Bright Data sync-scrape endpoint.
+ * Fetch a single TikTok video via Bright Data's immediate-or-snapshot scrape.
  * Returns null on any failure so the caller can report the combined error.
  */
-async function fetchViaBrightData(url: string, token: string): Promise<FetchResult | null> {
-  const endpoint = `${BRIGHTDATA_SCRAPE_URL}?dataset_id=${BRIGHTDATA_TIKTOK_POSTS_DATASET}&format=json&include_errors=true`;
-
+async function fetchViaBrightData(url: string, _token: string): Promise<FetchResult | null> {
   let records: unknown;
   try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify([{ url }]),
-      signal: AbortSignal.timeout(BRIGHTDATA_TIMEOUT_MS),
+    records = await scrapeDataset(BRIGHTDATA_TIKTOK_POSTS_DATASET, [{ url }], {
+      maxWaitMs: 180_000,
     });
-
-    if (!response.ok) {
-      const body = await response.text();
-      logger.warn(
-        { url: url.slice(0, 60), status: response.status, body: body.slice(0, 100) },
-        '[TikTok] Bright Data scrape non-OK',
-      );
-      return null;
-    }
-
-    records = await response.json();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.warn({ url: url.slice(0, 60), error: msg.slice(0, 100) }, '[TikTok] Bright Data scrape failed');
@@ -397,6 +378,13 @@ function extractPublishedAt(item: z.infer<typeof TikTokItemSchema>): string | un
 export const tiktokProvider: SearchProvider = {
   name: 'tiktok',
 
+  capabilities: {
+    search: true,
+    fetch: true,
+    extract: true,
+    backends: ['brightdata', 'apify'],
+  },
+
   get enabled(): boolean {
     return isEnabled();
   },
@@ -459,6 +447,7 @@ export const tiktokProvider: SearchProvider = {
           comment_count: item.commentCount,
         },
         raw_metadata: {
+          backend: 'apify',
           share_count: item.shareCount,
           comments: item.comments !== undefined ? item.comments.slice(0, 50) : [],
         },
@@ -484,6 +473,17 @@ export const tiktokProvider: SearchProvider = {
 
     const apifyToken = getApifyToken();
     const brightDataToken = getBrightDataToken();
+
+    // Braintied policy: prefer Bright Data for supported URL acquisition;
+    // Apify is the comment-rich backup and current keyword-discovery path.
+    if (brightDataToken !== null) {
+      const bdResult = await fetchViaBrightData(url, brightDataToken);
+      if (bdResult !== null) {
+        logger.info({ url: url.slice(0, 60), backend: 'brightdata' }, '[TikTok] Fetch complete');
+        return bdResult;
+      }
+      logger.warn({ url: url.slice(0, 60) }, '[TikTok] Bright Data fetch failed — trying Apify fallback');
+    }
 
     // Extract video ID from URL for targeted fetch
     const videoIdMatch = /\/video\/(\d+)/.exec(url);
@@ -600,16 +600,8 @@ export const tiktokProvider: SearchProvider = {
 
       logger.warn(
         { url: url.slice(0, 60), error: apifyError.slice(0, 100) },
-        '[TikTok] Apify fetch failed — trying Bright Data fallback',
+        '[TikTok] Apify fallback fetch failed',
       );
-    }
-
-    if (brightDataToken !== null) {
-      const bdResult = await fetchViaBrightData(url, brightDataToken);
-      if (bdResult !== null) {
-        logger.info({ url: url.slice(0, 60), backend: 'brightdata' }, '[TikTok] Fetch complete');
-        return bdResult;
-      }
     }
 
     return FetchResultSchema.parse({

@@ -25,6 +25,13 @@ import { extractQuotesWithGemini } from './gemini-extractor.js';
 export const crawl4aiProvider: SearchProvider = {
   name: 'crawl4ai',
 
+  capabilities: {
+    search: false,
+    fetch: true,
+    extract: true,
+    backends: ['crawl4ai', 'jina', 'direct_fetch'],
+  },
+
   get enabled(): boolean {
     return true; // No API key — uses internal ora-scraper service
   },

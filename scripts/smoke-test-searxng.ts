@@ -22,7 +22,7 @@
  * (Phase 1 Experiment 4)
  */
 
-import { searxngSearch } from '../src/lib/deep-research/providers/searxng.js';
+import { searxngSearch } from '../src/providers/searxng.js';
 
 const QUERY_CORPUS = [
   // M&A / diligence-style
