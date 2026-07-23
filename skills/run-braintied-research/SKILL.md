@@ -74,9 +74,13 @@ model providers; treat every brief as outbound data.
    ```
 
    The server persists the authenticated input before dispatch and returns a
-   durable run ID. Submission and status requests retry bounded transport and
-   temporary-service failures with the same request ID. If the local deadline
-   or process interrupts the client, rerun the identical command with the
+   durable run ID. Before the first submission, the client atomically writes a
+   chmod-0600 checkpoint to `--metadata` and prints the generated request ID to
+   stderr. Once Cortex accepts the run, the same checkpoint also records the
+   durable run ID; terminal success replaces it with final metadata. Submission
+   and status requests retry bounded transport and temporary-service failures
+   with the same request ID. If the local deadline or process interrupts the
+   client, preserve that checkpoint and rerun the identical command with its
    printed `--request-id <id>` to reattach; never choose a fresh ID for the same
    paid attempt. Cortex deploys atomically exclude queued/running research, so a
    normal rolling release cannot cut a paid run in half.
@@ -197,9 +201,12 @@ grounding were **not produced**; do not describe either as `null`. If standalone
 provider probes were made, report their known quota/credit cost separately.
 
 For an interrupted internal run, distinguish client transport from server
-execution. Preserve its request ID and use `--request-id` to retrieve the same
-durable record. Do not report `$0.00`, infer provider cost, or start a replacement
-run until the durable status proves the original attempt terminal.
+execution. Read the request ID from the private `--metadata` checkpoint or the
+pre-submission stderr diagnostic and use `--request-id` to retrieve the same
+durable record. A `submission_pending` checkpoint does not prove the server did
+or did not accept the request; resubmitting that same ID is the safe recovery
+operation. Do not report `$0.00`, infer provider cost, or start a replacement run
+until the durable status proves the original attempt terminal.
 
 Run `node skills/run-braintied-research/scripts/run-internal-research.mjs --help`
 for the default internal surface and `run-research.mjs --help` for the local

@@ -2,7 +2,7 @@
 
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -15,6 +15,7 @@ const PIPELINE_KINDS = new Set(['quick', 'standard', 'deep', 'social']);
 const DEFAULT_ENDPOINT = 'https://ora-cortex-worker.fly.dev/internal/tools/execute';
 const DEFAULT_KEYCHAIN_SERVICE = 'braintied-agent-auth';
 const DEFAULT_KEYCHAIN_ACCOUNT = 'codex';
+const CHECKPOINT_SCHEMA_VERSION = 1;
 const PACKAGE_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 const PACKAGE_JSON = path.join(PACKAGE_ROOT, 'package.json');
 const execFileAsync = promisify(execFile);
@@ -41,7 +42,7 @@ Options:
   --keychain-service <name> macOS Keychain service (default: braintied-agent-auth)
   --keychain-account <name> macOS Keychain account (default: codex)
   --output <path>           Required Markdown report output
-  --metadata <path>         Required JSON run metadata output
+  --metadata <path>         Required private JSON checkpoint/final metadata output
   --trusted-output <path>   Required for live profile runs; chmod-0600 JSON
                             trusted-local appendix (never public Markdown)
   --allow-external          Acknowledge that the brief goes to external services
@@ -289,15 +290,75 @@ async function readBrief(values) {
 
 async function atomicWrite(targetPath, contents) {
   const absolute = path.resolve(targetPath);
-  await mkdir(path.dirname(absolute), { recursive: true });
-  const temporary = `${absolute}.tmp-${process.pid}`;
+  const directory = path.dirname(absolute);
+  await mkdir(directory, { recursive: true });
+  const temporary = `${absolute}.tmp-${process.pid}-${randomUUID()}`;
+  let handle;
   try {
-    await writeFile(temporary, contents, { encoding: 'utf8', mode: 0o600 });
+    handle = await open(temporary, 'wx', 0o600);
+    await handle.writeFile(contents, { encoding: 'utf8' });
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
     await rename(temporary, absolute);
+    const directoryHandle = await open(directory, 'r');
+    try {
+      await directoryHandle.sync();
+    } finally {
+      await directoryHandle.close();
+    }
   } finally {
+    await handle?.close();
     await rm(temporary, { force: true });
   }
   return absolute;
+}
+
+async function writeStderrLine(value) {
+  await new Promise((resolve, reject) => {
+    process.stderr.write(`${value}\n`, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+function createResearchCheckpoint({
+  packageVersion: currentPackageVersion,
+  requestId,
+  run,
+  protocolVersion,
+  startedAt,
+  kind,
+  maxCostUsd,
+  recencyDays,
+  profileRef,
+  profileMode,
+  asOf,
+  timeoutSeconds,
+}) {
+  return {
+    artifact_type: 'braintied_internal_research_checkpoint',
+    schema_version: CHECKPOINT_SCHEMA_VERSION,
+    mode: 'internal',
+    package_version: currentPackageVersion,
+    request_id: requestId,
+    durable_run_id: run?.id ?? null,
+    execution_protocol: protocolVersion,
+    checkpoint_status: run === null
+      ? 'submission_pending'
+      : 'awaiting_terminal_result',
+    durable_run_status: run?.status ?? null,
+    started_at: startedAt.toISOString(),
+    updated_at: new Date().toISOString(),
+    kind,
+    requested_max_cost_usd: maxCostUsd ?? null,
+    requested_recency_days: recencyDays ?? null,
+    profile_ref: profileRef ?? null,
+    profile_mode: profileMode ?? null,
+    as_of: asOf ?? null,
+    timeout_seconds: timeoutSeconds,
+  };
 }
 
 function validateResult(payload) {
@@ -794,7 +855,15 @@ async function pollDurableResearch({
   );
 }
 
-async function executeResearch({ endpoint, token, timeoutSeconds, requestId, input, probe }) {
+async function executeResearch({
+  endpoint,
+  token,
+  timeoutSeconds,
+  requestId,
+  input,
+  probe,
+  onSubmitted,
+}) {
   const durable = resolveDurableEndpoints(endpoint, probe);
   const deadlineMs = Date.now() + timeoutSeconds * 1000;
   const run = await submitDurableResearch({
@@ -804,6 +873,7 @@ async function executeResearch({ endpoint, token, timeoutSeconds, requestId, inp
     input,
     deadlineMs,
   });
+  await onSubmitted(run);
   const result = await pollDurableResearch({
     endpoint: durable.status(run.id),
     token,
@@ -935,12 +1005,40 @@ async function main() {
   const requestId = requestedRequestId ?? randomUUID();
   const startedAt = new Date();
   const startedMonotonic = process.hrtime.bigint();
+  const checkpointContext = {
+    packageVersion: check.package_version,
+    requestId,
+    protocolVersion: liveProbe.protocol_version,
+    startedAt,
+    kind,
+    maxCostUsd,
+    recencyDays,
+    profileRef,
+    profileMode,
+    asOf,
+    timeoutSeconds,
+  };
+  const persistCheckpoint = async (run) => atomicWrite(
+    values.metadata,
+    `${JSON.stringify(createResearchCheckpoint({
+      ...checkpointContext,
+      run,
+    }), null, 2)}\n`,
+  );
+  const checkpointPath = await persistCheckpoint(null);
+  await writeStderrLine(JSON.stringify({
+    event: 'braintied_internal_research_checkpoint',
+    request_id: requestId,
+    metadata: checkpointPath,
+    resume_with: `--request-id ${requestId}`,
+  }));
   const execution = await executeResearch({
     endpoint,
     token: auth.token,
     timeoutSeconds,
     requestId,
     probe: liveProbe,
+    onSubmitted: persistCheckpoint,
     input: {
       brief,
       kind,
