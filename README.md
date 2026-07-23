@@ -133,9 +133,12 @@ macOS Keychain and keeps all model/search provider credentials in Cortex Worker.
 Live execution requires the authenticated catalog's durable protocol v2: the
 client submits one idempotent request, records the server-owned run ID, and
 polls the tenant-bound result. A dropped response or rolling deployment is
-retried with the same request ID instead of starting a second paid run. Preserve
-the printed request ID; `--request-id <id>` explicitly reattaches after a local
-timeout or interruption.
+retried with the same request ID instead of starting a second paid run. Before
+the first submission, the client atomically writes a chmod-0600 checkpoint to
+`--metadata` and prints its generated request ID to stderr. After Cortex accepts
+the run, that checkpoint also records the durable run ID; terminal success
+replaces it with final metadata. Preserve the checkpoint and use
+`--request-id <id>` to reattach after a local timeout or interruption.
 `run-research.mjs` remains available as an explicit local-provider fallback; it
 supports allowlisted interactive-shell environment loading and build-freshness
 checks. Exact lane preflight requires an as-of date:
@@ -204,7 +207,7 @@ npm run pack:release          # → releases/braintied-research-<version>.tgz
 
 ```jsonc
 // consumer package.json
-"@braintied/research": "file:vendor/braintied-research-0.8.1.tgz"
+"@braintied/research": "file:vendor/braintied-research-0.8.2.tgz"
 ```
 
 ## Development

@@ -41,9 +41,13 @@ node skills/run-braintied-research/scripts/run-internal-research.mjs \
   --allow-external
 ```
 
-The Markdown file is always the public-provider report. The metadata file adds
-`program_status`, `source_coverage`, `profile_coverage`, a pointer to the
-trusted artifact, and a separately labeled reference-only `private_manifest`.
+The Markdown file is always the public-provider report. Before submission, the
+metadata path contains a minimal chmod-0600 recovery checkpoint with the
+request ID and no brief, token, or provider content. Cortex acceptance adds the
+durable run ID; terminal success atomically replaces that checkpoint with final
+metadata. Final metadata adds `program_status`, `source_coverage`,
+`profile_coverage`, a pointer to the trusted artifact, and a separately labeled
+reference-only `private_manifest`.
 The third file is a chmod-0600 trusted-local appendix for the authenticated
 agent: up to 20 findings balanced across Cortex and Telegram, each with
 credential-scrubbed excerpts capped at 1,200 Unicode characters, bounded
@@ -69,11 +73,15 @@ reattaches instead of paying for a second run.
 
 Deep requests default to a 3,600-second local client deadline; other kinds
 default to 1,200 seconds. The deadline stops polling, not the server-owned run.
-Preserve the request ID from the diagnostic and repeat the same invocation with
-`--request-id <id>` to resume. Metadata records both `request_id` and
-`durable_run_id`. A successful HTTP response is not itself success: the client
-requires the strict completed result envelope and a non-empty report before it
-writes artifacts.
+The client fsyncs and atomically renames a private checkpoint, then flushes a
+compact request-ID diagnostic to stderr, before it sends the first paid
+submission. Preserve the request ID from that checkpoint or diagnostic and
+repeat the same invocation with `--request-id <id>` to resume. A
+`submission_pending` checkpoint is intentionally ambiguous about remote
+acceptance; resubmission with its same ID is idempotent. Accepted and final
+metadata record both `request_id` and `durable_run_id`. A successful HTTP
+response is not itself success: the client requires the strict completed
+result envelope and a non-empty report before it writes final artifacts.
 
 Cortex deployments acquire an atomic database exclusion lease. Lease
 acquisition fails while any unexpired research run is queued/running, and new

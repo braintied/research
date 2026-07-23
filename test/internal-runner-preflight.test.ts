@@ -614,6 +614,187 @@ test('live internal runner reattaches to a durable run after submission transpor
   assert.equal(statusReads, 2);
 });
 
+test('an interrupted live runner preserves its generated request ID and reattaches explicitly', {
+  timeout: 15_000,
+}, async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'braintied-interrupted-'));
+  t.after(async () => { await rm(temporaryDirectory, { recursive: true, force: true }); });
+  const reportPath = path.join(temporaryDirectory, 'report.md');
+  const metadataPath = path.join(temporaryDirectory, 'metadata.json');
+  const token = 'sat_interrupted_test';
+  const brief = 'Prove a locally interrupted paid run can reattach without duplicate execution.';
+
+  let acceptedRequestId: string | undefined;
+  let completeStatus = false;
+  let firstStatusSeenResolve: (() => void) | undefined;
+  const firstStatusSeen = new Promise<void>((resolve) => {
+    firstStatusSeenResolve = resolve;
+  });
+  const submissionRequestIds: string[] = [];
+  const submissionCheckpointStatuses: string[] = [];
+  const server = createServer(async (request, response) => {
+    assert.equal(request.headers.authorization, `Bearer ${token}`);
+    if (request.method === 'GET' && request.url === '/internal/tools') {
+      sendDurableCatalog(response);
+      return;
+    }
+    if (request.method === 'POST' && request.url === '/internal/tools/runs') {
+      const requestId = request.headers['x-request-id'];
+      assert.equal(typeof requestId, 'string');
+      acceptedRequestId ??= requestId;
+      assert.equal(requestId, acceptedRequestId);
+      submissionRequestIds.push(requestId);
+
+      const checkpoint = JSON.parse(await readFile(metadataPath, 'utf8')) as {
+        artifact_type: string;
+        schema_version: number;
+        request_id: string;
+        durable_run_id: string | null;
+        checkpoint_status: string;
+      };
+      assert.equal(checkpoint.artifact_type, 'braintied_internal_research_checkpoint');
+      assert.equal(checkpoint.schema_version, 1);
+      assert.equal(checkpoint.request_id, requestId);
+      assert.equal(checkpoint.durable_run_id, null);
+      submissionCheckpointStatuses.push(checkpoint.checkpoint_status);
+
+      response.writeHead(202, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        ok: true,
+        run: {
+          id: DURABLE_RUN_ID,
+          requestId,
+          status: 'running',
+          pollAfterMs: 250,
+        },
+      }));
+      return;
+    }
+
+    assert.equal(request.method, 'GET');
+    assert.equal(request.url, `/internal/tools/runs/${DURABLE_RUN_ID}`);
+    if (!completeStatus) {
+      response.writeHead(202, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        ok: true,
+        run: {
+          id: DURABLE_RUN_ID,
+          requestId: acceptedRequestId,
+          status: 'running',
+          pollAfterMs: 250,
+        },
+      }));
+      firstStatusSeenResolve?.();
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({
+      ok: true,
+      result: {
+        kind: 'quick',
+        engine: 'pipeline',
+        report: {
+          full_markdown: '# Resumed result\n\nThe original durable run completed.',
+          bibliography: [],
+          gaps: [],
+          word_count: 7,
+        },
+        grounding: {
+          ratio: 0,
+          total_citations: 0,
+          valid_citations: 0,
+          hallucinated: [],
+          status: 'ungrounded',
+        },
+        costUsd: 0.1,
+        appliedMaxCostUsd: 0.25,
+        quoteCount: 0,
+      },
+    }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.close(); });
+  const address = server.address();
+  assert.ok(address !== null && typeof address === 'object');
+  const endpoint = `http://127.0.0.1:${address.port}/internal/tools/execute`;
+  const baseArgs = [
+    '--brief', brief,
+    '--kind', 'quick',
+    '--max-cost-usd', '0.25',
+    '--endpoint', endpoint,
+    '--timeout-seconds', '10',
+    '--output', reportPath,
+    '--metadata', metadataPath,
+    '--allow-external',
+  ];
+
+  const interruptedChild = spawn(process.execPath, [runner, ...baseArgs], {
+    cwd: packageRoot,
+    env: { ...process.env, BRAINTIED_AGENT_TOKEN: token },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => { interruptedChild.kill('SIGKILL'); });
+  let interruptedStderr = '';
+  interruptedChild.stderr.setEncoding('utf8');
+  interruptedChild.stderr.on('data', (chunk: string) => {
+    interruptedStderr += chunk;
+  });
+  const interruptedClose = new Promise<{ status: number | null; signal: NodeJS.Signals | null }>(
+    (resolve, reject) => {
+      interruptedChild.once('error', reject);
+      interruptedChild.once('close', (status, signal) => resolve({ status, signal }));
+    },
+  );
+
+  await firstStatusSeen;
+  assert.equal(interruptedChild.kill('SIGINT'), true);
+  const interrupted = await interruptedClose;
+  assert.equal(interrupted.status, null);
+  assert.equal(interrupted.signal, 'SIGINT');
+  assert.ok(acceptedRequestId);
+  assert.match(acceptedRequestId, /^[0-9a-f-]{36}$/i);
+  assert.match(interruptedStderr, /"event":"braintied_internal_research_checkpoint"/);
+  assert.match(interruptedStderr, new RegExp(`--request-id ${acceptedRequestId}`));
+
+  const interruptedMetadataText = await readFile(metadataPath, 'utf8');
+  const interruptedMetadata = JSON.parse(interruptedMetadataText) as {
+    artifact_type: string;
+    request_id: string;
+    durable_run_id: string;
+    execution_protocol: string;
+    checkpoint_status: string;
+    durable_run_status: string;
+  };
+  assert.equal(interruptedMetadata.artifact_type, 'braintied_internal_research_checkpoint');
+  assert.equal(interruptedMetadata.request_id, acceptedRequestId);
+  assert.equal(interruptedMetadata.durable_run_id, DURABLE_RUN_ID);
+  assert.equal(interruptedMetadata.execution_protocol, '2');
+  assert.equal(interruptedMetadata.checkpoint_status, 'awaiting_terminal_result');
+  assert.equal(interruptedMetadata.durable_run_status, 'running');
+  assert.equal((await stat(metadataPath)).mode & 0o777, 0o600);
+  assert.equal(interruptedMetadataText.includes(token), false);
+  assert.equal(interruptedMetadataText.includes(brief), false);
+
+  completeStatus = true;
+  const resumed = await runRunner([
+    ...baseArgs,
+    '--request-id', acceptedRequestId,
+  ], { ...process.env, BRAINTIED_AGENT_TOKEN: token });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.match(resumed.stderr, new RegExp(`--request-id ${acceptedRequestId}`));
+  assert.match(await readFile(reportPath, 'utf8'), /original durable run completed/);
+  const completedMetadata = JSON.parse(await readFile(metadataPath, 'utf8')) as {
+    request_id: string;
+    durable_run_id: string;
+    execution_protocol: string;
+  };
+  assert.equal(completedMetadata.request_id, acceptedRequestId);
+  assert.equal(completedMetadata.durable_run_id, DURABLE_RUN_ID);
+  assert.equal(completedMetadata.execution_protocol, '2');
+  assert.deepEqual(submissionRequestIds, [acceptedRequestId, acceptedRequestId]);
+  assert.deepEqual(submissionCheckpointStatuses, ['submission_pending', 'submission_pending']);
+});
+
 test('live internal runner preserves a sanitized transport diagnostic and request ID', async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'braintied-transport-'));
   t.after(async () => { await rm(temporaryDirectory, { recursive: true, force: true }); });
