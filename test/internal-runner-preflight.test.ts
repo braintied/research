@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
-import { createServer } from 'node:http';
+import { createServer, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -12,6 +12,26 @@ const runner = path.join(
   packageRoot,
   'skills/run-braintied-research/scripts/run-internal-research.mjs',
 );
+const DURABLE_RUN_ID = '22222222-2222-4222-8222-222222222222';
+
+function sendDurableCatalog(response: ServerResponse): void {
+  response.writeHead(200, { 'content-type': 'application/json' });
+  response.end(JSON.stringify({
+    ok: true,
+    protocolVersion: '2',
+    tools: [{
+      name: 'research.run',
+      version: '2',
+      execution: {
+        mode: 'durable-polling',
+        submitPath: '/internal/tools/runs',
+        statusPathTemplate: '/internal/tools/runs/{runId}',
+        pollAfterMs: 250,
+        retentionHours: 24,
+      },
+    }],
+  }));
+}
 
 function runRunner(args: string[], env: NodeJS.ProcessEnv): Promise<{
   status: number | null;
@@ -157,19 +177,37 @@ test('profile runner separates public Markdown, reference metadata, and trusted-
   const trustedOutputPath = path.join(temporaryDirectory, 'trusted.json');
 
   const server = createServer(async (request, response) => {
-    let requestBody = '';
-    for await (const chunk of request) requestBody += chunk.toString();
-    const parsed = JSON.parse(requestBody) as {
-      input: {
-        profileRef: string;
-        profileMode: string;
-        asOf: string;
+    if (request.method === 'GET' && request.url === '/internal/tools') {
+      sendDurableCatalog(response);
+      return;
+    }
+    if (request.method === 'POST' && request.url === '/internal/tools/runs') {
+      let requestBody = '';
+      for await (const chunk of request) requestBody += chunk.toString();
+      const parsed = JSON.parse(requestBody) as {
+        input: {
+          profileRef: string;
+          profileMode: string;
+          asOf: string;
+        };
       };
-    };
-    assert.equal(parsed.input.profileRef, 'web-design-intelligence@1');
-    assert.equal(parsed.input.profileMode, 'snapshot');
-    assert.equal(parsed.input.asOf, '2026-07-22');
-
+      assert.equal(parsed.input.profileRef, 'web-design-intelligence@1');
+      assert.equal(parsed.input.profileMode, 'snapshot');
+      assert.equal(parsed.input.asOf, '2026-07-22');
+      response.writeHead(202, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        ok: true,
+        run: {
+          id: DURABLE_RUN_ID,
+          requestId: request.headers['x-request-id'],
+          status: 'queued',
+          pollAfterMs: 250,
+        },
+      }));
+      return;
+    }
+    assert.equal(request.method, 'GET');
+    assert.equal(request.url, `/internal/tools/runs/${DURABLE_RUN_ID}`);
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({
       ok: true,
@@ -349,7 +387,26 @@ test('profile runner rejects unknown private-text fields in a server manifest', 
   const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'braintied-profile-leak-'));
   t.after(async () => { await rm(temporaryDirectory, { recursive: true, force: true }); });
 
-  const server = createServer((_request, response) => {
+  const server = createServer((request, response) => {
+    if (request.method === 'GET' && request.url === '/internal/tools') {
+      sendDurableCatalog(response);
+      return;
+    }
+    if (request.method === 'POST' && request.url === '/internal/tools/runs') {
+      response.writeHead(202, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        ok: true,
+        run: {
+          id: DURABLE_RUN_ID,
+          requestId: request.headers['x-request-id'],
+          status: 'queued',
+          pollAfterMs: 250,
+        },
+      }));
+      return;
+    }
+    assert.equal(request.method, 'GET');
+    assert.equal(request.url, `/internal/tools/runs/${DURABLE_RUN_ID}`);
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({
       ok: true,
@@ -430,24 +487,39 @@ test('profile runner rejects unknown private-text fields in a server manifest', 
   assert.equal(result.stderr.includes('PRIVATE-MUST-NOT-BE-WRITTEN'), false);
 });
 
-test('live internal runner accepts whitespace heartbeats before the final JSON envelope', async (t) => {
+test('live internal runner reattaches to a durable run after submission transport loss', async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'braintied-heartbeat-'));
   t.after(async () => { await rm(temporaryDirectory, { recursive: true, force: true }); });
   const reportPath = path.join(temporaryDirectory, 'report.md');
   const metadataPath = path.join(temporaryDirectory, 'metadata.json');
 
+  let submissionAttempts = 0;
+  let statusReads = 0;
+  let acceptedRequestId: string | undefined;
   const server = createServer(async (request, response) => {
-    assert.equal(request.url, '/internal/tools/execute');
     assert.equal(request.headers.authorization, 'Bearer sat_heartbeat_test');
-    let requestBody = '';
-    for await (const chunk of request) requestBody += chunk.toString();
-    const parsed = JSON.parse(requestBody) as { tool: string; input: { kind: string } };
-    assert.equal(parsed.tool, 'research.run');
-    assert.equal(parsed.input.kind, 'quick');
-
-    response.writeHead(200, { 'content-type': 'application/json; charset=UTF-8' });
-    response.write(' \n');
-    setTimeout(() => {
+    if (request.method === 'GET' && request.url === '/internal/tools') {
+      sendDurableCatalog(response);
+      return;
+    }
+    if (request.method === 'GET'
+        && request.url === `/internal/tools/runs/${DURABLE_RUN_ID}`) {
+      statusReads += 1;
+      response.writeHead(statusReads === 1 ? 202 : 200, {
+        'content-type': 'application/json',
+      });
+      if (statusReads === 1) {
+        response.end(JSON.stringify({
+          ok: true,
+          run: {
+            id: DURABLE_RUN_ID,
+            requestId: acceptedRequestId,
+            status: 'running',
+            pollAfterMs: 250,
+          },
+        }));
+        return;
+      }
       response.end(JSON.stringify({
         ok: true,
         tool: 'research.run',
@@ -455,13 +527,13 @@ test('live internal runner accepts whitespace heartbeats before the final JSON e
           kind: 'quick',
           engine: 'pipeline',
           report: {
-            title: 'Heartbeat result',
-            executive_summary: 'The connection stayed open.',
-            full_markdown: '# Heartbeat result\n\nThe connection stayed open.',
+            title: 'Durable result',
+            executive_summary: 'The run survived a lost submission response.',
+            full_markdown: '# Durable result\n\nThe run survived a lost submission response.',
             sections: [],
             bibliography: [],
             gaps: [],
-            word_count: 6,
+            word_count: 9,
           },
           grounding: {
             ratio: 0,
@@ -475,9 +547,42 @@ test('live internal runner accepts whitespace heartbeats before the final JSON e
           quoteCount: 0,
           briefSha256: 'a'.repeat(64),
         },
-        meta: { requestId: 'heartbeat-request', durationMs: 20 },
+        meta: {
+          requestId: acceptedRequestId,
+          runId: DURABLE_RUN_ID,
+          durationMs: 20,
+          durable: true,
+        },
       }));
-    }, 20);
+      return;
+    }
+
+    assert.equal(request.method, 'POST');
+    assert.equal(request.url, '/internal/tools/runs');
+    let requestBody = '';
+    for await (const chunk of request) requestBody += chunk.toString();
+    const parsed = JSON.parse(requestBody) as { tool: string; input: { kind: string } };
+    assert.equal(parsed.tool, 'research.run');
+    assert.equal(parsed.input.kind, 'quick');
+    submissionAttempts += 1;
+    const requestId = request.headers['x-request-id'];
+    assert.equal(typeof requestId, 'string');
+    if (acceptedRequestId === undefined) acceptedRequestId = requestId;
+    assert.equal(requestId, acceptedRequestId);
+    if (submissionAttempts === 1) {
+      request.socket.destroy();
+      return;
+    }
+    response.writeHead(202, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({
+      ok: true,
+      run: {
+        id: DURABLE_RUN_ID,
+        requestId,
+        status: 'queued',
+        pollAfterMs: 250,
+      },
+    }));
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   t.after(() => { server.close(); });
@@ -496,17 +601,27 @@ test('live internal runner accepts whitespace heartbeats before the final JSON e
   ], { ...process.env, BRAINTIED_AGENT_TOKEN: 'sat_heartbeat_test' });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(await readFile(reportPath, 'utf8'), /Heartbeat result/);
+  assert.match(await readFile(reportPath, 'utf8'), /Durable result/);
   const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as {
     timeout_seconds: number;
+    durable_run_id: string;
+    execution_protocol: string;
   };
   assert.equal(metadata.timeout_seconds, 5);
+  assert.equal(metadata.durable_run_id, DURABLE_RUN_ID);
+  assert.equal(metadata.execution_protocol, '2');
+  assert.equal(submissionAttempts, 2);
+  assert.equal(statusReads, 2);
 });
 
 test('live internal runner preserves a sanitized transport diagnostic and request ID', async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'braintied-transport-'));
   t.after(async () => { await rm(temporaryDirectory, { recursive: true, force: true }); });
-  const server = createServer((request) => {
+  const server = createServer((request, response) => {
+    if (request.method === 'GET' && request.url === '/internal/tools') {
+      sendDurableCatalog(response);
+      return;
+    }
     request.socket.destroy();
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -520,14 +635,16 @@ test('live internal runner preserves a sanitized transport diagnostic and reques
     '--max-cost-usd', '0.25',
     '--endpoint', `http://127.0.0.1:${address.port}/internal/tools/execute`,
     '--timeout-seconds', '5',
+    '--request-id', 'request-transport-1',
     '--output', path.join(temporaryDirectory, 'report.md'),
     '--metadata', path.join(temporaryDirectory, 'metadata.json'),
     '--allow-external',
   ], { ...process.env, BRAINTIED_AGENT_TOKEN: 'sat_transport_test' });
 
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /connection closed before completion/);
-  assert.match(result.stderr, /request [a-f0-9-]{36}; transport TypeError(?:\/[A-Z0-9_]+)?/);
+  assert.match(result.stderr, /submission timed out/);
+  assert.match(result.stderr, /request request-transport-1; last transport TypeError(?:\/[A-Z0-9_]+)?/);
+  assert.match(result.stderr, /--request-id request-transport-1/);
   assert.equal(result.stderr.includes('sat_transport_test'), false);
 });
 
@@ -552,12 +669,7 @@ test('internal preflight fails closed when Agent Auth is unavailable', () => {
 test('authenticated catalog probe confirms research.run is deployed', async (t) => {
   const server = createServer((request, response) => {
     assert.equal(request.headers.authorization, 'Bearer sat_probe_test');
-    response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({
-      ok: true,
-      protocolVersion: '1',
-      tools: [{ name: 'research.run' }],
-    }));
+    sendDurableCatalog(response);
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   t.after(() => { server.close(); });
@@ -574,11 +686,46 @@ test('authenticated catalog probe confirms research.run is deployed', async (t) 
   assert.equal(result.status, 0, result.stderr);
   const check = JSON.parse(result.stdout) as {
     ready: boolean;
-    probe: { http_status: number; research_run_available: boolean };
+    probe: {
+      http_status: number;
+      research_run_available: boolean;
+      durable_execution: { mode: string };
+    };
   };
   assert.equal(check.ready, true);
   assert.equal(check.probe.http_status, 200);
   assert.equal(check.probe.research_run_available, true);
+  assert.equal(check.probe.durable_execution.mode, 'durable-polling');
+});
+
+test('catalog probe rejects legacy streaming-only execution', async (t) => {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({
+      ok: true,
+      protocolVersion: '1',
+      tools: [{ name: 'research.run', version: '1' }],
+    }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.close(); });
+  const address = server.address();
+  assert.ok(address !== null && typeof address === 'object');
+
+  const result = await runRunner([
+    '--check', '--probe',
+    '--kind', 'quick',
+    '--max-cost-usd', '1',
+    '--endpoint', `http://127.0.0.1:${address.port}/internal/tools/execute`,
+  ], { ...process.env, BRAINTIED_AGENT_TOKEN: 'sat_probe_test' });
+
+  assert.equal(result.status, 2, result.stderr);
+  const check = JSON.parse(result.stdout) as {
+    ready: boolean;
+    probe: { error: string };
+  };
+  assert.equal(check.ready, false);
+  assert.match(check.probe.error, /does not advertise durable research execution/);
 });
 
 test('catalog probe fails readiness when deployment returns 404 HTML', async (t) => {

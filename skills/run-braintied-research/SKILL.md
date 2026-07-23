@@ -53,7 +53,8 @@ model providers; treat every brief as outbound data.
    ```
 
    A token-presence check alone is not deployment health. Do not continue on a
-   missing route, failed authentication, or catalog without `research.run`.
+   missing route, failed authentication, or a catalog that lacks durable
+   protocol v2 submission/status endpoints for `research.run`.
 
 5. **Run only after the outbound brief, credentials, and remote catalog are authorized.** Pass
    `--allow-external`, an explicit report path, and a metadata path:
@@ -71,6 +72,14 @@ model providers; treat every brief as outbound data.
      --trusted-output /tmp/research-trusted.json \
      --allow-external
    ```
+
+   The server persists the authenticated input before dispatch and returns a
+   durable run ID. Submission and status requests retry bounded transport and
+   temporary-service failures with the same request ID. If the local deadline
+   or process interrupts the client, rerun the identical command with the
+   printed `--request-id <id>` to reattach; never choose a fresh ID for the same
+   paid attempt. Cortex deploys atomically exclude queued/running research, so a
+   normal rolling release cannot cut a paid run in half.
 
    Use `run-research.mjs` only as an explicitly authorized local fallback when
    the internal service is unavailable. That fallback requires package build
@@ -186,6 +195,11 @@ Braintied engine actually ran. If it did not run and no provider call was made,
 report **incurred cost `$0.00`** and say that engine `cost_usd` metadata and
 grounding were **not produced**; do not describe either as `null`. If standalone
 provider probes were made, report their known quota/credit cost separately.
+
+For an interrupted internal run, distinguish client transport from server
+execution. Preserve its request ID and use `--request-id` to retrieve the same
+durable record. Do not report `$0.00`, infer provider cost, or start a replacement
+run until the durable status proves the original attempt terminal.
 
 Run `node skills/run-braintied-research/scripts/run-internal-research.mjs --help`
 for the default internal surface and `run-research.mjs --help` for the local

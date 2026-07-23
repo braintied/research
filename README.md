@@ -130,6 +130,12 @@ node skills/run-braintied-research/scripts/run-internal-research.mjs \
 
 The internal runner uses Braintied Agent Auth from `BRAINTIED_AGENT_TOKEN` or
 macOS Keychain and keeps all model/search provider credentials in Cortex Worker.
+Live execution requires the authenticated catalog's durable protocol v2: the
+client submits one idempotent request, records the server-owned run ID, and
+polls the tenant-bound result. A dropped response or rolling deployment is
+retried with the same request ID instead of starting a second paid run. Preserve
+the printed request ID; `--request-id <id>` explicitly reattaches after a local
+timeout or interruption.
 `run-research.mjs` remains available as an explicit local-provider fallback; it
 supports allowlisted interactive-shell environment loading and build-freshness
 checks. Exact lane preflight requires an as-of date:
@@ -198,7 +204,7 @@ npm run pack:release          # → releases/braintied-research-<version>.tgz
 
 ```jsonc
 // consumer package.json
-"@braintied/research": "file:vendor/braintied-research-0.6.4.tgz"
+"@braintied/research": "file:vendor/braintied-research-0.8.1.tgz"
 ```
 
 ## Development

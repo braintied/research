@@ -37,6 +37,7 @@ Options:
   --endpoint <url>          Internal tool endpoint
   --timeout-seconds <n>     Request timeout, 1-3600
                             (default: 3600 for deep, 1200 otherwise)
+  --request-id <id>         Optional durable idempotency key for resuming a run
   --keychain-service <name> macOS Keychain service (default: braintied-agent-auth)
   --keychain-account <name> macOS Keychain account (default: codex)
   --output <path>           Required Markdown report output
@@ -72,6 +73,7 @@ function parseCli() {
       'as-of': { type: 'string' },
       endpoint: { type: 'string' },
       'timeout-seconds': { type: 'string' },
+      'request-id': { type: 'string' },
       'keychain-service': { type: 'string', default: DEFAULT_KEYCHAIN_SERVICE },
       'keychain-account': { type: 'string', default: DEFAULT_KEYCHAIN_ACCOUNT },
       output: { type: 'string' },
@@ -131,6 +133,14 @@ function parseAsOf(raw) {
   return raw;
 }
 
+function parseRequestId(raw) {
+  if (raw === undefined) return undefined;
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(raw)) {
+    throw new Error('--request-id must contain 1-128 URL-safe identifier characters.');
+  }
+  return raw;
+}
+
 function resolveEndpoint(raw) {
   const endpoint = new URL(raw ?? process.env.BRAINTIED_INTERNAL_TOOLS_URL ?? DEFAULT_ENDPOINT);
   if (endpoint.username !== '' || endpoint.password !== '' || endpoint.search !== '' || endpoint.hash !== '') {
@@ -171,6 +181,7 @@ async function probeInternalCatalog({ endpoint, token, timeoutSeconds }) {
       http_status: null,
       protocol_version: null,
       research_run_available: false,
+      durable_execution: null,
       error: 'Internal tool catalog is unavailable.',
     };
   }
@@ -185,17 +196,36 @@ async function probeInternalCatalog({ endpoint, token, timeoutSeconds }) {
       http_status: response.status,
       protocol_version: null,
       research_run_available: false,
+      durable_execution: null,
       error: `Internal tool catalog returned HTTP ${response.status} with invalid JSON.`,
     };
   }
 
   const tools = Array.isArray(payload?.tools) ? payload.tools : [];
-  const researchRunAvailable = tools.some((tool) => tool?.name === 'research.run');
-  const ready = response.ok && payload?.ok === true && researchRunAvailable;
+  const researchTool = tools.find((tool) => tool?.name === 'research.run');
+  const researchRunAvailable = researchTool !== undefined;
+  const execution = researchTool?.execution;
+  const durableExecution = execution !== null && typeof execution === 'object'
+    && execution.mode === 'durable-polling'
+    && execution.submitPath === '/internal/tools/runs'
+    && execution.statusPathTemplate === '/internal/tools/runs/{runId}'
+    && Number.isSafeInteger(execution.pollAfterMs)
+    && execution.pollAfterMs >= 250
+    && execution.pollAfterMs <= 10_000
+    && Number.isSafeInteger(execution.retentionHours)
+    && execution.retentionHours >= 1;
+  const ready = response.ok
+    && payload?.ok === true
+    && payload?.protocolVersion === '2'
+    && researchRunAvailable
+    && durableExecution;
   let error = null;
   if (!response.ok) error = `Internal tool catalog returned HTTP ${response.status}.`;
   else if (payload?.ok !== true) error = 'Internal tool catalog returned an invalid success envelope.';
   else if (!researchRunAvailable) error = 'Internal tool catalog does not advertise research.run.';
+  else if (payload?.protocolVersion !== '2' || !durableExecution) {
+    error = 'Internal tool catalog does not advertise durable research execution.';
+  }
 
   return {
     ready,
@@ -203,6 +233,15 @@ async function probeInternalCatalog({ endpoint, token, timeoutSeconds }) {
     http_status: response.status,
     protocol_version: typeof payload?.protocolVersion === 'string' ? payload.protocolVersion : null,
     research_run_available: researchRunAvailable,
+    durable_execution: durableExecution
+      ? {
+          mode: execution.mode,
+          submit_path: execution.submitPath,
+          status_path_template: execution.statusPathTemplate,
+          poll_after_ms: execution.pollAfterMs,
+          retention_hours: execution.retentionHours,
+        }
+      : null,
     error,
   };
 }
@@ -562,52 +601,218 @@ function sanitizedTransportDiagnostic(error) {
   return causeCode === null ? errorName : `${errorName}/${causeCode}`;
 }
 
-async function executeResearch({ endpoint, token, timeoutSeconds, requestId, input }) {
-  let response;
+function resolveDurableEndpoints(endpoint, probe) {
+  const durable = probe?.durable_execution;
+  if (durable === null || durable === undefined) {
+    throw new Error('Internal tool catalog did not provide durable research endpoints.');
+  }
+  const execution = new URL(endpoint);
+  const submit = new URL(durable.submit_path, execution);
+  if (submit.origin !== execution.origin
+      || submit.username !== ''
+      || submit.password !== ''
+      || submit.search !== ''
+      || submit.hash !== '') {
+    throw new Error('Internal tool catalog returned an unsafe durable submission endpoint.');
+  }
+  return {
+    submit: submit.toString(),
+    status(runId) {
+      const path = durable.status_path_template.replace('{runId}', encodeURIComponent(runId));
+      const status = new URL(path, execution);
+      if (status.origin !== execution.origin
+          || status.username !== ''
+          || status.password !== ''
+          || status.search !== ''
+          || status.hash !== '') {
+        throw new Error('Internal tool catalog returned an unsafe durable status endpoint.');
+      }
+      return status.toString();
+    },
+    pollAfterMs: durable.poll_after_ms,
+  };
+}
+
+function retryableHttpStatus(status) {
+  return [404, 408, 425, 429, 502, 503, 504].includes(status);
+}
+
+function retryDelayMs(attempt, requestedMs = null) {
+  if (Number.isSafeInteger(requestedMs) && requestedMs >= 250 && requestedMs <= 10_000) {
+    return requestedMs;
+  }
+  return Math.min(5_000, 500 * (2 ** Math.min(attempt, 4)));
+}
+
+async function waitForRetry(delayMs, deadlineMs) {
+  const remainingMs = deadlineMs - Date.now();
+  if (remainingMs <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, Math.min(delayMs, remainingMs)));
+}
+
+function boundedServerMessage(response, payload) {
+  const serverMessage = payload?.error?.message;
+  if (typeof serverMessage === 'string' && serverMessage.length <= 500) {
+    return serverMessage;
+  }
+  return response.ok
+    ? 'Internal tool returned a failed execution envelope.'
+    : `Internal tool returned HTTP ${response.status}.`;
+}
+
+async function fetchDurableJson({ url, method, token, requestId, body, deadlineMs }) {
+  const remainingMs = deadlineMs - Date.now();
+  if (remainingMs <= 0) return { kind: 'deadline' };
   try {
-    response = await fetch(endpoint, {
-      method: 'POST',
+    const response = await fetch(url, {
+      method,
       headers: {
         authorization: `Bearer ${token}`,
-        'content-type': 'application/json',
+        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
         'x-request-id': requestId,
       },
-      body: JSON.stringify({ tool: 'research.run', input }),
-      signal: AbortSignal.timeout(timeoutSeconds * 1000),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal: AbortSignal.timeout(Math.max(1, Math.min(15_000, remainingMs))),
     });
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      return { kind: 'invalid-json', response };
+    }
+    return { kind: 'response', response, payload };
   } catch (error) {
-    const diagnostic = sanitizedTransportDiagnostic(error);
-    const message = error instanceof Error
-      && (error.name === 'TimeoutError' || error.name === 'AbortError')
-      ? `Internal research timed out after ${timeoutSeconds} seconds (request ${requestId}; transport ${diagnostic}).`
-      : `Internal research connection closed before completion (request ${requestId}; transport ${diagnostic}). Verify the internal tool catalog and long-run heartbeat deployment, then retry.`;
-    throw new Error(message);
+    return {
+      kind: 'transport',
+      diagnostic: sanitizedTransportDiagnostic(error),
+    };
   }
+}
 
-  let payload;
-  try {
-    payload = await response.json();
-  } catch {
-    if (response.status === 404) {
-      throw new Error('Internal tool returned HTTP 404 with invalid JSON. The deployed /internal/tools route may be missing; run --check --probe to verify the catalog.');
+async function submitDurableResearch({
+  endpoint,
+  token,
+  requestId,
+  input,
+  deadlineMs,
+}) {
+  let attempt = 0;
+  let lastDiagnostic = 'UnknownError';
+  while (Date.now() < deadlineMs) {
+    const outcome = await fetchDurableJson({
+      url: endpoint,
+      method: 'POST',
+      token,
+      requestId,
+      body: { tool: 'research.run', input },
+      deadlineMs,
+    });
+    if (outcome.kind === 'response') {
+      const { response, payload } = outcome;
+      const run = payload?.run;
+      const validRun = payload?.ok === true
+        && run !== null
+        && typeof run === 'object'
+        && typeof run.id === 'string'
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(run.id)
+        && run.requestId === requestId
+        && ['queued', 'running', 'completed', 'failed'].includes(run.status);
+      if ((response.status === 202 || response.status === 200) && validRun) {
+        return run;
+      }
+      if (!retryableHttpStatus(response.status)) {
+        throw new Error(boundedServerMessage(response, payload));
+      }
+      lastDiagnostic = `HTTP_${response.status}`;
+    } else if (outcome.kind === 'invalid-json') {
+      if (!retryableHttpStatus(outcome.response.status)) {
+        throw new Error(`Internal durable submission returned HTTP ${outcome.response.status} with invalid JSON.`);
+      }
+      lastDiagnostic = `HTTP_${outcome.response.status}_INVALID_JSON`;
+    } else if (outcome.kind === 'transport') {
+      lastDiagnostic = outcome.diagnostic;
     }
-    if (response.ok) {
-      throw new Error(`Internal research response stream ended before a valid JSON result was received (request ${requestId}). Verify the long-run heartbeat deployment, then retry.`);
+    await waitForRetry(retryDelayMs(attempt), deadlineMs);
+    attempt += 1;
+  }
+  throw new Error(
+    `Internal research submission timed out (request ${requestId}; last transport ${lastDiagnostic}). Re-run with --request-id ${requestId} to resume the same durable run.`,
+  );
+}
+
+async function pollDurableResearch({
+  endpoint,
+  token,
+  requestId,
+  runId,
+  pollAfterMs,
+  deadlineMs,
+}) {
+  let attempt = 0;
+  let lastDiagnostic = 'UnknownError';
+  while (Date.now() < deadlineMs) {
+    const outcome = await fetchDurableJson({
+      url: endpoint,
+      method: 'GET',
+      token,
+      requestId,
+      deadlineMs,
+    });
+    if (outcome.kind === 'response') {
+      const { response, payload } = outcome;
+      if (response.status === 200 && payload?.ok === true) {
+        return validateResult(payload);
+      }
+      if (response.status === 202
+          && payload?.ok === true
+          && payload?.run?.id === runId
+          && ['queued', 'running'].includes(payload.run.status)) {
+        await waitForRetry(
+          retryDelayMs(attempt, payload.run.pollAfterMs ?? pollAfterMs),
+          deadlineMs,
+        );
+        attempt = 0;
+        continue;
+      }
+      if (!retryableHttpStatus(response.status)) {
+        throw new Error(boundedServerMessage(response, payload));
+      }
+      lastDiagnostic = `HTTP_${response.status}`;
+    } else if (outcome.kind === 'invalid-json') {
+      if (!retryableHttpStatus(outcome.response.status)) {
+        throw new Error(`Internal durable status returned HTTP ${outcome.response.status} with invalid JSON.`);
+      }
+      lastDiagnostic = `HTTP_${outcome.response.status}_INVALID_JSON`;
+    } else if (outcome.kind === 'transport') {
+      lastDiagnostic = outcome.diagnostic;
     }
-    throw new Error(`Internal tool returned HTTP ${response.status} with invalid JSON.`);
+    await waitForRetry(retryDelayMs(attempt), deadlineMs);
+    attempt += 1;
   }
+  throw new Error(
+    `Internal research timed out before its durable result was ready (request ${requestId}; run ${runId}; last transport ${lastDiagnostic}). Re-run with --request-id ${requestId} to resume.`,
+  );
+}
 
-  if (!response.ok || payload?.ok !== true) {
-    const serverMessage = payload?.error?.message;
-    const message = typeof serverMessage === 'string' && serverMessage.length <= 500
-      ? serverMessage
-      : response.ok
-        ? 'Internal tool returned a failed execution envelope.'
-        : `Internal tool returned HTTP ${response.status}.`;
-    throw new Error(message);
-  }
-
-  return validateResult(payload);
+async function executeResearch({ endpoint, token, timeoutSeconds, requestId, input, probe }) {
+  const durable = resolveDurableEndpoints(endpoint, probe);
+  const deadlineMs = Date.now() + timeoutSeconds * 1000;
+  const run = await submitDurableResearch({
+    endpoint: durable.submit,
+    token,
+    requestId,
+    input,
+    deadlineMs,
+  });
+  const result = await pollDurableResearch({
+    endpoint: durable.status(run.id),
+    token,
+    requestId,
+    runId: run.id,
+    pollAfterMs: durable.pollAfterMs,
+    deadlineMs,
+  });
+  return { result, runId: run.id };
 }
 
 async function main() {
@@ -638,6 +843,7 @@ async function main() {
   const profileRef = parseProfileRef(values.profile);
   const profileMode = parseProfileMode(values['profile-mode']);
   const asOf = parseAsOf(values['as-of']);
+  const requestedRequestId = parseRequestId(values['request-id']);
   if (values.probe === true && values.check !== true && values['dry-run'] !== true) {
     throw new Error('--probe is supported only with --check or --dry-run.');
   }
@@ -677,6 +883,7 @@ async function main() {
     requested_profile_ref: profileRef ?? null,
     requested_profile_mode: profileMode ?? null,
     requested_as_of: asOf ?? null,
+    requested_request_id: requestedRequestId ?? null,
     timeout_seconds: timeoutSeconds,
     agent_token_source: auth.source,
     agent_token_present: auth.token !== null,
@@ -718,15 +925,22 @@ async function main() {
     throw new Error('--output, --metadata, and --trusted-output must be different paths.');
   }
 
+  const liveProbe = probe
+    ?? await probeInternalCatalog({ endpoint, token: auth.token, timeoutSeconds });
+  if (!liveProbe.ready) {
+    throw new Error(`Preflight failed: ${liveProbe.error ?? 'durable internal tool catalog probe failed'}.`);
+  }
+
   const brief = await readBrief(values);
-  const requestId = randomUUID();
+  const requestId = requestedRequestId ?? randomUUID();
   const startedAt = new Date();
   const startedMonotonic = process.hrtime.bigint();
-  const result = await executeResearch({
+  const execution = await executeResearch({
     endpoint,
     token: auth.token,
     timeoutSeconds,
     requestId,
+    probe: liveProbe,
     input: {
       brief,
       kind,
@@ -740,6 +954,7 @@ async function main() {
       ...(asOf !== undefined ? { asOf } : {}),
     },
   });
+  const result = execution.result;
   if (profileRef !== undefined && result.privateManifest === undefined) {
     throw new Error('Profile research completed without its required trusted-local private manifest.');
   }
@@ -754,6 +969,8 @@ async function main() {
     mode: 'internal',
     package_version: check.package_version,
     request_id: requestId,
+    durable_run_id: execution.runId,
+    execution_protocol: liveProbe.protocol_version,
     started_at: startedAt.toISOString(),
     finished_at: finishedAt.toISOString(),
     duration_ms: Math.round(durationMs),
@@ -814,6 +1031,7 @@ async function main() {
     metadata: metadataPath,
     trusted_output: trustedOutputPath,
     request_id: requestId,
+    durable_run_id: execution.runId,
     kind: metadata.kind,
     engine: metadata.engine,
     cost_usd: metadata.cost_usd,
