@@ -83,6 +83,13 @@ function toIsoString(dateStr: string): string | undefined {
 export const tavilyProvider: SearchProvider = {
   name: 'tavily',
 
+  capabilities: {
+    search: true,
+    fetch: false,
+    extract: false,
+    backends: ['tavily_search_raw_content', 'crawl4ai', 'jina', 'direct_fetch'],
+  },
+
   get enabled(): boolean {
     return isEnabled();
   },
@@ -112,7 +119,16 @@ export const tavilyProvider: SearchProvider = {
       body['exclude_domains'] = opts.exclude_domains;
     }
 
-    if (opts.recency_days !== undefined && opts.recency_days > 0) {
+    if (opts.published_before !== undefined) {
+      const upper = new Date(opts.published_before);
+      if (!Number.isNaN(upper.getTime())) {
+        body['end_date'] = upper.toISOString().slice(0, 10);
+        if (opts.recency_days !== undefined && opts.recency_days > 0) {
+          const lower = new Date(upper.getTime() - opts.recency_days * 86_400_000);
+          body['start_date'] = lower.toISOString().slice(0, 10);
+        }
+      }
+    } else if (opts.recency_days !== undefined && opts.recency_days > 0) {
       body['days'] = opts.recency_days;
     }
 
@@ -154,7 +170,10 @@ export const tavilyProvider: SearchProvider = {
         engagement: {
           score: item.score,
         },
-        raw_metadata: rawContent.length > 0 ? { raw_content: rawContent } : {},
+        raw_metadata: {
+          backend: 'tavily_search',
+          ...(rawContent.length > 0 ? { raw_content: rawContent } : {}),
+        },
       };
 
       const validated = SearchResultSchema.safeParse(candidate);

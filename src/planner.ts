@@ -29,18 +29,20 @@ const PROVIDER_ROUTING_ROWS: Array<{ need: string; providers: string[] }> = [
   { need: 'YouTube comment threads', providers: ['youtube'] },
   { need: 'News / recent reactions', providers: ['searxng', 'serper', 'tavily', 'serpapi'] },
   { need: 'Google SERP / ads / PAA', providers: ['serper', 'serpapi'] },
-  { need: 'Long-form blogs / essays', providers: ['exa', 'searxng', 'crawl4ai'] },
+  { need: 'Long-form blogs / essays', providers: ['exa', 'searxng', 'tavily'] },
   { need: 'Academic papers / arxiv', providers: ['exa', 'tavily', 'searxng'] },
   { need: 'Hacker News discussions', providers: ['hn', 'tavily'] },
-  { need: 'RSS newsletters / Substack', providers: ['rss', 'crawl4ai'] },
-  { need: 'Competitor landing pages', providers: ['crawl4ai', 'serper', 'serpapi'] },
+  { need: 'RSS newsletters / Substack', providers: ['rss', 'searxng'] },
+  { need: 'Competitor landing pages', providers: ['tavily', 'serper', 'serpapi'] },
   { need: 'Audience verbatim pain', providers: ['reddit', 'youtube'] },
-  { need: 'Vendor docs / changelogs', providers: ['crawl4ai', 'searxng', 'exa'] },
+  { need: 'Vendor docs / changelogs', providers: ['tavily', 'searxng', 'exa'] },
+  { need: 'GitHub repositories / releases', providers: ['github', 'tavily', 'searxng'] },
+  { need: 'GitHub issues / pull requests', providers: ['github', 'tavily', 'searxng'] },
 ];
 
 /** Legacy default — used when the caller doesn't pass availableProviders. */
 const DEFAULT_PLANNER_PROVIDERS = [
-  'tavily', 'exa', 'serpapi', 'serper', 'searxng', 'reddit', 'youtube', 'hn', 'rss', 'crawl4ai',
+  'tavily', 'exa', 'serpapi', 'serper', 'searxng', 'reddit', 'youtube', 'hn', 'rss', 'github',
 ];
 
 /**
@@ -86,7 +88,7 @@ Output ONLY valid JSON in this exact shape (no markdown fences, no explanation):
 }
 
 Valid provider values: ${providerList}
-Valid expected_source_types: forum, social, video, video_comments, longform, academic, news, serp, course_page, audience_voice, newsletter, documentation`;
+Valid expected_source_types: forum, social, video, video_comments, social_video, longform, academic, news, serp, course_page, audience_voice, newsletter, documentation, podcast, course_review, repository, issue, code`;
 };
 
 // =============================================================================

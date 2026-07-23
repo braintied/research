@@ -21,6 +21,8 @@ Shared deep-research engine for Braintied products (Sentigen, Swishh, ora-ai, Kr
 
 Higher layers (this package):
 - **Research kinds** — presets (`answer` / `quick` / `standard` / `deep` / `managed` / `social`) so callers say *what kind* of research instead of tuning knobs
+- **Source modes** — explicit, enforceable evidence lanes (`web`, `x`, `reddit`, `youtube`, `github`, `community`, `cortex`, `telegram`); required lanes compile to deterministic searches and fail coverage rather than becoming prompt prose
+- **Investigation profiles** — versioned source, coverage, verification, output, update, and data-boundary contracts; public and private recall briefs compile separately
 - **Documents** — `generateDocument({ docType, ... })` renders research into typed structured docs: `prd`, `market-report`, `tech-spec`, `client-brief`, `content-brief`, `estimate-research`
 - **Agent skill** — `skills/run-braintied-research/` provides a safe preflight, explicit cost caps, deterministic report/metadata output, and source-verification rules for Codex and other skill-aware agents
 
@@ -39,10 +41,11 @@ All providers are raw `fetch` — no SDK dependencies. A provider is enabled whe
 | Jina Reader | fetch fallback | `JINA_API_KEY` | free tier |
 | Reddit | social | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT` | free |
 | YouTube | video | `YOUTUBE_API_KEY` | free quota |
+| GitHub | repository/issues/PRs | optional `GITHUB_TOKEN` or `GH_TOKEN` | public unauthenticated access; token recommended for search quota |
 | Hacker News | forum | (none) | $0 |
 | RSS | newsletters | (none) | $0 |
 | Podcasts | podcast | `LISTENNOTES_API_KEY` | paid |
-| X (Twitter) | social | `TWITTERAPI_IO_KEY` (primary, ~$0.15/1k tweets, datacenter-safe) and/or `APIFY_API_TOKEN` (fallback actor) | cheap |
+| X (Twitter) | social | `TWITTERAPI_IO_KEY` (lower-cost primary), `X_BEARER_TOKEN` (official fallback; `TWITTER_BEARER_TOKEN` / Ora's `X_APP_BEARER_TOKEN` aliases), and/or `APIFY_API_TOKEN` (last fallback) | plan-dependent |
 | TikTok | social | `APIFY_API_TOKEN` (search + comment-rich fetch) and/or `BRIGHTDATA_API_TOKEN` (fetch fallback, ~$1.50/1k records) | paid |
 | Instagram | social | `BRIGHTDATA_API_TOKEN` (posts dataset `gd_lk5ns7kz21pck8jpis`; profiles dataset `gd_l1vikfch901nx3by4`) | paid |
 | FB Groups | social | `APIFY_API_TOKEN` | paid |
@@ -74,6 +77,38 @@ const { report, quotes, costUsd } = await runResearch({
 console.log(report.full_markdown);
 ```
 
+Kinds control execution depth and cost; source modes control which lanes must
+actually run. Profiles make recurring investigations reproducible. Public
+research and private recall execute concurrently but remain separate artifacts:
+
+```ts
+import { runResearchProgram } from '@braintied/research';
+
+const result = await runResearchProgram({
+  brief: 'How should Ora combine durable workflows and long-running agents?',
+  asOf: '2026-07-21',
+  profileRef: 'ora-agent-runtime@1',
+  kind: 'deep',
+  maxCostUsd: 7,
+  // Ora injects the tenant-bound `ora-cortex-braintied` adapter here.
+  // Raw private evidence never enters the public provider/model pipeline.
+  trustedAdapters: [oraCortexBraintiedAdapter],
+});
+
+if (result.status !== 'complete') {
+  console.warn(result.sourceCoverage.missingModes);
+}
+```
+
+For an all-public run without private recall, use
+`sourceModes: ['all_public']`. The core expansion is web, X, Reddit, YouTube,
+GitHub, and community evidence. Paid optional social modes are opt-in.
+
+The provider boundary is intentional: structured APIs perform social
+discovery; Bright Data supplies high-fidelity acquisition/backfill where its
+dataset contract supports the lane; Apify is the last scraper fallback. Tavily
+and SearXNG discover web URLs, while Crawl4AI/Jina/direct HTTP acquire them.
+
 Composable stages are exported individually (`planSubqueries`, `getEnabledProviders`, `rerankQuotes`, `synthesizeAllSections`, `critiqueDraft`, `assembleFinalReport`, `validateGrounding`) for consumers that orchestrate their own pipelines (e.g. cortex-worker keeps Inngest step boundaries).
 
 ## Agent skill
@@ -82,11 +117,13 @@ The canonical skill is [`skills/run-braintied-research/`](skills/run-braintied-r
 Its name deliberately differs from the existing Braintied Telegram/Cortex
 enrichment-operations skill.
 
-Preflight the package without making a network call:
+Verify Agent Auth locally, then add `--probe` to confirm the deployed Cortex
+catalog exposes `research.run` without calling a model or search provider:
 
 ```bash
 node skills/run-braintied-research/scripts/run-internal-research.mjs \
   --check \
+  --probe \
   --kind standard \
   --max-cost-usd 2.50
 ```
@@ -95,7 +132,47 @@ The internal runner uses Braintied Agent Auth from `BRAINTIED_AGENT_TOKEN` or
 macOS Keychain and keeps all model/search provider credentials in Cortex Worker.
 `run-research.mjs` remains available as an explicit local-provider fallback; it
 supports allowlisted interactive-shell environment loading and build-freshness
-checks.
+checks. Exact lane preflight requires an as-of date:
+
+```bash
+node skills/run-braintied-research/scripts/run-research.mjs \
+  --check \
+  --kind deep \
+  --max-cost-usd 5 \
+  --sources all_public \
+  --require-providers tavily,x,reddit,youtube,github \
+  --as-of 2026-07-21 \
+  --load-shell-env
+```
+
+This check validates build/configuration and compiles the source plan; it does
+not prove credentials are accepted remotely. A live run records source and
+profile coverage in metadata and exits non-zero when a required lane is partial.
+
+For a bounded search-only health check with no model, fetch, extraction, or
+trusted recall, use `probePublicSourceHealth`. Its default registry permits only
+known no-usage-billing adapters; pass the enabled registry explicitly when a
+caller has authorized X/Tavily or another metered probe:
+
+```ts
+import {
+  getEnabledSearchProviders,
+  probePublicSourceHealth,
+} from '@braintied/research';
+
+const health = await probePublicSourceHealth({
+  question: 'long-running agents loops work graphs',
+  modes: ['all_public'],
+  asOf: '2026-07-21T23:59:59-07:00',
+  limit: 4,
+  maxPages: 1,
+}, {
+  providerRegistry: getEnabledSearchProviders(), // explicit metered-call opt-in
+});
+```
+
+The report contains query hashes, backend names, counts, dates, latency, and
+sanitized failure classes—not query text or provider error bodies.
 
 To make this checkout discoverable in Codex without copying or drifting the
 skill, link the canonical folder once (fail if a path with that name already

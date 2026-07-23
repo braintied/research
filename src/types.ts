@@ -33,6 +33,7 @@ export const PROVIDER_NAMES = [
   'instagram',
   'x',
   'podcasts',
+  'github',
 ] as const;
 
 export const ProviderNameSchema = z.enum(PROVIDER_NAMES);
@@ -58,6 +59,9 @@ export const ExpectedSourceTypeSchema = z.enum([
   'documentation',  // Vendor docs, changelogs
   'podcast',        // Podcast episodes + transcripts (Listen Notes)
   'course_review',  // Course reviews across Reddit, YouTube, forums
+  'repository',     // GitHub repositories and release activity
+  'issue',          // GitHub issues, pull requests, and discussions
+  'code',           // Source-code examples and implementations
 ]);
 
 export type ExpectedSourceType = z.infer<typeof ExpectedSourceTypeSchema>;
@@ -72,6 +76,25 @@ export const SubquerySchema = z.object({
   providers: z.array(ProviderNameSchema).min(1),
   expected_source_types: z.array(ExpectedSourceTypeSchema).default([]),
   rationale: z.string().default(''),
+  /** Deterministic source-pack lineage for required, non-LLM-seeded searches. */
+  source_pack_id: z.string().min(1).max(120).optional(),
+  /** Source mode that caused this search (web, x, reddit, youtube, github...). */
+  source_mode: z.string().min(1).max(80).optional(),
+  /** Required searches are preserved even when the LLM plan omits that lane. */
+  required: z.boolean().default(false),
+  /** Per-search controls override the run-level/provider-level defaults. */
+  search_options: z.object({
+    limit: z.number().int().min(1).max(100).optional(),
+    recency_days: z.number().int().positive().optional(),
+    published_before: z.string().datetime({ offset: true }).optional(),
+    sort: z.enum(['relevance', 'latest', 'top', 'new', 'comments', 'views', 'rating', 'mixed']).optional(),
+    include_domains: z.array(z.string().min(1)).optional(),
+    exclude_domains: z.array(z.string().min(1)).optional(),
+    communities: z.array(z.string().min(1)).optional(),
+    handles: z.array(z.string().min(1)).optional(),
+    channel_ids: z.array(z.string().min(1)).optional(),
+    max_pages: z.number().int().min(1).max(10).optional(),
+  }).default({}),
 });
 
 export type Subquery = z.infer<typeof SubquerySchema>;
@@ -95,6 +118,9 @@ export const SearchResultSchema = z.object({
    * provider gave every same-provider section identical URLs).
    */
   retrieved_for: z.array(z.string()).default([]),
+  /** Source packs/modes that actually retrieved this result in the current run. */
+  source_pack_ids: z.array(z.string()).default([]),
+  source_modes: z.array(z.string()).default([]),
   engagement: z.object({
     upvotes: z.number().optional(),
     comment_count: z.number().optional(),
@@ -121,6 +147,8 @@ export const FetchResultSchema = z.object({
   raw_content: z.string().default(''),              // raw HTML / JSON / transcript
   markdown: z.string().default(''),                 // cleaned, ready for extraction
   engagement: z.record(z.string(), z.unknown()).default({}),
+  /** Acquisition-backend lineage (native API, Bright Data, Crawl4AI, Apify...). */
+  raw_metadata: z.record(z.string(), z.unknown()).default({}),
   fetch_status: z.enum(['ok', 'partial', 'failed']).default('ok'),
   fetch_error: z.string().optional(),
 });
@@ -174,12 +202,42 @@ export type ExtractedQuotes = z.infer<typeof ExtractedQuotesSchema>;
 // SearchOpts — passed to provider.search()
 // =============================================================================
 
+export type SearchSort =
+  | 'relevance'
+  | 'latest'
+  | 'top'
+  | 'new'
+  | 'comments'
+  | 'views'
+  | 'rating'
+  | 'mixed';
+
 export interface SearchOpts {
   limit?: number;                                   // top-N results
   recency_days?: number;                            // restrict to last N days
+  /** Exclude evidence newer than this timestamp (reproducible as-of runs). */
+  published_before?: string;
+  /** Provider-specific ranking/sampling strategy; mixed means multiple strata. */
+  sort?: SearchSort;
   include_domains?: string[];
   exclude_domains?: string[];
+  /** Reddit subreddit names (without r/), GitHub orgs, or similar scopes. */
+  communities?: string[];
+  /** X handles (with or without @). */
+  handles?: string[];
+  /** YouTube channel ids. */
+  channel_ids?: string[];
+  /** Maximum provider result pages per ranking stratum. */
+  max_pages?: number;
   signal?: AbortSignal;
+}
+
+export interface ProviderCapabilities {
+  search: boolean;
+  fetch: boolean;
+  extract: boolean;
+  /** Concrete backend order used by this adapter. */
+  backends?: readonly string[];
 }
 
 // =============================================================================
@@ -189,6 +247,7 @@ export interface SearchOpts {
 export interface SearchProvider {
   readonly name: ProviderName;
   readonly enabled: boolean;
+  readonly capabilities?: ProviderCapabilities;
   search(query: string, opts: SearchOpts): Promise<SearchResult[]>;
   fetch?(url: string, signal?: AbortSignal): Promise<FetchResult>;
   extract?(raw: FetchResult): Promise<ExtractedQuotes>;

@@ -14,6 +14,7 @@ import {
   hashUrl,
   canonicalizeUrl,
   SearchResultSchema,
+  SubquerySchema,
 } from './types.js';
 import type {
   Subquery,
@@ -25,6 +26,7 @@ import type {
   SectionDraft,
   FinalReport,
   ReportChunkInput,
+  SearchOpts,
 } from './types.js';
 import { DEPTH_CONFIG, getModelPricing } from './depth-config.js';
 import type { ResearchDepth } from './depth-config.js';
@@ -39,6 +41,7 @@ import { planSubqueries } from './planner.js';
 import type { PlannerUsage } from './planner.js';
 import {
   getEnabledProviders,
+  getEnabledSearchProviders,
   routeProvidersForSourceTypes,
   extractQuotesWithGemini,
 } from './providers/index.js';
@@ -50,7 +53,10 @@ import {
 import type { SectionSpec } from './synthesis.js';
 import { critiqueDraft } from './critique.js';
 import { buildReportChunks } from './chunker.js';
-import { validateGrounding } from './grounding.js';
+import {
+  buildGroundingEvidenceChunks,
+  validateGrounding,
+} from './grounding.js';
 import type { GroundingResult } from './grounding.js';
 import { logger as defaultLogger } from './logger.js';
 import type { Logger } from './logger.js';
@@ -80,6 +86,7 @@ export type { PlanSubqueriesInput, PlannerUsage } from './planner.js';
 export {
   getAllProviders,
   getEnabledProviders,
+  getEnabledSearchProviders,
   routeProvidersForSourceTypes,
   extractQuotesWithGemini,
   tavilyProvider,
@@ -98,13 +105,15 @@ export {
   instagramProvider,
   xProvider,
   podcastsProvider,
+  githubProvider,
   triggerCollection,
   pollSnapshot,
   downloadSnapshot,
+  scrapeDataset,
   fetchLinkedInPostsBrightData,
   fetchFacebookGroupPostsBrightData,
 } from './providers/index.js';
-export type { PollSnapshotOptions } from './providers/index.js';
+export type { PollSnapshotOptions, ScrapeDatasetOptions, BrightDataRecord } from './providers/index.js';
 export { rerankQuotes } from './rerank.js';
 export {
   synthesizeSection,
@@ -137,6 +146,13 @@ export type {
   ValidateGroundingInput,
 } from './grounding.js';
 export { parseMarkdownReport } from './parse-markdown-report.js';
+
+// Versioned investigation profiles, evidence lineage, and coverage gates.
+export * from './profiles/index.js';
+export * from './evidence.js';
+export * from './source-modes.js';
+export * from './source-health.js';
+export * from './research-program.js';
 
 // Knowledge-ingestion core (continuous internet-knowledge ingestion).
 export * from './ingestion/index.js';
@@ -282,16 +298,27 @@ const SEARCH_CACHE_TTL_SECONDS: Partial<Record<ProviderName, number>> = {
   serpapi: 7 * 86_400,
   serper: 7 * 86_400,
   searxng: 7 * 86_400,
-  tavily: 30 * 86_400,
+  tavily: 7 * 86_400,
   exa: 30 * 86_400,
   perplexity: 7 * 86_400,
-  reddit: 60 * 86_400,
-  youtube: 60 * 86_400,
-  hn: 60 * 86_400,
+  reddit: 24 * 3_600,
+  youtube: 24 * 3_600,
+  github: 12 * 3_600,
+  x: 6 * 3_600,
+  hn: 24 * 3_600,
   rss: 7 * 86_400,
 };
 const DEFAULT_SEARCH_CACHE_TTL_SECONDS = 14 * 86_400;
 const FETCH_CACHE_TTL_SECONDS = 30 * 86_400;
+
+function searchCacheTtl(provider: ProviderName, opts: SearchOpts): number {
+  const configured = SEARCH_CACHE_TTL_SECONDS[provider] ?? DEFAULT_SEARCH_CACHE_TTL_SECONDS;
+  if (opts.recency_days !== undefined && opts.recency_days <= 7) return Math.min(configured, 3_600);
+  if (opts.sort === 'latest' || opts.sort === 'new' || opts.sort === 'mixed') {
+    return Math.min(configured, 6 * 3_600);
+  }
+  return configured;
+}
 
 async function cacheGet(cache: ResearchCacheAdapter | undefined, key: string, log: Logger): Promise<string | null> {
   if (cache === undefined) return null;
@@ -368,12 +395,23 @@ export interface RunDeepResearchInput {
    * cost. The 'quick' kind now defaults this to gemini-3.6-flash.
    */
   synthesisModelOverride?: string;
+  /**
+   * Deterministic searches that run in addition to LLM-planned subqueries.
+   * Source-mode/profile executors use these to guarantee required lanes.
+   */
+  seedSubqueries?: Subquery[];
+  /** Search controls applied to every provider unless overridden below. */
+  searchOptions?: Omit<SearchOpts, 'limit'>;
+  /** Provider-specific controls layered over searchOptions. */
+  providerSearchOptions?: Partial<Record<ProviderName, Omit<SearchOpts, 'limit'>>>;
 }
 
 export interface RunDeepResearchResult {
   report: FinalReport;
   quotes: VerbatimQuote[];
   costUsd: number;
+  /** Deduplicated discoveries, with source-mode/source-pack lineage. */
+  discoveries: SearchResult[];
   /**
    * Faithfulness verdict for the assembled report (audit F2: this was
    * computed and then discarded — callers could never see, gate on, or
@@ -448,7 +486,20 @@ export async function runDeepResearch(
       enabledProviders = withoutPerplexity;
     }
   }
-  const availableProviderNames = Object.keys(enabledProviders);
+  // Keep fetch-capable providers (notably Crawl4AI) available for acquisition,
+  // but expose only real search providers to the planner and search fan-out.
+  const globallySearchable = getEnabledSearchProviders();
+  const searchProviders: typeof enabledProviders = {};
+  for (const [name, provider] of Object.entries(enabledProviders)) {
+    if (globallySearchable[name as ProviderName] !== undefined) {
+      searchProviders[name as ProviderName] = provider;
+    }
+  }
+  const availableProviderNames = Object.keys(searchProviders);
+
+  if (availableProviderNames.length === 0) {
+    throw new Error('No enabled search-capable providers are available for this run.');
+  }
 
   // Planner spend → CostTracker 'plan' category (audit F8: previously never
   // recorded, so the hard cap under-counted by every plan + re-plan call).
@@ -479,7 +530,7 @@ export async function runDeepResearch(
   // ---------------------------------------------------------------------------
   // Step 1: plan subqueries (restricted to providers enabled for this run)
   // ---------------------------------------------------------------------------
-  let subqueries: Subquery[] = await planSubqueries({
+  const plannedSubqueries: Subquery[] = await planSubqueries({
     promptMd: input.brief,
     targetWordCount,
     subqueriesMin,
@@ -487,6 +538,9 @@ export async function runDeepResearch(
     availableProviders: availableProviderNames,
     usageSink: plannerUsageSink,
   });
+
+  const seededSubqueries = (input.seedSubqueries ?? []).map((subquery) => SubquerySchema.parse(subquery));
+  let subqueries: Subquery[] = [...seededSubqueries, ...plannedSubqueries];
 
   if (subqueries.length === 0) {
     throw new Error('Planner returned zero subqueries — cannot proceed');
@@ -496,8 +550,10 @@ export async function runDeepResearch(
   // Step 2: search (route providers per subquery, run in parallel, dedup)
   // ---------------------------------------------------------------------------
   const allSearchResults = await runSearch(
-    subqueries, enabledProviders, costTracker, log, input.cache, minFreeResults,
+    subqueries, searchProviders, costTracker, log, input.cache, minFreeResults,
+    input.searchOptions, input.providerSearchOptions,
   );
+  const allDiscoveries: SearchResult[] = [...allSearchResults];
 
   // Provenance map for the bibliography (audit m3) — accumulated across the
   // initial search and every critique-loop refinement search.
@@ -620,8 +676,10 @@ export async function runDeepResearch(
 
     // Extra search for the refinement subqueries only.
     const extraResults = await runSearch(
-      additionalSubqueries, enabledProviders, costTracker, log, input.cache, minFreeResults,
+      additionalSubqueries, searchProviders, costTracker, log, input.cache, minFreeResults,
+      input.searchOptions, input.providerSearchOptions,
     );
+    mergeDiscoveryResults(allDiscoveries, extraResults);
     recordSourceMeta(extraResults);
     const extraToFetch = extraResults.slice(0, Math.min(extraResults.length, CUMULATIVE_URL_CEILING));
     const extraMarkdown = await fetchContent(extraToFetch, enabledProviders, log, input.cache);
@@ -697,24 +755,10 @@ export async function runDeepResearch(
   // ---------------------------------------------------------------------------
   // Step 8: validate grounding (diagnostic; never aborts)
   // ---------------------------------------------------------------------------
-  const groundingChunks: ReportChunkInput[] = [];
-  for (const [sourceUrl, quotes] of Object.entries(sourceQuotesByUrl)) {
-    for (const q of quotes) {
-      groundingChunks.push({
-        chunk_kind: 'quote',
-        section_path: '',
-        heading: null,
-        content: q.quote,
-        source_url: sourceUrl,
-        source_provider: null,
-        source_author: q.author !== undefined ? q.author : null,
-        source_published_at: q.published_at !== undefined ? q.published_at : null,
-        source_engagement: { ...q.engagement },
-        citation_anchor: null,
-        metadata: {},
-      });
-    }
-  }
+  const groundingChunks = buildGroundingEvidenceChunks({
+    sourceQuotesByUrl,
+    claimsBySection,
+  });
   const grounding = validateGrounding({
     fullMarkdown: report.full_markdown,
     bibliography: report.bibliography,
@@ -773,6 +817,7 @@ export async function runDeepResearch(
     report,
     quotes: allQuotes,
     costUsd: costTracker.total(),
+    discoveries: allDiscoveries,
     grounding,
   };
 }
@@ -796,8 +841,34 @@ async function searchOneProvider(
   costTracker: CostTracker,
   log: Logger,
   cache?: ResearchCacheAdapter,
+  runSearchOptions?: Omit<SearchOpts, 'limit'>,
+  providerSearchOptions?: Partial<Record<ProviderName, Omit<SearchOpts, 'limit'>>>,
 ): Promise<SearchResult[]> {
-  const cacheKey = `search:${providerName}:${subquery.query}`;
+  const effectiveOptions: SearchOpts = {
+    ...runSearchOptions,
+    ...providerSearchOptions?.[providerName],
+    ...subquery.search_options,
+    limit: subquery.search_options.limit ?? SEARCH_RESULT_LIMIT,
+  };
+  const cacheIdentity = JSON.stringify({
+    provider: providerName,
+    query: subquery.query,
+    sourcePackId: subquery.source_pack_id ?? null,
+    sourceMode: subquery.source_mode ?? null,
+    options: {
+      limit: effectiveOptions.limit,
+      recency_days: effectiveOptions.recency_days ?? null,
+      published_before: effectiveOptions.published_before ?? null,
+      sort: effectiveOptions.sort ?? null,
+      include_domains: effectiveOptions.include_domains ?? [],
+      exclude_domains: effectiveOptions.exclude_domains ?? [],
+      communities: effectiveOptions.communities ?? [],
+      handles: effectiveOptions.handles ?? [],
+      channel_ids: effectiveOptions.channel_ids ?? [],
+      max_pages: effectiveOptions.max_pages ?? null,
+    },
+  });
+  const cacheKey = `search:${providerName}:${hashUrl(cacheIdentity)}`;
   const cached = await cacheGet(cache, cacheKey, log);
   if (cached !== null) {
     try {
@@ -810,7 +881,8 @@ async function searchOneProvider(
     }
   }
   try {
-    const results = await provider.search(subquery.query, { limit: SEARCH_RESULT_LIMIT });
+    const providerResults = await provider.search(subquery.query, effectiveOptions);
+    const results = filterSearchResults(providerResults, effectiveOptions);
     const perCall = SEARCH_COST_PER_CALL_USD[providerName];
     if (perCall !== undefined && perCall > 0) {
       costTracker.record({
@@ -818,15 +890,19 @@ async function searchOneProvider(
         category: 'search',
         units: 1,
         unit_cost_usd: perCall,
-        metadata: { query: subquery.query.slice(0, 80), results: results.length },
+        metadata: {
+          query: subquery.query.slice(0, 80), results: results.length,
+          source_mode: subquery.source_mode,
+          sort: effectiveOptions.sort,
+          recency_days: effectiveOptions.recency_days,
+        },
       });
     }
-    const ttl = SEARCH_CACHE_TTL_SECONDS[providerName];
     await cacheSet(
       cache,
       cacheKey,
       JSON.stringify(results),
-      ttl !== undefined ? ttl : DEFAULT_SEARCH_CACHE_TTL_SECONDS,
+      searchCacheTtl(providerName, effectiveOptions),
       log,
     );
     return results;
@@ -843,6 +919,35 @@ async function searchOneProvider(
   }
 }
 
+function filterSearchResults(results: SearchResult[], opts: SearchOpts): SearchResult[] {
+  const upper = opts.published_before !== undefined
+    ? new Date(opts.published_before).getTime()
+    : Date.now();
+  const lower = opts.recency_days !== undefined && !Number.isNaN(upper)
+    ? upper - opts.recency_days * 86_400_000
+    : null;
+  const includeDomains = new Set((opts.include_domains ?? []).map((domain) => domain.toLowerCase().replace(/^www\./, '')));
+  const excludeDomains = new Set((opts.exclude_domains ?? []).map((domain) => domain.toLowerCase().replace(/^www\./, '')));
+
+  return results.filter((result) => {
+    if (result.published_at !== undefined) {
+      const timestamp = new Date(result.published_at).getTime();
+      if (Number.isNaN(timestamp)) return false;
+      if (!Number.isNaN(upper) && timestamp > upper) return false;
+      if (lower !== null && timestamp < lower) return false;
+    }
+    let hostname = '';
+    try {
+      hostname = new URL(result.url).hostname.toLowerCase().replace(/^www\./, '');
+    } catch {
+      return includeDomains.size === 0;
+    }
+    if (excludeDomains.has(hostname) || Array.from(excludeDomains).some((domain) => hostname.endsWith(`.${domain}`))) return false;
+    if (includeDomains.size > 0 && !includeDomains.has(hostname) && !Array.from(includeDomains).some((domain) => hostname.endsWith(`.${domain}`))) return false;
+    return true;
+  });
+}
+
 /**
  * Route + run searches for a set of subqueries, deduped by canonical URL.
  * Free-first tiering (audit M5): free general-search + specialist providers
@@ -856,6 +961,8 @@ async function runSearch(
   log: Logger,
   cache?: ResearchCacheAdapter,
   minFreeResults: number = DEFAULT_MIN_FREE_RESULTS,
+  runSearchOptions?: Omit<SearchOpts, 'limit'>,
+  providerSearchOptions?: Partial<Record<ProviderName, Omit<SearchOpts, 'limit'>>>,
 ): Promise<SearchResult[]> {
   // Bounded fan-out (audit F7): wide mode plans 50-80 subqueries; unbounded
   // Promise.all ran them all at once and 429-stormed providers and our own
@@ -899,7 +1006,13 @@ async function runSearch(
               // Provenance tag (audit F1): this result was retrieved FOR this
               // subquery's section. Cache entries come back untagged (tags are
               // per-run); tagging happens here, after retrieval.
-              subResults.push({ ...result, url: canonical, retrieved_for: [subquery.section_path] });
+              subResults.push({
+                ...result,
+                url: canonical,
+                retrieved_for: [subquery.section_path],
+                source_pack_ids: subquery.source_pack_id !== undefined ? [subquery.source_pack_id] : [],
+                source_modes: subquery.source_mode !== undefined ? [subquery.source_mode] : [],
+              });
             }
           }
         }
@@ -907,7 +1020,10 @@ async function runSearch(
 
       collect(await Promise.all(
         tier1.map((entry) =>
-          searchOneProvider(entry.name, entry.provider, subquery, costTracker, log, cache),
+          searchOneProvider(
+            entry.name, entry.provider, subquery, costTracker, log, cache,
+            runSearchOptions, providerSearchOptions,
+          ),
         ),
       ));
 
@@ -923,7 +1039,10 @@ async function runSearch(
         );
         collect(await Promise.all(
           tier2Paid.map((entry) =>
-            searchOneProvider(entry.name, entry.provider, subquery, costTracker, log, cache),
+            searchOneProvider(
+              entry.name, entry.provider, subquery, costTracker, log, cache,
+              runSearchOptions, providerSearchOptions,
+            ),
           ),
         ));
       }
@@ -948,12 +1067,40 @@ async function runSearch(
             existing.retrieved_for.push(path);
           }
         }
+        for (const packId of result.source_pack_ids) {
+          if (!existing.source_pack_ids.includes(packId)) existing.source_pack_ids.push(packId);
+        }
+        for (const mode of result.source_modes) {
+          if (!existing.source_modes.includes(mode)) existing.source_modes.push(mode);
+        }
       }
     }
   }
   const merged = Array.from(mergedByHash.values());
   log.info({ total: merged.length }, '[runDeepResearch] Search phase complete');
   return merged;
+}
+
+function mergeDiscoveryResults(target: SearchResult[], additions: SearchResult[]): void {
+  const byHash = new Map(target.map((result) => [hashUrl(result.url), result]));
+  for (const addition of additions) {
+    const key = hashUrl(addition.url);
+    const existing = byHash.get(key);
+    if (existing === undefined) {
+      target.push(addition);
+      byHash.set(key, addition);
+      continue;
+    }
+    for (const path of addition.retrieved_for) {
+      if (!existing.retrieved_for.includes(path)) existing.retrieved_for.push(path);
+    }
+    for (const packId of addition.source_pack_ids) {
+      if (!existing.source_pack_ids.includes(packId)) existing.source_pack_ids.push(packId);
+    }
+    for (const mode of addition.source_modes) {
+      if (!existing.source_modes.includes(mode)) existing.source_modes.push(mode);
+    }
+  }
 }
 
 /** Fetch markdown content for a set of results — provider.fetch, else crawl4ai. */
@@ -1108,6 +1255,7 @@ async function extractQuotes(
             markdown,
             title: '',
             engagement: {},
+            raw_metadata: {},
             fetch_status: 'ok',
           });
         } catch (err: unknown) {

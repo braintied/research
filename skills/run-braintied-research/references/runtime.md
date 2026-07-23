@@ -9,6 +9,7 @@ agent-bound Agent Auth token that is validated for the `cortex` product.
 ```bash
 node skills/run-braintied-research/scripts/run-internal-research.mjs \
   --check \
+  --probe \
   --kind quick \
   --max-cost-usd 0.25
 ```
@@ -17,14 +18,53 @@ The client resolves `BRAINTIED_AGENT_TOKEN` from its inherited environment,
 then from macOS Keychain service `braintied-agent-auth`, account `codex`. When
 neither token source exists, preflight fails closed with exit status 2.
 
-`--check` is local-only: it does not call Agent Auth, Cortex Worker, or a model
+`--check` is local-only unless `--probe` is supplied. With `--probe`, the runner
+makes an authenticated, read-only request to the Cortex Worker tool catalog and
+requires it to advertise `research.run`; it does not call a model or search
 provider. A live run requires `--allow-external` and writes mode, request ID,
 actual cost, bibliography, gaps, and grounding without persisting the token.
+
+Versioned internal profile runs add an exact evidence boundary while keeping
+their public and private data planes separate:
+
+```bash
+node skills/run-braintied-research/scripts/run-internal-research.mjs \
+  --brief-file /tmp/design-brief.md \
+  --kind deep \
+  --max-cost-usd 5 \
+  --profile web-design-intelligence@1 \
+  --profile-mode snapshot \
+  --as-of 2026-07-22 \
+  --output /tmp/design-report.md \
+  --metadata /tmp/design-run.json \
+  --trusted-output /tmp/design-trusted.json \
+  --allow-external
+```
+
+The Markdown file is always the public-provider report. The metadata file adds
+`program_status`, `source_coverage`, `profile_coverage`, a pointer to the
+trusted artifact, and a separately labeled reference-only `private_manifest`.
+The third file is a chmod-0600 trusted-local appendix for the authenticated
+agent: up to 20 findings balanced across Cortex and Telegram, each with
+credential-scrubbed excerpts capped at 1,200 Unicode characters, bounded
+resource URLs, hashes, dates, and source-pack identity. The client strictly
+validates that contract before writing it. It allowlists every manifest,
+evidence-reference, lineage, coverage, failure, appendix, and finding field
+recursively; unknown fields and over-limit values fail before any artifact is
+written.
 
 The endpoint accepts raw `sat_` tokens and short-lived exchanged JWTs. Every
 tool request requires an agent identity, `cortex` product access, and an
 execution-capable scope (`execute`, `write`, `admin`, `master`, or `*`). The
 initial registry exposes `research.run`; provider keys are never returned.
+
+Deep requests default to a 3,600-second client deadline; other kinds default to
+1,200 seconds. The Cortex route commits response headers immediately for long
+work and emits JSON-whitespace heartbeats every 15 seconds before one final JSON
+envelope. Do not place a buffering proxy in this path. A transport failure
+reports only its sanitized error name/cause code and request ID. A streamed
+HTTP 200 is not itself success: the client requires `ok: true` and a non-empty
+report before it writes any artifact.
 
 ## Local provider fallback: package and build
 
@@ -60,6 +100,27 @@ General search providers are enabled by one of `SEARXNG_URLS`,
 `SERPER_API_KEY`, `TAVILY_API_KEY`, `EXA_API_KEY`, or `SERPAPI_KEY`. Specialist
 providers use the variables documented in the package README.
 
+For exact source-mode runs, the local runner also recognizes Reddit OAuth,
+YouTube, X, Apify, Bright Data, GitHub, Jina, and Crawl4AI variables in its
+explicit shell allowlist. `--sources` and `--profile` require `--as-of`; use
+`--require-providers` when a particular backend is part of the decision
+contract. `--check` proves only that configuration is present and the source
+plan compiles. Only a bounded live query proves that a credential is accepted
+and a provider returns eligible current evidence.
+
+Recommended role/order:
+
+- Tavily/SearXNG discover public web URLs; provider raw content or
+  Crawl4AI/Jina/direct HTTP acquires them.
+- twitterapi.io is the lower-cost primary X search/fetch transport; official X
+  v2 is the seven-day fallback, Bright Data enriches known URLs/profiles, and
+  Apify is last.
+- Native Reddit OAuth and YouTube Data API are the free structured discovery
+  paths; Bright Data is the preferred secondary discovery/backfill path;
+  Apify is last.
+- GitHub REST performs repository/issue/PR discovery; an optional project-owned
+  token raises the restrictive unauthenticated quota.
+
 For compatibility, the runner maps `GEMINI_RESEARCH_KEY` to `GEMINI_API_KEY`
 inside its child process when the latter is absent. It never persists the alias.
 
@@ -85,6 +146,20 @@ Every successful run writes:
   `grounding_quality`, `grounding_passed`, and the numeric grounding ratio so
   automation does not confuse “the validator ran” with “the evidence passed.”
 
+Source-mode output also includes `source_plan`, `source_coverage`, and, for a
+profile, `profile_coverage`. A run with a missing required lane is written for
+audit but exits with status 2 and must be described as partial.
+
+Internal profile metadata additionally contains a trusted-local
+`private_manifest` with evidence hashes, source references, lane/source-pack
+IDs, lineage, and coverage. It never contains quotes, message bodies, report
+Markdown, or other private evidence text. A live profile invocation also
+requires a distinct `--trusted-output` path. That restricted JSON artifact is
+the consumable authenticated-agent reconciliation surface; it contains only
+the bounded and credential-scrubbed findings contract described above and is
+created with mode `0600`. It is never embedded in the public Markdown or
+metadata.
+
 The runner prints only a compact, non-secret completion summary to stdout.
 
 `grounding: null` is expected for `answer` and `managed`, because those engines
@@ -100,14 +175,33 @@ The default pass threshold is 60%; 80% or higher is classified as strong.
 and `social`). The runner rejects that option for `answer` and provider-managed
 research so a caller cannot mistake it for a hard cap.
 
+## Trusted source boundary
+
+`cortex` and `telegram` source modes require a caller-injected, tenant-scoped
+`ora-cortex-braintied` adapter. The local provider runner intentionally has no
+such adapter and fails closed. Trusted evidence is returned as a separate
+private manifest plus a separately labeled trusted-local findings appendix.
+Neither may be appended to the public planner, search, extraction, reranking,
+synthesis, provider payload, or shared cache. The appendix is constructed only
+after the public-provider execution has completed and is exposed only by the
+Agent Auth-protected tool response; the CLI writes it solely to the explicit
+chmod-0600 `--trusted-output` artifact. Tenant identity must come from
+authenticated server context rather than request input. Ora binds that identity
+from the Agent Auth `workspace_id`; neither the brief nor internal-runner flags
+accept an organization override. Telegram recall is further limited to the
+authenticated organization’s explicitly registered `braintied-research` corpus
+channels.
+
 ## Preflight behavior
 
-`--check` and `--dry-run` are offline aliases. They validate arguments, inspect
-the built package, list enabled provider names, and report missing required
-configuration without making a research request. A not-ready result exits with
-status 2 so automation can distinguish configuration failure from a crash. The
-preflight echoes `requested_max_cost_usd`; pipeline checks therefore require the
-same explicit cap as the intended live run.
+`--check` and `--dry-run` validate arguments and configuration without making a
+research request. The internal runner remains offline by default; add `--probe`
+to authenticate against the remote catalog and detect deployment or route
+drift. The local-provider runner inspects the built package, lists enabled
+providers, and has no remote-catalog probe. A not-ready result exits with status
+2 so automation can distinguish configuration failure from a crash. Preflight
+echoes `requested_max_cost_usd`; pipeline checks therefore require the same
+explicit cap as the intended live run.
 
 Examples:
 
@@ -125,6 +219,15 @@ node --env-file=/path/owned-by-this-project/.env \
   --kind quick \
   --max-cost-usd 0.25 \
   --synthesis-model gemini-3-flash-preview
+
+node skills/run-braintied-research/scripts/run-research.mjs \
+  --check \
+  --kind deep \
+  --max-cost-usd 5 \
+  --sources all_public \
+  --require-providers tavily,x,reddit,youtube,github \
+  --as-of 2026-07-21 \
+  --load-shell-env
 ```
 
 ## Research brief template

@@ -35,6 +35,22 @@ import type {
 const SYNTH_MODEL_DEFAULT = 'gemini-3.6-flash';
 const ASSEMBLY_MODEL_DEFAULT = 'gemini-3.6-flash';
 
+/**
+ * Keep synthesized claims mechanically auditable against their evidence.
+ * The validator is intentionally lexical and exact about numbers; fluent but
+ * lossy rewrites (for example, replacing an HTTP status code with a generic
+ * success description) turn supported claims into unverifiable ones.
+ */
+export const SECTION_SYNTHESIS_SYSTEM_PROMPT =
+  'You are a research writer. Write a well-structured markdown section using the provided quotes and claims as primary evidence. ' +
+  'Embed inline citations using [^N] notation exactly where the evidence appears in the text. ' +
+  'Do not invent citations or facts not present in the evidence below. ' +
+  'Keep every cited sentence source-near and mechanically traceable to its evidence. Preserve every number, percentage, date, named entity, standard identifier, protocol or status code, and technical term exactly as stated in the evidence. ' +
+  'Do not replace numeric or protocol details with looser qualitative wording, and do not combine separate evidence fragments into a broader claim unless the same citation supports the entire resulting sentence. ' +
+  'Place each citation immediately after the smallest sentence fully supported by that source. ' +
+  'Write in flowing paragraphs with a clear section heading. ' +
+  'Match the requested word count as closely as possible.';
+
 // =============================================================================
 // Multi-provider synthesis dispatcher
 // =============================================================================
@@ -407,13 +423,6 @@ export async function synthesizeSection(
     .map(([url, num]) => `[^${num}]: ${url}`)
     .join('\n');
 
-  const systemPrompt =
-    'You are a research writer. Write a well-structured markdown section using the provided quotes and claims as primary evidence. ' +
-    'Embed inline citations using [^N] notation exactly where the evidence appears in the text. ' +
-    'Do not invent citations or facts not present in the evidence below. ' +
-    'Write in flowing paragraphs with a clear section heading. ' +
-    'Match the requested word count as closely as possible.';
-
   const userMessage =
     `Section: ${sectionPath}\n` +
     `Goal: ${sectionGoal}\n` +
@@ -424,7 +433,7 @@ export async function synthesizeSection(
     `Write the section now. Start with a markdown heading (## or ###). Use [^N] inline citations.`;
 
   const callResult = await synthesisGenerate({
-    system: systemPrompt,
+    system: SECTION_SYNTHESIS_SYSTEM_PROMPT,
     user: userMessage,
     model: synthModel,
     maxTokens: Math.max(4096, targetWords * 2),

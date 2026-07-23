@@ -173,6 +173,39 @@ test('direct Instagram fetch uses Bright Data once and preserves the canonical s
   assert.equal(calls.length, 1);
 });
 
+test('direct Instagram fetch follows an asynchronous Bright Data scrape snapshot', async () => {
+  process.env.BRIGHTDATA_API_TOKEN = 'test-brightdata-token';
+  const calls = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    calls.push(url);
+    if (url.includes('/scrape?')) {
+      return jsonResponse({ snapshot_id: 'instagram-async-1' }, 202);
+    }
+    if (url.includes('/progress/')) return jsonResponse({ status: 'ready' });
+    if (url.includes('/snapshot/')) {
+      return jsonResponse([{
+        post_url: 'https://www.instagram.com/p/Async_42/',
+        short_code: 'Async_42',
+        caption: 'Asynchronous evidence from Bright Data',
+        owner_username: 'async-researcher',
+        timestamp: '2026-07-21T13:00:00+00:00',
+      }]);
+    }
+    throw new Error(`unexpected test URL: ${url}`);
+  };
+
+  const result = await instagramProvider.fetch('https://www.instagram.com/p/Async_42/');
+  assert.equal(result.fetch_status, 'ok');
+  assert.equal(result.engagement.brightdata_dataset_id, 'gd_lk5ns7kz21pck8jpis');
+  assert.match(result.markdown, /Asynchronous evidence from Bright Data/);
+  assert.deepEqual(calls.map(url => new URL(url).pathname), [
+    '/datasets/v3/scrape',
+    '/datasets/v3/progress/instagram-async-1',
+    '/datasets/v3/snapshot/instagram-async-1',
+  ]);
+});
+
 test('one-segment Instagram profiles use the Bright Data profiles dataset and require useful profile data', async () => {
   process.env.BRIGHTDATA_API_TOKEN = 'test-brightdata-token';
   const calls = [];

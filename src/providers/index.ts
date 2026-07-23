@@ -21,6 +21,7 @@ import { tiktokProvider } from './tiktok.js';
 import { instagramProvider } from './instagram.js';
 import { xProvider } from './x.js';
 import { podcastsProvider } from './podcasts.js';
+import { githubProvider } from './github.js';
 
 import type { SearchProvider, ProviderName, ExpectedSourceType } from '../types.js';
 
@@ -45,6 +46,7 @@ const ALL_PROVIDERS: Record<ProviderName, SearchProvider> = {
   instagram: instagramProvider,
   x: xProvider,
   podcasts: podcastsProvider,
+  github: githubProvider,
 };
 
 export function getAllProviders(): Record<ProviderName, SearchProvider> {
@@ -68,6 +70,20 @@ export function getEnabledProviders(): Partial<Record<ProviderName, SearchProvid
   return enabled;
 }
 
+/**
+ * Returns enabled providers that can actually perform discovery. Fetch-only
+ * transports such as Crawl4AI never reach the LLM planner or search fan-out.
+ */
+export function getEnabledSearchProviders(): Partial<Record<ProviderName, SearchProvider>> {
+  const enabled = getEnabledProviders();
+  const searchable: Partial<Record<ProviderName, SearchProvider>> = {};
+  for (const [name, provider] of Object.entries(enabled)) {
+    if (provider.capabilities?.search === false) continue;
+    searchable[name as ProviderName] = provider;
+  }
+  return searchable;
+}
+
 // =============================================================================
 // Source-type → provider routing table
 // =============================================================================
@@ -82,19 +98,22 @@ const SOURCE_TYPE_ROUTING: Record<ExpectedSourceType, ProviderName[]> = {
   video:          ['youtube', 'tavily'],
   video_comments: ['youtube'],
   social_video:   ['tiktok', 'instagram'],
-  longform:       ['exa', 'searxng', 'tavily', 'crawl4ai'],
+  longform:       ['exa', 'searxng', 'tavily'],
   academic:       ['exa', 'tavily', 'searxng'],
   // NOTE: perplexity is deliberately NOT in any routing entry — pipeline runs
   // never spend on it implicitly. It participates only via kind='managed'
   // (runManagedResearch) or an explicit RunDeepResearchInput.providers list.
   news:           ['searxng', 'serper', 'tavily', 'hn', 'x'],
   serp:           ['serper', 'serpapi'],
-  course_page:    ['serper', 'serpapi', 'crawl4ai'],
+  course_page:    ['serper', 'serpapi', 'tavily'],
   audience_voice: ['reddit', 'youtube', 'facebook_groups', 'tiktok', 'instagram'],
   newsletter:     ['rss', 'searxng', 'tavily'],
-  documentation:  ['searxng', 'tavily', 'crawl4ai'],
+  documentation:  ['searxng', 'tavily', 'exa'],
   podcast:        ['podcasts'],
   course_review:  ['reddit', 'youtube', 'serper', 'serpapi', 'facebook_groups'],
+  repository:     ['github', 'tavily', 'searxng'],
+  issue:          ['github', 'tavily', 'searxng'],
+  code:           ['github', 'exa', 'tavily'],
 };
 
 /**
@@ -139,6 +158,7 @@ export {
   instagramProvider,
   xProvider,
   podcastsProvider,
+  githubProvider,
 };
 
 // Re-export the extractor for use outside providers
@@ -150,7 +170,8 @@ export {
   triggerCollection,
   pollSnapshot,
   downloadSnapshot,
+  scrapeDataset,
   fetchLinkedInPostsBrightData,
   fetchFacebookGroupPostsBrightData,
 } from './brightdata.js';
-export type { PollSnapshotOptions } from './brightdata.js';
+export type { PollSnapshotOptions, ScrapeDatasetOptions, BrightDataRecord } from './brightdata.js';

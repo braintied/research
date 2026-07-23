@@ -109,6 +109,7 @@ const YtSearchItemSchema = z.object({
 
 const YtSearchResponseSchema = z.object({
   items: z.array(YtSearchItemSchema).default([]),
+  nextPageToken: z.string().optional(),
 });
 
 const YtVideoItemSchema = z.object({
@@ -228,6 +229,112 @@ async function fetchVideoStats(
   return map;
 }
 
+type YouTubeOrder = 'relevance' | 'date' | 'viewCount' | 'rating';
+
+function youtubeOrders(sort: SearchOpts['sort']): YouTubeOrder[] {
+  if (sort === 'mixed') return ['date', 'relevance', 'viewCount'];
+  if (sort === 'latest' || sort === 'new') return ['date'];
+  if (sort === 'top' || sort === 'views' || sort === 'comments') return ['viewCount'];
+  if (sort === 'rating') return ['rating'];
+  return ['relevance'];
+}
+
+async function searchYouTubeOrder(
+  query: string,
+  opts: SearchOpts,
+  order: YouTubeOrder,
+  target: number,
+  channelId: string | undefined,
+): Promise<SearchResult[]> {
+  const apiKey = getApiKey();
+  const maxPages = Math.max(1, Math.min(opts.max_pages ?? 1, 10));
+  const perPage = Math.max(1, Math.min(50, Math.ceil(target / maxPages)));
+  const results: SearchResult[] = [];
+  let pageToken: string | undefined;
+
+  for (let page = 0; page < maxPages && results.length < target; page++) {
+    await rateLimit();
+    await quotaAwareThrottle();
+    const params: Record<string, string> = {
+      part: 'snippet', q: query, type: 'video', maxResults: String(perPage),
+      order, key: apiKey,
+    };
+    if (pageToken !== undefined) params['pageToken'] = pageToken;
+    if (channelId !== undefined) params['channelId'] = channelId;
+    const upper = opts.published_before !== undefined ? new Date(opts.published_before) : new Date();
+    if (!Number.isNaN(upper.getTime())) {
+      params['publishedBefore'] = upper.toISOString();
+      if (opts.recency_days !== undefined && opts.recency_days > 0) {
+        params['publishedAfter'] = new Date(upper.getTime() - opts.recency_days * 86_400_000).toISOString();
+      }
+    }
+
+    const response = await fetch(`${YT_BASE}/search?${new URLSearchParams(params).toString()}`, {
+      signal: opts.signal !== undefined ? opts.signal : AbortSignal.timeout(20_000),
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`YouTube search error: ${response.status} ${body.slice(0, 200)}`);
+    }
+    const rawJson: unknown = await response.json();
+    const parsed = YtSearchResponseSchema.parse(rawJson);
+    const videoIds = parsed.items
+      .map((item) => item.id.videoId)
+      .filter((videoId): videoId is string => videoId !== undefined && videoId.length > 0);
+    const statsMap = await fetchVideoStats(videoIds, apiKey, opts.signal);
+    for (const item of parsed.items) {
+      const videoId = item.id.videoId;
+      if (videoId === undefined || videoId.length === 0) continue;
+      const stats = statsMap.get(videoId);
+      const candidate = SearchResultSchema.safeParse({
+        provider: 'youtube',
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        canonical_id: videoId,
+        title: item.snippet.title,
+        snippet: item.snippet.description.slice(0, 500),
+        author: item.snippet.channelTitle.length > 0 ? item.snippet.channelTitle : undefined,
+        published_at: toIsoString(item.snippet.publishedAt),
+        engagement: {
+          view_count: stats?.viewCount,
+          like_count: stats?.likeCount,
+          comment_count: stats?.commentCount,
+        },
+        raw_metadata: {
+          backend: 'youtube_data_api',
+          channel_id: item.snippet.channelId,
+          search_order: order,
+          page: page + 1,
+        },
+      });
+      if (candidate.success) results.push(candidate.data);
+      if (results.length >= target) break;
+    }
+    pageToken = parsed.nextPageToken;
+    if (pageToken === undefined) break;
+  }
+  return results;
+}
+
+function interleaveYouTubeResults(groups: SearchResult[][], limit: number): SearchResult[] {
+  const results: SearchResult[] = [];
+  const seen = new Set<string>();
+  let index = 0;
+  while (results.length < limit) {
+    let found = false;
+    for (const group of groups) {
+      const item = group[index];
+      if (item === undefined || seen.has(item.url)) continue;
+      seen.add(item.url);
+      results.push(item);
+      found = true;
+      if (results.length >= limit) break;
+    }
+    if (!found && groups.every((group) => index >= group.length)) break;
+    index += 1;
+  }
+  return results;
+}
+
 // =============================================================================
 // Provider
 // =============================================================================
@@ -235,93 +342,35 @@ async function fetchVideoStats(
 export const youtubeProvider: SearchProvider = {
   name: 'youtube',
 
+  capabilities: {
+    search: true,
+    fetch: true,
+    extract: true,
+    backends: ['youtube_data_api', 'youtube_transcript'],
+  },
+
   get enabled(): boolean {
     return isEnabled();
   },
 
   async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
-    const apiKey = getApiKey();
-    await rateLimit();
-
-    const params: Record<string, string> = {
-      part: 'snippet',
-      q: query,
-      type: 'video',
-      maxResults: String(opts.limit !== undefined ? Math.min(opts.limit, 50) : 15),
-      order: 'relevance',
-      key: apiKey,
-    };
-
-    if (opts.recency_days !== undefined && opts.recency_days > 0) {
-      const cutoff = new Date(Date.now() - opts.recency_days * 24 * 60 * 60 * 1000);
-      params['publishedAfter'] = cutoff.toISOString();
-    }
-
-    const searchParams = new URLSearchParams(params);
-
-    const response = await fetch(`${YT_BASE}/search?${searchParams.toString()}`, {
-      signal: opts.signal !== undefined ? opts.signal : AbortSignal.timeout(20000),
-    });
-
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`YouTube search error: ${response.status} ${body.slice(0, 200)}`);
-    }
-
-    const rawJson: unknown = await response.json();
-    const parsed = YtSearchResponseSchema.safeParse(rawJson);
-
-    if (!parsed.success) {
-      logger.warn({ query: query.slice(0, 60), errors: parsed.error.message }, '[YouTube] Invalid search response');
-      return [];
-    }
-
-    // Collect video IDs for batch stats fetch
-    const videoIds: string[] = [];
-    for (const item of parsed.data.items) {
-      const vid = item.id.videoId;
-      if (vid !== undefined && vid.length > 0) {
-        videoIds.push(vid);
+    const limit = Math.max(1, Math.min(opts.limit ?? 15, 50));
+    const orders = youtubeOrders(opts.sort);
+    const channels = opts.channel_ids !== undefined && opts.channel_ids.length > 0
+      ? opts.channel_ids
+      : [undefined];
+    const strategyCount = orders.length * channels.length;
+    const target = Math.max(1, Math.ceil(limit / strategyCount));
+    const groups: SearchResult[][] = [];
+    for (const order of orders) {
+      for (const channelId of channels) {
+        groups.push(await searchYouTubeOrder(query, opts, order, target, channelId));
       }
     }
-
-    const statsMap = await fetchVideoStats(videoIds, apiKey, opts.signal);
-
-    const results: SearchResult[] = [];
-
-    for (const item of parsed.data.items) {
-      const videoId = item.id.videoId;
-      if (videoId === undefined || videoId.length === 0) continue;
-
-      const stats = statsMap.get(videoId);
-      const publishedAt = toIsoString(item.snippet.publishedAt);
-
-      const candidate = {
-        provider: 'youtube' as const,
-        url: `https://www.youtube.com/watch?v=${videoId}`,
-        canonical_id: videoId,
-        title: item.snippet.title,
-        snippet: item.snippet.description.slice(0, 500),
-        author: item.snippet.channelTitle.length > 0 ? item.snippet.channelTitle : undefined,
-        published_at: publishedAt,
-        engagement: {
-          view_count: stats !== undefined ? stats.viewCount : undefined,
-          like_count: stats !== undefined ? stats.likeCount : undefined,
-          comment_count: stats !== undefined ? stats.commentCount : undefined,
-        },
-        raw_metadata: {
-          channel_id: item.snippet.channelId,
-        },
-      };
-
-      const validated = SearchResultSchema.safeParse(candidate);
-      if (validated.success) {
-        results.push(validated.data);
-      }
-    }
+    const results = interleaveYouTubeResults(groups, limit);
 
     logger.info(
-      { query: query.slice(0, 60), count: results.length },
+      { query: query.slice(0, 60), count: results.length, orders, channels: channels.length },
       '[YouTube] Search complete',
     );
 
@@ -538,6 +587,7 @@ export const youtubeProvider: SearchProvider = {
       fetch_status: transcriptResult.success ? 'ok' : 'partial',
       fetch_error: transcriptResult.error !== null ? transcriptResult.error : undefined,
       raw_metadata: {
+        backend: 'youtube_data_api+youtube_transcript',
         top_comments: topComments,
         replies_by_parent_id: replysByParentId,
         segments: transcriptResult.segments,
