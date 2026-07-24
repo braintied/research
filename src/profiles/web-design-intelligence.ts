@@ -109,7 +109,7 @@ export const WEB_DESIGN_INTELLIGENCE_PROFILE = ResearchProfileSchema.parse({
       transport: 'external_search',
       executionMode: 'github',
       providers: ['github', 'tavily', 'searxng'],
-      expectedSourceTypes: ['repository', 'issue', 'code'],
+      expectedSourceTypes: ['repository', 'code'],
       includeDomains: ['github.com'],
       queryHints: [
         'website design component library animation creative frontend design system license maintained stars release',
@@ -155,6 +155,12 @@ export const WEB_DESIGN_INTELLIGENCE_PROFILE = ResearchProfileSchema.parse({
       executionMode: 'community',
       providers: ['hn', 'rss', 'podcasts'],
       expectedSourceTypes: ['forum', 'newsletter', 'podcast'],
+      feedUrls: [
+        'https://www.smashingmagazine.com/feed/',
+        'https://web.dev/static/blog/feed.xml',
+        'https://alistapart.com/main/feed/',
+        'https://css-tricks.com/feed/',
+      ],
       queryHints: [
         'AI generated website design taste failure generic aesthetics design systems practitioner',
         'frontend design agent workflow visual QA screenshot benchmark template library experience',

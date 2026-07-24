@@ -12,7 +12,7 @@ import { runResearch } from './kinds.js';
 import type { KindResearchResult, ResearchKind, RunResearchInput } from './kinds.js';
 import type { IndexSink, OnPipelineUsage, ResearchCacheAdapter } from './index.js';
 import type { Logger } from './logger.js';
-import type { ProviderName, SearchOpts } from './types.js';
+import { canonicalizeUrl, type ProviderName, type SearchOpts } from './types.js';
 import { getEnabledSearchProviders } from './providers/index.js';
 import {
   evaluateSourceModeCoverage,
@@ -166,27 +166,37 @@ function sourceClassForMode(mode: string | undefined): EvidenceItem['sourceClass
   return 'secondary_analysis';
 }
 
-function discoveriesToEvidence(
+function validatedPublicEvidenceItems(
   discoveries: KindResearchResult['discoveries'],
+  validatedEvidence: NonNullable<KindResearchResult['validatedEvidence']>,
   profile: ResearchProfile | null,
 ): EvidenceItem[] {
   if (profile === null) return [];
   const retrievedAt = new Date().toISOString();
   const evidence: EvidenceItem[] = [];
-  for (const discovery of discoveries) {
+  const seen = new Set<string>();
+  const discoveryByUrl = new Map(
+    discoveries.map((discovery) => [canonicalizeUrl(discovery.url), discovery]),
+  );
+
+  for (const accepted of validatedEvidence) {
+    const discovery = discoveryByUrl.get(canonicalizeUrl(accepted.source_url));
+    if (discovery === undefined) continue;
     for (const sourcePackId of discovery.source_pack_ids) {
       const pack = profile.sourcePacks.find((candidate) => candidate.id === sourcePackId);
       if (pack === undefined || pack.visibility !== 'public') continue;
-      const content = `${discovery.title}\n${discovery.snippet}`.trim();
       const identity = createEvidenceIdentity({
-        sourceRef: discovery.url,
-        content,
+        sourceRef: accepted.source_url,
+        content: accepted.content,
         publishedAt: discovery.published_at,
       });
+      const packedIdentity = `${sourcePackId}\u0000${identity.id}`;
+      if (seen.has(packedIdentity)) continue;
+      seen.add(packedIdentity);
       evidence.push(EvidenceItemSchema.parse({
         ...identity,
-        sourceRef: discovery.url,
-        canonicalUrl: discovery.url,
+        sourceRef: accepted.source_url,
+        canonicalUrl: canonicalizeUrl(accepted.source_url),
         title: discovery.title,
         author: discovery.author,
         publishedAt: discovery.published_at,
@@ -196,13 +206,16 @@ function discoveriesToEvidence(
         lane: pack.lane as SourceLane,
         sourcePackId,
         visibility: 'public',
-        contentRef: discovery.url,
+        exactQuote: accepted.kind === 'verbatim_quote' ? accepted.content : undefined,
+        contentRef: accepted.source_url,
         engagement: Object.fromEntries(
           Object.entries(discovery.engagement).filter((entry): entry is [string, number] => typeof entry[1] === 'number'),
         ),
         metadata: {
           source_modes: discovery.source_modes,
           backend: discovery.raw_metadata['backend'],
+          evidence_kind: accepted.kind,
+          validation: 'exact_fetched_source_sentence',
         },
       }));
     }
@@ -317,19 +330,28 @@ export async function runResearchProgram(input: RunResearchProgramInput): Promis
 
   const [publicResearch] = await Promise.all([publicPromise, Promise.all(recallPromises)]);
   const trustedEvidence = Array.from(evidenceByMode.values()).flat();
-  const publicEvidence = discoveriesToEvidence(
+  const publicEvidence = validatedPublicEvidenceItems(
     publicResearch?.discoveries ?? [],
+    publicResearch?.validatedEvidence ?? [],
     profileExecution?.profile ?? null,
   );
+  const validatedPublicUrls = new Set(
+    (publicResearch?.validatedEvidence ?? []).map((item) => canonicalizeUrl(item.source_url)),
+  );
+  const validatedDiscoveries = (publicResearch?.discoveries ?? []).filter((discovery) =>
+    validatedPublicUrls.has(canonicalizeUrl(discovery.url)));
   const coverage = evaluateSourceModeCoverage(
     plan,
-    publicResearch?.discoveries ?? [],
+    validatedDiscoveries,
     trustedCounts(evidenceByMode),
   );
   const profileCoverage = profileExecution !== null
     ? evaluateCoverage(profileExecution.profile, [...publicEvidence, ...trustedEvidence], input.asOf)
     : null;
-  const groundingPassed = publicResearch === null || publicResearch.grounding?.passed !== false;
+  // Every pipeline kind admitted to a public program owns a grounding result.
+  // Missing/null grounding is not success: otherwise a consumer regression
+  // could silently turn an unverified report into program_status=complete.
+  const groundingPassed = publicResearch === null || publicResearch.grounding?.passed === true;
   const status = coverage.passed && (profileCoverage?.passed ?? true) && groundingPassed && trustedRecallFailures.length === 0
     ? 'complete'
     : 'partial';

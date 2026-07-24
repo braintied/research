@@ -9,7 +9,7 @@
  */
 
 import { z } from 'zod';
-import { ExpectedSourceTypeSchema, ProviderNameSchema } from '../types.js';
+import { ExpectedSourceTypeSchema, FeedUrlSchema, ProviderNameSchema } from '../types.js';
 
 const ProfileIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{2,80}$/);
 const PackIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{2,80}$/);
@@ -52,6 +52,8 @@ export const SourcePackSchema = z.object({
   queryHints: z.array(z.string().min(3).max(500)).default([]),
   includeDomains: z.array(z.string().min(1)).default([]),
   excludeDomains: z.array(z.string().min(1)).default([]),
+  /** Verified, explicit RSS/Atom endpoints. Domain filters are not feed URLs. */
+  feedUrls: z.array(FeedUrlSchema).default([]),
   handles: z.array(z.string().min(1)).default([]),
   communities: z.array(z.string().min(1)).default([]),
   recencyDays: z.number().int().positive().optional(),
@@ -72,6 +74,20 @@ export const SourcePackSchema = z.object({
       code: 'custom',
       path: ['adapterId'],
       message: 'Internal-memory source packs require an adapterId.',
+    });
+  }
+  if (pack.providers.includes('rss') && pack.feedUrls.length === 0) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['feedUrls'],
+      message: 'Source packs that enable RSS must declare at least one explicit feed URL.',
+    });
+  }
+  if (!pack.providers.includes('rss') && pack.feedUrls.length > 0) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['feedUrls'],
+      message: 'feedUrls requires the RSS provider.',
     });
   }
 });

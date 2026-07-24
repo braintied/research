@@ -153,6 +153,27 @@ function issueSort(opts: SearchOpts): string | null {
   return null;
 }
 
+export interface GitHubSearchKinds {
+  repositories: boolean;
+  issues: boolean;
+}
+
+/**
+ * Honor the planner's requested source classes. Repository/code research must
+ * not be polluted by coincidentally matching pull requests; issue retrieval
+ * remains available only when it is explicitly requested. Empty or unrelated
+ * legacy inputs retain the historical mixed behavior.
+ */
+export function resolveGitHubSearchKinds(opts: SearchOpts): GitHubSearchKinds {
+  const expected = new Set(opts.expected_source_types ?? []);
+  const hasGitHubKind = expected.has('repository') || expected.has('code') || expected.has('issue');
+  if (!hasGitHubKind) return { repositories: true, issues: true };
+  return {
+    repositories: expected.has('repository') || expected.has('code'),
+    issues: expected.has('issue'),
+  };
+}
+
 async function searchRepositories(query: string, opts: SearchOpts, limit: number): Promise<SearchResult[]> {
   const params = new URLSearchParams({
     q: scopedQuery(query, opts, 'pushed'),
@@ -269,6 +290,7 @@ export const githubProvider: SearchProvider = {
 
   async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
     const limit = Math.max(1, Math.min(opts.limit ?? 20, 100));
+    const kinds = resolveGitHubSearchKinds(opts);
     const strategies = opts.sort === 'mixed'
       ? [
           { ...opts, sort: 'latest' as const },
@@ -281,10 +303,10 @@ export const githubProvider: SearchProvider = {
     const failures: string[] = [];
     const perStrategyLimit = Math.max(2, Math.ceil(limit / strategies.length));
     for (const strategy of strategies) {
-      const settled = await Promise.allSettled([
-        searchRepositories(query, strategy, perStrategyLimit),
-        searchIssues(query, strategy, perStrategyLimit),
-      ]);
+      const searches: Array<Promise<SearchResult[]>> = [];
+      if (kinds.repositories) searches.push(searchRepositories(query, strategy, perStrategyLimit));
+      if (kinds.issues) searches.push(searchIssues(query, strategy, perStrategyLimit));
+      const settled = await Promise.allSettled(searches);
       for (const outcome of settled) {
         if (outcome.status === 'fulfilled') groups.push(outcome.value);
         else failures.push(outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason));
@@ -294,7 +316,13 @@ export const githubProvider: SearchProvider = {
     if (groups.length === 0 && failures.length > 0) throw new Error(failures.join('; '));
     const results = interleave(groups, limit);
     logger.info(
-      { query: query.slice(0, 60), count: results.length, failures: failures.length, authenticated: getToken() !== null },
+      {
+        query: query.slice(0, 60),
+        count: results.length,
+        failures: failures.length,
+        authenticated: getToken() !== null,
+        kinds,
+      },
       '[GitHub] Search complete',
     );
     return results;

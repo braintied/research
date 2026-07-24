@@ -195,13 +195,16 @@ export function compileProfileExecution(
     const selectedProviders = pack.providers.filter((provider) =>
       provider !== 'crawl4ai' && available.has(provider));
     if (selectedProviders.length === 0) continue;
-    const providers = selectedProviders.slice(0, 1);
+    const providers = selectedProviders;
     const hints = pack.queryHints.length > 0 ? pack.queryHints.slice(0, 2) : [rawInput.question];
     for (let index = 0; index < hints.length; index++) {
       const hint = hints[index];
       if (hint === undefined) continue;
       seedSubqueries.push(SubquerySchema.parse({
-        section_path: `source.${pack.id}.${index + 1}`,
+        // Query hints fan out acquisition, not report structure. Keeping one
+        // stable section per source pack lets evidence from every hint merge
+        // into one synthesis and prevents duplicate headings/content.
+        section_path: `source.${pack.id}`,
         // Query hints are already source-specific and should remain concise;
         // prepending a long decision brief hurts GitHub/social search syntax.
         query: hint.slice(0, 1_800),
@@ -218,6 +221,7 @@ export function compileProfileExecution(
           sort: pack.sort,
           include_domains: pack.includeDomains.length > 0 ? pack.includeDomains : undefined,
           exclude_domains: pack.excludeDomains.length > 0 ? pack.excludeDomains : undefined,
+          feed_urls: pack.feedUrls.length > 0 ? pack.feedUrls : undefined,
           communities: pack.communities.length > 0 ? pack.communities : undefined,
           handles: pack.handles.length > 0 ? pack.handles : undefined,
           max_pages: pack.maxPages,

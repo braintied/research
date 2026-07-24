@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createEvidenceIdentity, EvidenceItemSchema } from '../src/evidence.js';
+import { providersForSubquery } from '../src/index.js';
 import { compileProfileExecution } from '../src/profiles/registry.js';
 import { runResearchProgram } from '../src/research-program.js';
 import {
@@ -72,6 +73,40 @@ test('Ora profile source packs compile into executable searches with separate tr
   assert.ok(compiled.seedSubqueries.every((subquery) => !subquery.providers.includes('crawl4ai')));
 });
 
+test('profile query hints merge into one stable synthesis section per source pack', () => {
+  const compiled = compileProfileExecution(
+    'web-design-intelligence@1',
+    { question: 'Which resources should Parlor agents use to build exceptional websites?', asOf: '2026-07-22' },
+    [...coreProviders, 'searxng', 'rss', 'podcasts'],
+  );
+  const awardQueries = compiled.seedSubqueries.filter((subquery) =>
+    subquery.source_pack_id === 'award-editorial-sources');
+  assert.equal(awardQueries.length, 2);
+  assert.deepEqual(
+    new Set(awardQueries.map((subquery) => subquery.section_path)),
+    new Set(['source.award-editorial-sources']),
+  );
+  const implementation = compiled.seedSubqueries.find((subquery) =>
+    subquery.source_pack_id === 'open-implementation-sources');
+  assert.deepEqual(implementation?.expected_source_types, ['repository', 'code']);
+  const practitioner = compiled.seedSubqueries.find((subquery) =>
+    subquery.source_pack_id === 'design-practitioner-signal');
+  assert.deepEqual(practitioner?.providers, ['hn', 'rss', 'podcasts']);
+  assert.ok(practitioner !== undefined);
+  assert.deepEqual(providersForSubquery(practitioner), ['hn', 'rss', 'podcasts']);
+  assert.equal(providersForSubquery(practitioner).includes('searxng'), false);
+  assert.deepEqual(providersForSubquery({
+    section_path: 'source.optional-community-pack',
+    query: 'optional community design evidence',
+    providers: ['hn'],
+    expected_source_types: ['forum'],
+    rationale: '',
+    source_pack_id: 'optional-community-pack',
+    required: false,
+    search_options: {},
+  }), ['hn']);
+});
+
 test('profile execution applies the exact timestamp boundary to every seeded search', async () => {
   let publicInput: RunResearchInput | null = null;
   await runResearchProgram({
@@ -93,6 +128,45 @@ test('profile execution applies the exact timestamp boundary to every seeded sea
   assert.ok(publicInput !== null);
   assert.ok((publicInput as RunResearchInput).seedSubqueries?.every((subquery) =>
     subquery.search_options.published_before === '2026-07-22T06:59:59.000Z'));
+});
+
+test('profile evidence contains exact accepted source text rather than search snippets', async () => {
+  const validatedSentence =
+    'The documented design review process compares complete layouts at multiple viewport sizes.';
+  const packedDiscovery = SearchResultSchema.parse({
+    ...discovery(1),
+    snippet: 'A search-provider summary that was never fetched evidence.',
+    source_pack_ids: ['award-editorial-sources'],
+    source_modes: ['web'],
+  });
+  const result = await runResearchProgram({
+    brief: question,
+    asOf: '2026-07-21',
+    profileRef: 'web-design-intelligence@1',
+    availableProviders: [...coreProviders, 'searxng', 'rss', 'podcasts'],
+    trustedAdapters: [{
+      id: 'ora-cortex-braintied',
+      modes: ['cortex', 'telegram'] as const,
+      async recall() { return []; },
+    }],
+    publicRunner: async () => ({
+      ...mockPublicResult(),
+      discoveries: [packedDiscovery],
+      validatedEvidence: [{
+        source_url: packedDiscovery.url,
+        content: validatedSentence,
+        kind: 'verbatim_quote',
+      }],
+    }),
+  });
+
+  assert.equal(result.publicEvidence.length, 1);
+  assert.equal(result.publicEvidence[0]?.exactQuote, validatedSentence);
+  assert.notEqual(result.publicEvidence[0]?.exactQuote, packedDiscovery.snippet);
+  assert.equal(
+    result.publicEvidence[0]?.metadata['validation'],
+    'exact_fetched_source_sentence',
+  );
 });
 
 function discovery(index: number) {
@@ -140,8 +214,21 @@ function mockPublicResult(): KindResearchResult {
     },
     quotes: [],
     costUsd: 0,
-    grounding: null,
+    grounding: {
+      ratio: 1,
+      total_citations: 1,
+      valid_citations: 1,
+      hallucinated: [],
+      status: 'validated',
+      quality: 'strong',
+      passed: true,
+    },
     discoveries: [1, 2, 3, 4].map(discovery),
+    validatedEvidence: [1, 2, 3, 4].map((index) => ({
+      source_url: `https://example.com/source-${index}`,
+      content: `Validated source sentence number ${index} contains complete factual evidence.`,
+      kind: 'verbatim_quote' as const,
+    })),
   };
 }
 
@@ -174,6 +261,33 @@ test('research program keeps private recall out of the public model boundary', a
   assert.ok(publicInput !== null);
   const outbound = (publicInput as RunResearchInput).brief;
   assert.doesNotMatch(outbound, /PRIVATE-CORTEX|PRIVATE-TELEGRAM/);
+});
+
+test('public program research cannot complete when grounding is missing', async () => {
+  const result = await runResearchProgram({
+    brief: question,
+    asOf: '2026-07-21',
+    sourceModes: ['web'],
+    availableProviders: ['tavily'],
+    publicRunner: async () => ({ ...mockPublicResult(), grounding: null }),
+  });
+
+  assert.equal(result.sourceCoverage.passed, true);
+  assert.equal(result.status, 'partial');
+});
+
+test('search discoveries cannot satisfy source coverage without validated fetched evidence', async () => {
+  const result = await runResearchProgram({
+    brief: question,
+    asOf: '2026-07-21',
+    sourceModes: ['web'],
+    availableProviders: ['tavily'],
+    publicRunner: async () => ({ ...mockPublicResult(), validatedEvidence: [] }),
+  });
+
+  assert.equal(result.sourceCoverage.passed, false);
+  assert.deepEqual(result.sourceCoverage.missingModes, ['web']);
+  assert.equal(result.status, 'partial');
 });
 
 test('trusted adapters cannot cross-tag Cortex and Telegram evidence', async () => {

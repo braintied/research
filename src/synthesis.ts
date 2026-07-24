@@ -10,7 +10,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { GoogleGenAI } from '@google/genai';
 import OpenAI from 'openai';
-import { z } from 'zod';
 import { logger } from './logger.js';
 import { getGeminiKey } from './pipeline-core.js';
 import { recordGeminiUsage } from './cache-hit-measurement.js';
@@ -44,14 +43,172 @@ const ASSEMBLY_MODEL_DEFAULT = 'gemini-3.6-flash';
  * success description) turn supported claims into unverifiable ones.
  */
 export const SECTION_SYNTHESIS_SYSTEM_PROMPT =
-  'You are a research writer. Write a well-structured markdown section using the provided quotes and claims as primary evidence. ' +
-  'Embed inline citations using [^N] notation exactly where the evidence appears in the text. ' +
-  'Do not invent citations or facts not present in the evidence below. ' +
-  'Keep every cited sentence source-near and mechanically traceable to its evidence. Preserve every number, percentage, date, named entity, standard identifier, protocol or status code, and technical term exactly as stated in the evidence. ' +
-  'Do not replace numeric or protocol details with looser qualitative wording, and do not combine separate evidence fragments into a broader claim unless the same citation supports the entire resulting sentence. ' +
-  'Place each citation immediately after the smallest sentence fully supported by that source. ' +
-  'Write in flowing paragraphs with a clear section heading. ' +
+  'You are a research editor. Write a well-structured markdown section using only the supplied evidence units for factual claims. ' +
+  'Insert an evidence unit with its exact token, such as {{EVIDENCE:E1}}. The renderer replaces that token with the exact source sentence and its citation; never copy, paraphrase, combine, or add [^N] citation syntax yourself. ' +
+  'Put each evidence token on its own line between paragraphs. Use each token at most once and never invent an evidence ID. ' +
+  'You may add concise connective analysis, but it must not introduce new names, numbers, dates, product capabilities, prices, legal terms, benchmarks, or other externally verifiable facts. The renderer visibly labels every word of that connective prose as editorial inference rather than source-validated evidence. ' +
+  'This evidence-token contract makes every cited sentence source-near and mechanically traceable while preserving every number, percentage, date, named entity, standard identifier, protocol or status code, and technical term exactly as stated. ' +
+  'Write in concise, non-repetitive paragraphs. Do not output a heading; the renderer assigns the section heading deterministically. ' +
   'Match the requested word count as closely as possible.';
+
+const EVIDENCE_TOKEN_PATTERN = /\{\{EVIDENCE:([A-Z][A-Z0-9_-]{0,31})\}\}/gu;
+const MODEL_CITATION_PATTERN = /\[\^\d+\]/gu;
+
+export interface SynthesisEvidenceUnit {
+  id: string;
+  text: string;
+  sourceUrl: string;
+  citationAnchor: string;
+}
+
+export class SynthesisEvidenceBindingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SynthesisEvidenceBindingError';
+  }
+}
+
+function normalizeEvidenceText(text: string): string {
+  return text.replace(/\s+/gu, ' ').trim();
+}
+
+/**
+ * Build stable, source-bound evidence handles for one section. The model sees
+ * handles, but only this renderer is allowed to emit a citation marker.
+ */
+export function buildSynthesisEvidenceUnits(
+  quotes: VerbatimQuote[],
+  claims: { claim: string; source_url: string; provider: ProviderName }[],
+  citationMap: Map<string, number>,
+): SynthesisEvidenceUnit[] {
+  const units: SynthesisEvidenceUnit[] = [];
+  const seen = new Set<string>();
+  const add = (text: string, sourceUrl: string): void => {
+    const normalizedText = normalizeEvidenceText(text);
+    const citationNumber = citationMap.get(sourceUrl);
+    if (normalizedText.length === 0 || citationNumber === undefined) return;
+    const identity = `${sourceUrl}\u0000${normalizedText}`;
+    if (seen.has(identity)) return;
+    seen.add(identity);
+    units.push({
+      id: `E${units.length + 1}`,
+      text: normalizedText,
+      sourceUrl,
+      citationAnchor: `[^${citationNumber}]`,
+    });
+  };
+
+  for (const quote of quotes) add(quote.quote, quote.source_url);
+  for (const claim of claims) add(claim.claim, claim.source_url);
+  return units;
+}
+
+function citeExactEvidence(text: string, anchor: string): string {
+  const terminal = /([.!?]+)(["')\]]*)$/u.exec(text);
+  if (terminal === null || terminal.index === undefined) {
+    return `${text} ${anchor}.`;
+  }
+  const prefix = text.slice(0, terminal.index).trimEnd();
+  return `${prefix} ${anchor}${terminal[1]}${terminal[2]}`;
+}
+
+function codeOwnedSectionHeading(sectionOrdinal: number): string {
+  const ordinal = Number.isSafeInteger(sectionOrdinal) && sectionOrdinal > 0
+    ? sectionOrdinal
+    : 1;
+  return `Research Findings ${ordinal}`;
+}
+
+export interface RenderEvidenceBoundMarkdownResult {
+  bodyMd: string;
+  usedUnits: SynthesisEvidenceUnit[];
+}
+
+const EDITORIAL_SYNTHESIS_LABEL =
+  '**Editorial synthesis — inference, not source-validated:**';
+
+/**
+ * Model-authored connective prose is useful for orientation, but it is not
+ * evidence. Render it inside an unmistakable blockquote so no consumer can
+ * confuse fluent model prose with the exact, mechanically validated source
+ * sentences emitted beside it.
+ */
+function renderEditorialSynthesis(markdown: string): string {
+  const normalized = markdown
+    .replace(/[ \t]+\n/gu, '\n')
+    .replace(/\n{3,}/gu, '\n\n')
+    .trim();
+  if (normalized.length === 0) return '';
+
+  const quoted = normalized
+    .split('\n')
+    .map((line) => (line.length > 0 ? `> ${line}` : '>'))
+    .join('\n');
+  return `> ${EDITORIAL_SYNTHESIS_LABEL}\n>\n${quoted}`;
+}
+
+/**
+ * Replace model-selected evidence handles with exact evidence sentences.
+ * Direct model-authored citations are removed, repeated handles are emitted
+ * once, and an unknown/missing handle fails closed. Blank paragraphs isolate
+ * each cited sentence so sentence-level grounding cannot accidentally absorb
+ * adjacent editorial prose.
+ */
+export function renderEvidenceBoundMarkdown(
+  modelMarkdown: string,
+  units: SynthesisEvidenceUnit[],
+): RenderEvidenceBoundMarkdownResult {
+  const byId = new Map(units.map((unit) => [unit.id, unit]));
+  const usedIds = new Set<string>();
+  const unknownIds = new Set<string>();
+  const usedUnits: SynthesisEvidenceUnit[] = [];
+
+  const withoutModelCitations = modelMarkdown.replace(MODEL_CITATION_PATTERN, '');
+  const renderedParts: string[] = [];
+  let cursor = 0;
+  EVIDENCE_TOKEN_PATTERN.lastIndex = 0;
+  let tokenMatch: RegExpExecArray | null;
+
+  while ((tokenMatch = EVIDENCE_TOKEN_PATTERN.exec(withoutModelCitations)) !== null) {
+    const editorial = renderEditorialSynthesis(
+      withoutModelCitations.slice(cursor, tokenMatch.index),
+    );
+    if (editorial.length > 0) renderedParts.push(editorial);
+
+    const rawId = tokenMatch[1];
+    const unit = rawId !== undefined ? byId.get(rawId) : undefined;
+    if (unit === undefined) {
+      if (rawId !== undefined) unknownIds.add(rawId);
+    } else if (!usedIds.has(rawId)) {
+      usedIds.add(rawId);
+      usedUnits.push(unit);
+      renderedParts.push(citeExactEvidence(unit.text, unit.citationAnchor));
+    }
+
+    cursor = tokenMatch.index + tokenMatch[0].length;
+  }
+
+  const trailingEditorial = renderEditorialSynthesis(
+    withoutModelCitations.slice(cursor),
+  );
+  if (trailingEditorial.length > 0) renderedParts.push(trailingEditorial);
+
+  if (unknownIds.size > 0) {
+    throw new SynthesisEvidenceBindingError(
+      `Synthesis referenced unknown evidence IDs: ${Array.from(unknownIds).sort().join(', ')}`,
+    );
+  }
+  if (units.length > 0 && usedUnits.length === 0) {
+    throw new SynthesisEvidenceBindingError(
+      'Synthesis returned no valid evidence tokens for an evidence-backed section.',
+    );
+  }
+
+  return {
+    bodyMd: renderedParts.join('\n\n').trim(),
+    usedUnits,
+  };
+}
 
 // =============================================================================
 // Multi-provider synthesis dispatcher
@@ -363,10 +520,14 @@ export interface SynthesizeSectionInput {
   quotes: VerbatimQuote[];
   keyClaims: { claim: string; source_url: string; provider: ProviderName }[];
   targetWords: number;
+  /** Code-owned display order; never derived from planner/model prose. */
+  sectionOrdinal?: number;
   /** Phase 1 Experiment 1 — see resolveSynthesisModel(). undefined → glm-5.2. */
   synthesisModelOverride?: string;
   /** Phase 1 Experiment 3 — Gemini cache-hit measurement attribution. */
   telemetry?: { organizationId?: string; promptRunId?: string };
+  /** Deterministic test/consumer injection; production uses synthesisGenerate. */
+  generate?: typeof synthesisGenerate;
 }
 
 export interface SynthesizeSectionResult {
@@ -376,59 +537,65 @@ export interface SynthesizeSectionResult {
   outputTokens: number;
 }
 
+export const EVIDENCE_GAP_NOTICE =
+  '> **Evidence gap:** No source-validated evidence sentence was available for this section, so no factual synthesis was produced.';
+
 export async function synthesizeSection(
   input: SynthesizeSectionInput,
 ): Promise<SynthesizeSectionResult> {
-  const { sectionPath, sectionGoal, quotes, keyClaims, targetWords, synthesisModelOverride, telemetry } = input;
+  const {
+    sectionPath,
+    sectionGoal,
+    quotes,
+    keyClaims,
+    targetWords,
+    sectionOrdinal = 1,
+    synthesisModelOverride,
+    telemetry,
+    generate = synthesisGenerate,
+  } = input;
   const synthModel = resolveSynthesisModel(synthesisModelOverride, SYNTH_MODEL_DEFAULT);
 
   const citationMap = buildCitationMap(quotes, keyClaims);
+  const evidenceUnits = buildSynthesisEvidenceUnits(quotes, keyClaims, citationMap);
 
-  // Build quote block
-  const quotesBlock =
-    quotes.length > 0
-      ? quotes
-          .map((q) => {
-            const num = citationMap.get(q.source_url);
-            const anchor = num !== undefined ? `[^${num}]` : '';
-            const authorLine =
-              q.author !== undefined && q.author !== '' ? ` — ${q.author}` : '';
-            const pubLine =
-              q.published_at !== undefined && q.published_at !== ''
-                ? ` (${q.published_at.slice(0, 10)})`
-                : '';
-            return `> "${q.quote}"${authorLine}${pubLine} ${anchor}\n> Source: ${q.source_url}`;
-          })
-          .join('\n\n')
-      : '(no direct quotes available)';
+  // An evidence-empty section is an explicit research gap, not an invitation
+  // for a model to manufacture polished filler. The critique loop can search
+  // again; if the final pass is still empty, assembly preserves this notice.
+  if (evidenceUnits.length === 0) {
+    const draft = SectionDraftSchema.parse({
+      section_path: sectionPath,
+      heading: codeOwnedSectionHeading(sectionOrdinal),
+      level: 2,
+      body_md: EVIDENCE_GAP_NOTICE,
+      source_urls: [],
+      inline_citations: [],
+      word_count: countWords(EVIDENCE_GAP_NOTICE),
+    });
+    logger.warn({ sectionPath }, '[synthesis] Section has no validated evidence');
+    return {
+      draft,
+      inputTokens: 0,
+      cachedReadTokens: 0,
+      outputTokens: 0,
+    };
+  }
 
-  // Build claims block
-  const claimsBlock =
-    keyClaims.length > 0
-      ? keyClaims
-          .map((c) => {
-            const num = citationMap.get(c.source_url);
-            const anchor = num !== undefined ? `[^${num}]` : '';
-            return `- ${c.claim} ${anchor} [via ${c.provider}]`;
-          })
-          .join('\n')
-      : '(no key claims available)';
-
-  // Build footnote reference list for the model
-  const footnotes = Array.from(citationMap.entries())
-    .map(([url, num]) => `[^${num}]: ${url}`)
-    .join('\n');
+  const evidenceBlock = evidenceUnits
+    .map((unit) =>
+      `### ${unit.id}\nSource: ${unit.sourceUrl}\nExact evidence: ${unit.text}`)
+    .join('\n\n');
 
   const userMessage =
     `Section: ${sectionPath}\n` +
     `Goal: ${sectionGoal}\n` +
     `Target length: ~${targetWords} words\n\n` +
-    `## Verbatim Quotes\n\n${quotesBlock}\n\n` +
-    `## Key Claims\n\n${claimsBlock}\n\n` +
-    `## Citation Map (use these [^N] references inline)\n\n${footnotes}\n\n` +
-    `Write the section now. Start with a markdown heading (## or ###). Use [^N] inline citations.`;
+    `## Source-validated evidence units\n\n${evidenceBlock}\n\n` +
+    'Write the section body now without a heading. ' +
+    'Insert factual support only with exact {{EVIDENCE:EN}} tokens on their own lines. ' +
+    'Do not output footnotes or [^N] markers.';
 
-  const callResult = await synthesisGenerate({
+  const callResult = await generate({
     system: SECTION_SYNTHESIS_SYSTEM_PROMPT,
     user: userMessage,
     model: synthModel,
@@ -441,41 +608,32 @@ export async function synthesizeSection(
         }
       : undefined,
   });
-  const bodyMd = callResult.text;
+  const heading = codeOwnedSectionHeading(sectionOrdinal);
+  const level = 2;
+  let bodyContent = callResult.text;
 
-  // Extract heading from first line
-  const lines = bodyMd.trim().split('\n');
-  const headingLine = lines[0];
-  let heading = sectionPath;
-  let bodyContent = bodyMd;
+  const rendered = renderEvidenceBoundMarkdown(bodyContent, evidenceUnits);
+  bodyContent = rendered.bodyMd;
 
-  if (headingLine !== undefined && headingLine.startsWith('#')) {
-    heading = headingLine.replace(/^#+\s*/, '').trim();
-    bodyContent = lines.slice(1).join('\n').trim();
+  // Only selected evidence becomes a section source/citation. This removes
+  // phantom bibliography entries at the earliest possible boundary.
+  const usedByUrl = new Map<string, SynthesisEvidenceUnit>();
+  for (const unit of rendered.usedUnits) {
+    if (!usedByUrl.has(unit.sourceUrl)) usedByUrl.set(unit.sourceUrl, unit);
   }
-
-  // Determine heading level from markdown
-  let level = 2;
-  if (headingLine !== undefined) {
-    const match = headingLine.match(/^(#+)/);
-    if (match !== null) {
-      level = Math.min(match[1].length, 6);
-    }
-  }
-
-  // Build inline_citations from citation map
-  const inlineCitations = Array.from(citationMap.entries()).map(([url, num]) => {
-    const quote = quotes.find((q) => q.source_url === url);
+  const inlineCitations = Array.from(usedByUrl.values()).map((unit) => {
     return {
-      anchor: `[^${num}]`,
-      source_url: url,
-      quote_excerpt:
-        quote !== undefined ? quote.quote.slice(0, 120) : '',
+      anchor: unit.citationAnchor,
+      source_url: unit.sourceUrl,
+      // Preserve the complete evidence sentence. Assembly reuses this exact
+      // text for its deterministic executive summary; truncation would turn a
+      // valid source sentence into a fragment the grounding validator must
+      // correctly reject.
+      quote_excerpt: unit.text,
     };
   });
 
-  // Collect source URLs
-  const sourceUrls = Array.from(citationMap.keys());
+  const sourceUrls = Array.from(usedByUrl.keys());
 
   const draft = SectionDraftSchema.parse({
     section_path: sectionPath,
@@ -484,11 +642,16 @@ export async function synthesizeSection(
     body_md: bodyContent,
     source_urls: sourceUrls,
     inline_citations: inlineCitations,
-    word_count: countWords(bodyMd),
+    word_count: countWords(`${heading}\n${bodyContent}`),
   });
 
   logger.info(
-    { sectionPath, words: draft.word_count, citations: inlineCitations.length },
+    {
+      sectionPath,
+      words: draft.word_count,
+      citations: inlineCitations.length,
+      evidenceUnits: rendered.usedUnits.length,
+    },
     '[synthesis] Section synthesized',
   );
 
@@ -562,7 +725,7 @@ export async function synthesizeAllSections(
     const chunk = sectionsToWrite.slice(i, i + PARALLEL_CHUNK_SIZE);
 
     const chunkResults = await Promise.all(
-      chunk.map((spec) => {
+      chunk.map((spec, chunkIndex) => {
         const quotes = quotesByPath[spec.section_path];
         const claims = claimsByPath[spec.section_path];
 
@@ -572,6 +735,7 @@ export async function synthesizeAllSections(
           quotes: quotes !== undefined ? quotes : [],
           keyClaims: claims !== undefined ? claims : [],
           targetWords: spec.targetWords,
+          sectionOrdinal: i + chunkIndex + 1,
           synthesisModelOverride,
           telemetry,
         });
@@ -640,10 +804,59 @@ export interface AssembleFinalReportResult {
   model: string;
 }
 
+/**
+ * Build an executive summary exclusively from evidence sentences that have
+ * already survived section synthesis and global citation renumbering. This
+ * deliberately favors exactness over abstractive fluency: the summary is the
+ * most prominent surface in the report and therefore must obey the same
+ * evidence contract as every section.
+ */
+export function buildEvidenceBoundExecutiveSummary(
+  sections: SectionDraft[],
+  targetMaxWords = 400,
+): string {
+  const intro =
+    `This report contains source-validated findings across ${sections.length} ` +
+    `${sections.length === 1 ? 'section' : 'sections'}. ` +
+    'The statements below are reproduced from the accepted evidence set.';
+  const findings: string[] = [];
+  const seen = new Set<string>();
+  let wordCount = countWords(intro);
+
+  for (const section of sections) {
+    for (const citation of section.inline_citations) {
+      const evidenceText = normalizeEvidenceText(citation.quote_excerpt);
+      if (evidenceText.length === 0) continue;
+      const identity = `${citation.source_url}\u0000${evidenceText}`;
+      if (seen.has(identity)) continue;
+
+      const rendered = citeExactEvidence(evidenceText, citation.anchor);
+      const renderedWords = countWords(rendered);
+      if (findings.length > 0 && wordCount + renderedWords > targetMaxWords) {
+        continue;
+      }
+
+      seen.add(identity);
+      findings.push(rendered);
+      wordCount += renderedWords;
+    }
+  }
+
+  if (findings.length === 0) {
+    return 'No source-validated findings were available for an evidence-bound executive summary.';
+  }
+  return `${intro}\n\n${findings.join('\n\n')}`;
+}
+
 export async function assembleFinalReport(
   input: AssembleFinalReportInput,
 ): Promise<AssembleFinalReportResult> {
-  const { promptMd, sections, gaps, synthesisModelOverride, telemetry, sourceMeta } = input;
+  const {
+    sections,
+    gaps,
+    synthesisModelOverride,
+    sourceMeta,
+  } = input;
   const assemblyModel = resolveSynthesisModel(synthesisModelOverride, ASSEMBLY_MODEL_DEFAULT);
 
   // ---------------------------------------------------------------------------
@@ -677,7 +890,7 @@ export async function assembleFinalReport(
     }
   }
 
-  const renumberedSections: SectionDraft[] = citedSections.map((s) => {
+  const renumberedSections: SectionDraft[] = citedSections.map((s, sectionIndex) => {
     // Two-pass placeholder replacement — a direct local→global rewrite can
     // collide when local [^2] maps to global [^5] while local [^5] exists.
     const replacements: Array<{ from: string; to: string }> = [];
@@ -702,7 +915,13 @@ export async function assembleFinalReport(
       const globalNum = urlToGlobal.get(ic.source_url);
       return globalNum !== undefined ? { ...ic, anchor: `[^${globalNum}]` } : ic;
     });
-    return { ...s, body_md: body, inline_citations: inlineCitations };
+    return {
+      ...s,
+      heading: codeOwnedSectionHeading(sectionIndex + 1),
+      level: 2,
+      body_md: body,
+      inline_citations: inlineCitations,
+    };
   });
 
   // Build full markdown from renumbered sections
@@ -748,58 +967,17 @@ export async function assembleFinalReport(
       };
     });
 
-  // Generate title + executive summary via Claude
-  const totalWords = sections.reduce((sum, s) => sum + s.word_count, 0);
+  // Report-level labels are deterministic. Model-authored headings/titles sit
+  // outside sentence grounding and therefore cannot safely become report
+  // metadata, even when a prompt asks the model to avoid factual claims.
+  const title = 'Evidence-Bound Research Report';
+  const executiveSummary = buildEvidenceBoundExecutiveSummary(renumberedSections);
 
-  const summarySystemPrompt =
-    'You are an executive editor. Given a multi-section research report, write: ' +
-    '(1) a concise, informative title (max 12 words), and ' +
-    '(2) an executive summary of 200–400 words that distills the most important findings across all sections. ' +
-    'Output ONLY valid JSON (no markdown fences): {"title": "...", "executive_summary": "..."}';
-
-  const summaryUserMessage =
-    `Original research brief:\n\n${promptMd}\n\n` +
-    `Report sections (${totalWords} total words):\n\n${sectionsMarkdown.slice(0, 20000)}`;
-
-  const summaryCallResult = await synthesisGenerate({
-    system: summarySystemPrompt,
-    user: summaryUserMessage,
-    model: assemblyModel,
-    maxTokens: 2048,
-    telemetry: telemetry !== undefined
-      ? {
-          functionName: 'assembleFinalReport',
-          organizationId: telemetry.organizationId,
-          promptRunId: telemetry.promptRunId,
-        }
-      : undefined,
-  });
-  const summaryRaw = summaryCallResult.text;
-
-  // Parse title + exec summary
-  const SummarySchema = z.object({
-    title: z.string().min(1),
-    executive_summary: z.string().min(1),
-  });
-
-  let title = 'Deep Research Report';
-  let executiveSummary = '';
-
-  const jsonStart = summaryRaw.indexOf('{');
-  const jsonEnd = summaryRaw.lastIndexOf('}');
-
-  if (jsonStart !== -1 && jsonEnd !== -1) {
-    try {
-      const parsed: unknown = JSON.parse(summaryRaw.slice(jsonStart, jsonEnd + 1));
-      const validated = SummarySchema.parse(parsed);
-      title = validated.title;
-      executiveSummary = validated.executive_summary;
-    } catch {
-      logger.warn('[synthesis] Failed to parse title/summary JSON, using fallback');
-      executiveSummary = summaryRaw.slice(0, 1000);
-    }
-  } else {
-    executiveSummary = summaryRaw.slice(0, 1000);
+  const assemblyGaps = [...gaps];
+  for (const section of renumberedSections) {
+    if (section.source_urls.length > 0) continue;
+    const gap = `${section.section_path}: no source-validated evidence was available after refinement.`;
+    if (!assemblyGaps.includes(gap)) assemblyGaps.push(gap);
   }
 
   // Assemble full markdown
@@ -824,7 +1002,7 @@ export async function assembleFinalReport(
     full_markdown: fullMarkdown,
     sections: renumberedSections,
     bibliography,
-    gaps,
+    gaps: assemblyGaps,
     word_count: countWords(fullMarkdown),
   });
 
@@ -835,9 +1013,9 @@ export async function assembleFinalReport(
 
   return {
     report,
-    inputTokens: summaryCallResult.inputTokens,
-    cachedReadTokens: summaryCallResult.cachedReadTokens,
-    outputTokens: summaryCallResult.outputTokens,
+    inputTokens: 0,
+    cachedReadTokens: 0,
+    outputTokens: 0,
     model: assemblyModel,
   };
 }

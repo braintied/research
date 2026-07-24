@@ -206,6 +206,9 @@ Every successful run writes:
 Source-mode output also includes `source_plan`, `source_coverage`, and, for a
 profile, `profile_coverage`. A run with a missing required lane is written for
 audit but exits with status 2 and must be described as partial.
+Public lane and profile coverage count only exact evidence extracted from a
+fetched source. Search-result titles and snippets never satisfy coverage on
+their own.
 
 Internal profile metadata additionally contains a trusted-local
 `private_manifest` with evidence hashes, source references, lane/source-pack
@@ -226,6 +229,10 @@ evidence diagnostic and may still miss false or stale source claims.
 A weak or ungrounded pipeline result is still written for auditability, but it
 is marked with a visible evidence warning and must be treated as unverified.
 The default pass threshold is 60%; 80% or higher is classified as strong.
+In evidence-bound reports, cited sentences are inserted verbatim by the
+renderer. Any model-authored connective prose appears inside a block labeled
+`Editorial synthesis — inference, not source-validated`; that prose is not a
+citation-backed finding and must remain labeled when excerpted.
 
 
 `maxCostUsd` is enforced only by pipeline kinds (`quick`, `standard`, `deep`,
