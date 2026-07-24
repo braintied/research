@@ -26,11 +26,102 @@ function cleanRunnerEnvironment(): NodeJS.ProcessEnv {
     'SERPER_API_KEY',
     'ANTHROPIC_API_KEY',
     'VOYAGE_API_KEY',
+    'BRAINTIED_GITHUB_PUBLIC_TOKEN',
+    'BRAINTIED_GITHUB_REQUIRE_AUTH',
+    'GITHUB_TOKEN',
+    'GH_TOKEN',
   ]) {
     delete env[name];
   }
   return env;
 }
+
+test('web-design v2 preflight fails closed when dedicated GitHub auth is absent', () => {
+  const env = cleanRunnerEnvironment();
+  env.GEMINI_API_KEY = 'test-only-key';
+  env.TAVILY_API_KEY = 'test-only-tavily-key';
+  env.BRAINTIED_GITHUB_REQUIRE_AUTH = 'true';
+  const broadToken = 'ghp_broad_private_credential_must_be_ignored';
+  const broadCliToken = 'gho_broad_cli_credential_must_be_ignored';
+  env.GITHUB_TOKEN = broadToken;
+  env.GH_TOKEN = broadCliToken;
+
+  const result = spawnSync(process.execPath, [
+    runner,
+    '--check',
+    '--kind', 'standard',
+    '--max-cost-usd', '1',
+    '--synthesis-model', 'gemini-3-flash-preview',
+    '--profile', 'web-design-intelligence@2',
+    '--as-of', '2026-07-22',
+  ], { cwd: packageRoot, env, encoding: 'utf8' });
+
+  assert.equal(result.status, 2, result.stderr);
+  const preflight = JSON.parse(result.stdout) as {
+    ready: boolean;
+    missing: string[];
+    required_providers: string[];
+    provider_health: { github: { ready: boolean; authenticated: boolean; code: string } };
+  };
+  assert.equal(preflight.ready, false);
+  assert.deepEqual(preflight.required_providers, ['github']);
+  assert.deepEqual(preflight.provider_health.github, {
+    ready: false,
+    authenticated: false,
+    required: true,
+    ambientCredentialsIgnored: true,
+    code: 'github_auth_required',
+  });
+  assert.ok(
+    preflight.missing.includes('required provider unavailable: github'),
+  );
+  assert.ok(preflight.missing.includes(
+    'GitHub public-research authentication policy is not satisfied (github_auth_required)',
+  ));
+  assert.equal(result.stdout.includes(broadToken), false);
+  assert.equal(result.stdout.includes(broadCliToken), false);
+});
+
+test('web-design v2 preflight exposes sanitized authenticated health only', () => {
+  const env = cleanRunnerEnvironment();
+  env.GEMINI_API_KEY = 'test-only-key';
+  env.TAVILY_API_KEY = 'test-only-tavily-key';
+  env.BRAINTIED_GITHUB_REQUIRE_AUTH = 'true';
+  const dedicated = 'github_pat_dedicated_public_research_credential';
+  const broad = 'ghp_broad_private_credential_must_be_ignored';
+  env.BRAINTIED_GITHUB_PUBLIC_TOKEN = dedicated;
+  env.GITHUB_TOKEN = broad;
+
+  const result = spawnSync(process.execPath, [
+    runner,
+    '--check',
+    '--kind', 'standard',
+    '--max-cost-usd', '1',
+    '--synthesis-model', 'gemini-3-flash-preview',
+    '--sources', 'web,github',
+    '--profile', 'web-design-intelligence@2',
+    '--as-of', '2026-07-22',
+  ], { cwd: packageRoot, env, encoding: 'utf8' });
+
+  assert.equal(result.status, 0, result.stderr);
+  const preflight = JSON.parse(result.stdout) as {
+    ready: boolean;
+    required_providers: string[];
+    provider_health: { github: Record<string, unknown> };
+  };
+  assert.equal(preflight.ready, true);
+  assert.deepEqual(preflight.required_providers, ['github']);
+  assert.deepEqual(preflight.provider_health.github, {
+    ready: true,
+    authenticated: true,
+    required: true,
+    ambientCredentialsIgnored: true,
+    code: 'ready_authenticated_ambient_ignored',
+  });
+  assert.equal('token' in preflight.provider_health.github, false);
+  assert.equal(result.stdout.includes(dedicated), false);
+  assert.equal(result.stdout.includes(broad), false);
+});
 
 test('dotenv parser returns only allowlisted names using the documented single-line grammar', () => {
   const parsed = parseAllowlistedEnvFile([

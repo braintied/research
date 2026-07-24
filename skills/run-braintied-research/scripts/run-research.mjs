@@ -57,8 +57,8 @@ const RESEARCH_ENV_NAMES = [
   'CRAWL4AI_URL',
   'BRAINTIED_CRAWL4AI_ALLOWED_DOMAINS',
   'BRAINTIED_CRAWL4AI_NETWORK_GUARD',
-  'GITHUB_TOKEN',
-  'GH_TOKEN',
+  'BRAINTIED_GITHUB_PUBLIC_TOKEN',
+  'BRAINTIED_GITHUB_REQUIRE_AUTH',
 ];
 const SHARED_ENV_FILE_VARIABLE = 'BRAINTIED_RESEARCH_ENV_FILE';
 const GEMINI_KEY_NAME_VARIABLE = 'BRAINTIED_GEMINI_KEY_NAME';
@@ -522,6 +522,7 @@ async function preflight(
     : enabled.filter((provider) => provider !== 'crawl4ai');
   const config = requiredConfiguration(kind, enabled, synthesisModel);
   let sourcePlan = null;
+  let effectiveRequiredProviders = [...requiredProviders];
   if ((sources.length > 0 || profileRef !== undefined) && asOf === undefined) {
     config.missing.push('--as-of is required with --sources or --profile');
   }
@@ -538,6 +539,10 @@ async function preflight(
             enabledSearch,
           );
           if (effectiveSources.length === 0) effectiveSources = profileExecution.sourceModes;
+          effectiveRequiredProviders = Array.from(new Set([
+            ...profileExecution.requiredProviders,
+            ...effectiveRequiredProviders,
+          ]));
         } catch (error) {
           config.missing.push(`profile preflight failed: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -549,11 +554,27 @@ async function preflight(
         modes: effectiveSources,
         availableProviders: enabledSearch,
         availableTrustedAdapters: [],
-        requiredProviders,
+        requiredProviders: effectiveRequiredProviders,
         asOf,
       });
       for (const mode of sourcePlan.missingModes) addMissing(config.missing, `source mode unavailable: ${mode}`);
       for (const provider of sourcePlan.missingRequiredProviders) addMissing(config.missing, `required provider unavailable: ${provider}`);
+    }
+  }
+  const githubRequested = effectiveRequiredProviders.includes('github')
+    || sourcePlan?.publicModes?.includes('github') === true;
+  let githubHealth = null;
+  if (typeof research.resolveGitHubPublicAuthState === 'function') {
+    githubHealth = research.resolveGitHubPublicAuthState(process.env);
+  }
+  if (githubRequested) {
+    if (githubHealth === null) {
+      addMissing(config.missing, 'built package does not export GitHub public-auth policy');
+    } else if (githubHealth.ready !== true) {
+      addMissing(
+        config.missing,
+        `GitHub public-research authentication policy is not satisfied (${githubHealth.code})`,
+      );
     }
   }
   const freshness = await buildFreshness();
@@ -571,6 +592,8 @@ async function preflight(
     build_freshness: freshness,
     enabled_providers: enabled,
     enabled_search_providers: enabledSearch,
+    required_providers: effectiveRequiredProviders,
+    provider_health: { github: githubHealth },
     source_plan: sourcePlan,
     configured_key_names: RESEARCH_ENV_NAMES.filter(hasEnv),
     runtime_environment: {

@@ -159,6 +159,8 @@ export const ResearchProfileSchema = z.object({
   name: z.string().min(3).max(160),
   description: z.string().min(10).max(2_000),
   safePreamble: z.string().min(10).max(5_000),
+  /** Providers whose native execution is part of this versioned contract. */
+  requiredProviders: z.array(ProviderNameSchema).optional(),
   sourcePacks: z.array(SourcePackSchema).min(1),
   coverageRequirements: z.array(CoverageRequirementSchema).min(1),
   verification: VerificationPolicySchema,

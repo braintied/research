@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   ORA_AGENT_RUNTIME_PROFILE,
   WEB_DESIGN_INTELLIGENCE_PROFILE,
+  WEB_DESIGN_INTELLIGENCE_PROFILE_V1,
   compileResearchBrief,
   getResearchProfile,
 } from '../src/profiles/index.js';
@@ -14,7 +15,26 @@ test('profile registry resolves a pinned or unpinned profile reference', () => {
   assert.equal(getResearchProfile('ora-agent-runtime').version, 1);
   assert.equal(getResearchProfile('ora-agent-runtime@1').id, 'ora-agent-runtime');
   assert.throws(() => getResearchProfile('missing-profile'), /Unknown research profile/);
-  assert.equal(getResearchProfile('web-design-intelligence@1').id, 'web-design-intelligence');
+  assert.equal(getResearchProfile('web-design-intelligence').version, 2);
+  assert.equal(getResearchProfile('web-design-intelligence@1').version, 1);
+  assert.equal(getResearchProfile('web-design-intelligence@2').version, 2);
+});
+
+test('web-design profile v1 hash stays immutable while v2 requires native GitHub', () => {
+  const input = {
+    question: 'Which resources should Parlor agents use to create exceptional websites?',
+    asOf: '2026-07-22',
+    mode: 'snapshot' as const,
+  };
+  const v1 = compileResearchBrief(WEB_DESIGN_INTELLIGENCE_PROFILE_V1, input);
+  const v2 = compileResearchBrief(WEB_DESIGN_INTELLIGENCE_PROFILE, input);
+  assert.equal(v1.profileRef, 'web-design-intelligence@1');
+  assert.equal(v1.profileSha256, '5fa862b9f00dc60146fa4dc6ff88b75ef4ae0b9c300acd757cce7407ba1c4c0e');
+  assert.equal(v1.profileSha256, compileResearchBrief('web-design-intelligence@1', input).profileSha256);
+  assert.equal(WEB_DESIGN_INTELLIGENCE_PROFILE_V1.requiredProviders, undefined);
+  assert.deepEqual(WEB_DESIGN_INTELLIGENCE_PROFILE.requiredProviders, ['github']);
+  assert.equal(v2.profileRef, 'web-design-intelligence@2');
+  assert.equal(v2.profileSha256, '86f51f4d409a97cc785620ccb6d83b3bcd2ec2c1c418434ee4a4ce3a51f6f5e3');
 });
 
 test('web design profile separates public source authority from private design recall', () => {

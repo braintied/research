@@ -5,7 +5,7 @@ import { ResearchProfileSchema } from './types.js';
  * intelligence. Private recall stays tenant-bound and is reconciled separately
  * from the public synthesis boundary.
  */
-export const WEB_DESIGN_INTELLIGENCE_PROFILE = ResearchProfileSchema.parse({
+export const WEB_DESIGN_INTELLIGENCE_PROFILE_V1 = ResearchProfileSchema.parse({
   id: 'web-design-intelligence',
   version: 1,
   name: 'Beautiful, sunny, award-level website design intelligence',
@@ -280,4 +280,20 @@ export const WEB_DESIGN_INTELLIGENCE_PROFILE = ResearchProfileSchema.parse({
     privateEvidenceExternalization: 'deny',
     privateRecallExecution: 'trusted_local_only',
   },
+});
+
+/**
+ * Version 2 makes native GitHub public-repository evidence a hard contract.
+ * The version-1 object remains byte-for-byte/hash compatible for pinned runs;
+ * generic web search cannot stand in for implementation-repository evidence
+ * in the latest profile.
+ */
+export const WEB_DESIGN_INTELLIGENCE_PROFILE = ResearchProfileSchema.parse({
+  ...WEB_DESIGN_INTELLIGENCE_PROFILE_V1,
+  version: 2,
+  requiredProviders: ['github'],
+  sourcePacks: WEB_DESIGN_INTELLIGENCE_PROFILE_V1.sourcePacks.map((pack) =>
+    pack.id === 'open-implementation-sources'
+      ? { ...pack, providers: ['github'] }
+      : pack),
 });

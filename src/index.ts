@@ -65,6 +65,7 @@ import {
 import type { GroundingResult } from './grounding.js';
 import { safeLogger } from './logger.js';
 import type { Logger } from './logger.js';
+import { parseCachedSearchResults, searchCachePolicyIdentity } from './search-cache.js';
 
 // =============================================================================
 // Public re-exports — types, schemas, config
@@ -111,6 +112,7 @@ export {
   xProvider,
   podcastsProvider,
   githubProvider,
+  resolveGitHubPublicAuthState,
   triggerCollection,
   pollSnapshot,
   downloadSnapshot,
@@ -118,7 +120,13 @@ export {
   fetchLinkedInPostsBrightData,
   fetchFacebookGroupPostsBrightData,
 } from './providers/index.js';
-export type { PollSnapshotOptions, ScrapeDatasetOptions, BrightDataRecord } from './providers/index.js';
+export type {
+  PollSnapshotOptions,
+  ScrapeDatasetOptions,
+  BrightDataRecord,
+  GitHubPublicAuthCode,
+  GitHubPublicAuthState,
+} from './providers/index.js';
 export { rerankQuotes } from './rerank.js';
 export {
   synthesizeSection,
@@ -931,8 +939,6 @@ export async function runDeepResearch(
 
 type EnabledProviders = ReturnType<typeof getEnabledProviders>;
 
-const CachedSearchResultsSchema = z.array(SearchResultSchema);
-
 /**
  * Required/seeded searches are a locked source contract. Planner routing may
  * broaden an ordinary generated subquery, but it must never inject a web
@@ -972,6 +978,7 @@ async function searchOneProvider(
   };
   const cacheIdentity = JSON.stringify({
     provider: providerName,
+    policy: searchCachePolicyIdentity(providerName),
     query: subquery.query,
     sourcePackId: subquery.source_pack_id ?? null,
     sourceMode: subquery.source_mode ?? null,
@@ -993,14 +1000,8 @@ async function searchOneProvider(
   const cacheKey = `search:${providerName}:${hashUrl(cacheIdentity)}`;
   const cached = await cacheGet(cache, cacheKey, log);
   if (cached !== null) {
-    try {
-      const parsed = CachedSearchResultsSchema.safeParse(JSON.parse(cached));
-      if (parsed.success) {
-        return parsed.data;
-      }
-    } catch {
-      // Corrupt cache entry — fall through to a live search.
-    }
+    const parsed = parseCachedSearchResults(providerName, cached);
+    if (parsed !== null) return parsed;
   }
   try {
     const providerResults = await provider.search(subquery.query, effectiveOptions);

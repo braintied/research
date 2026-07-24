@@ -4,7 +4,7 @@ import test from 'node:test';
 import { createEvidenceIdentity, EvidenceItemSchema } from '../src/evidence.js';
 import { providersForSubquery } from '../src/index.js';
 import { compileProfileExecution } from '../src/profiles/registry.js';
-import { runResearchProgram } from '../src/research-program.js';
+import { runResearchProgram, SourcePlanUnavailableError } from '../src/research-program.js';
 import {
   evaluateSourceModeCoverage,
   resolveSourceExecutionPlan,
@@ -105,6 +105,83 @@ test('profile query hints merge into one stable synthesis section per source pac
     required: false,
     search_options: {},
   }), ['hn']);
+});
+
+test('web-design v2 makes implementation evidence native-GitHub-only', () => {
+  const compiled = compileProfileExecution(
+    'web-design-intelligence@2',
+    {
+      question: 'Which resources should Parlor agents use to build exceptional websites?',
+      asOf: '2026-07-22',
+    },
+    [...coreProviders, 'searxng', 'rss', 'podcasts'],
+  );
+  const implementationSeeds = compiled.seedSubqueries.filter((subquery) =>
+    subquery.source_pack_id === 'open-implementation-sources');
+  assert.deepEqual(compiled.requiredProviders, ['github']);
+  assert.equal(implementationSeeds.length, 2);
+  assert.ok(implementationSeeds.every((subquery) =>
+    subquery.providers.length === 1 && subquery.providers[0] === 'github'));
+});
+
+test('web-design v2 fails before public research when GitHub is absent', async () => {
+  let publicRunnerCalled = false;
+  await assert.rejects(
+    runResearchProgram({
+      brief: 'Which resources should Parlor agents use to build exceptional websites?',
+      asOf: '2026-07-22',
+      profileRef: 'web-design-intelligence@2',
+      availableProviders: ['tavily', 'searxng', 'hn', 'rss', 'podcasts'],
+      trustedAdapters: [{
+        id: 'ora-cortex-braintied',
+        modes: ['cortex', 'telegram'] as const,
+        async recall() { return []; },
+      }],
+      publicRunner: async () => {
+        publicRunnerCalled = true;
+        return mockPublicResult();
+      },
+    }),
+    (error: unknown) => error instanceof SourcePlanUnavailableError
+      && error.plan.missingRequiredProviders.includes('github'),
+  );
+  assert.equal(publicRunnerCalled, false);
+});
+
+test('profile and caller required providers are unioned without weakening v1 compatibility', async () => {
+  const v1 = compileProfileExecution(
+    'web-design-intelligence@1',
+    {
+      question: 'Which resources should Parlor agents use to build exceptional websites?',
+      asOf: '2026-07-22',
+    },
+    ['tavily', 'searxng', 'hn', 'rss', 'podcasts'],
+  );
+  const v1Implementation = v1.seedSubqueries.filter((subquery) =>
+    subquery.source_pack_id === 'open-implementation-sources');
+  assert.deepEqual(v1.requiredProviders, []);
+  assert.ok(v1Implementation.every((subquery) =>
+    subquery.providers.includes('tavily') && subquery.providers.includes('searxng')));
+
+  await assert.rejects(
+    runResearchProgram({
+      brief: 'Which resources should Parlor agents use to build exceptional websites?',
+      asOf: '2026-07-22',
+      profileRef: 'web-design-intelligence@2',
+      requiredProviders: ['x'],
+      availableProviders: ['github', 'tavily', 'searxng', 'hn', 'rss', 'podcasts'],
+      trustedAdapters: [{
+        id: 'ora-cortex-braintied',
+        modes: ['cortex', 'telegram'] as const,
+        async recall() { return []; },
+      }],
+      publicRunner: async () => mockPublicResult(),
+    }),
+    (error: unknown) => error instanceof SourcePlanUnavailableError
+      && error.plan.requiredProviders.includes('github')
+      && error.plan.requiredProviders.includes('x')
+      && error.plan.missingRequiredProviders.includes('x'),
+  );
 });
 
 test('profile execution applies the exact timestamp boundary to every seeded search', async () => {

@@ -160,6 +160,8 @@ export {
   podcastsProvider,
   githubProvider,
 };
+export { resolveGitHubPublicAuthState } from './github.js';
+export type { GitHubPublicAuthCode, GitHubPublicAuthState } from './github.js';
 
 // Re-export the extractor for use outside providers
 export { extractQuotesWithGemini } from './gemini-extractor.js';

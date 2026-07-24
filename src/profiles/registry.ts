@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 import { ORA_AGENT_RUNTIME_PROFILE } from './ora-agent-runtime.js';
-import { WEB_DESIGN_INTELLIGENCE_PROFILE } from './web-design-intelligence.js';
+import {
+  WEB_DESIGN_INTELLIGENCE_PROFILE,
+  WEB_DESIGN_INTELLIGENCE_PROFILE_V1,
+} from './web-design-intelligence.js';
 import { SubquerySchema } from '../types.js';
 import type { ProviderName, Subquery } from '../types.js';
 import type { AtomicSourceMode, SourceMode, TrustedSourceMode } from '../source-modes.js';
@@ -14,6 +17,7 @@ import {
 export const RESEARCH_PROFILES = [
   ORA_AGENT_RUNTIME_PROFILE,
   WEB_DESIGN_INTELLIGENCE_PROFILE,
+  WEB_DESIGN_INTELLIGENCE_PROFILE_V1,
 ] as const;
 
 function profileRef(profile: ResearchProfile): string {
@@ -69,9 +73,12 @@ function privatePackInstructions(profile: ResearchProfile): string | null {
 
 export function getResearchProfile(ref: string): ResearchProfile {
   const normalized = ref.trim();
-  for (const profile of RESEARCH_PROFILES) {
-    if (normalized === profile.id || normalized === profileRef(profile)) return profile;
-  }
+  const exact = RESEARCH_PROFILES.find((profile) => normalized === profileRef(profile));
+  if (exact !== undefined) return exact;
+  const latest = RESEARCH_PROFILES
+    .filter((profile) => normalized === profile.id)
+    .sort((left, right) => right.version - left.version)[0];
+  if (latest !== undefined) return latest;
   throw new Error(`Unknown research profile: ${ref}.`);
 }
 
@@ -153,6 +160,7 @@ export function compileResearchBrief(
 export interface CompiledProfileExecution {
   profile: ResearchProfile;
   compiledBrief: CompiledResearchBrief;
+  requiredProviders: ProviderName[];
   sourceModes: SourceMode[];
   seedSubqueries: Subquery[];
   trustedPacksByMode: Partial<Record<TrustedSourceMode, Array<{
@@ -230,5 +238,12 @@ export function compileProfileExecution(
     }
   }
 
-  return { profile, compiledBrief, sourceModes, seedSubqueries, trustedPacksByMode };
+  return {
+    profile,
+    compiledBrief,
+    requiredProviders: profile.requiredProviders ?? [],
+    sourceModes,
+    seedSubqueries,
+    trustedPacksByMode,
+  };
 }
