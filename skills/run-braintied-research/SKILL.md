@@ -87,8 +87,18 @@ model providers; treat every brief as outbound data.
 
    Use `run-research.mjs` only as an explicitly authorized local fallback when
    the internal service is unavailable. That fallback requires package build
-   freshness plus its own provider credentials; `--load-shell-env` imports only
-   the documented provider allowlist and never Agent Auth. For multichannel
+   freshness plus its own provider credentials. When approved credentials live
+   in a project dotenv file, prefer the runner's
+   `--research-env-file /absolute/path/to/.env` option. Never use Node's built-in
+   `--env-file`: Node imports every entry before the runner's allowlist executes,
+   and the runner refuses when it detects that preload.
+   The runner imports only its documented allowlist, requires every supplied
+   file to be a private regular non-symlink on supported POSIX systems, and
+   treats blank assignments as explicit masks for inherited values.
+   `BRAINTIED_RESEARCH_ENV_FILE` may point to that approved path so the command
+   works from any workspace; an explicit `--research-env-file` wins.
+   `--load-shell-env` imports the same allowlist from the interactive shell,
+   can discover that pointer, and never imports Agent Auth. For multichannel
    research, preflight exact lanes and an exact upper boundary:
 
    ```bash

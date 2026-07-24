@@ -58,7 +58,7 @@ import {
   validateGrounding,
 } from './grounding.js';
 import type { GroundingResult } from './grounding.js';
-import { logger as defaultLogger } from './logger.js';
+import { safeLogger } from './logger.js';
 import type { Logger } from './logger.js';
 
 // =============================================================================
@@ -217,6 +217,79 @@ export interface PipelineUsageEvent {
 
 export type OnPipelineUsage = (event: PipelineUsageEvent) => void | Promise<void>;
 
+const SAFE_USAGE_OPERATIONS = new Set([
+  'assembly-input',
+  'assembly-input-cached',
+  'assembly-output',
+  'extract-input',
+  'extract-input-estimated',
+  'extract-output',
+  'plan-input',
+  'plan-output',
+  'rerank-2',
+  'synth-input',
+  'synth-input-cached',
+  'synth-output',
+]);
+const SAFE_USAGE_SORTS = new Set([
+  'comments', 'latest', 'mixed', 'new', 'rating', 'relevance', 'top', 'views',
+]);
+const SAFE_USAGE_SOURCE_MODES = new Set([
+  'all', 'all_public', 'all_social', 'community', 'cortex', 'facebook_groups',
+  'github', 'instagram', 'reddit', 'telegram', 'tiktok', 'web', 'x', 'youtube',
+]);
+const SAFE_USAGE_MODELS = new Set([
+  'claude-haiku-4-5',
+  'claude-sonnet-4-6',
+  'claude-sonnet-5',
+  'deepseek-v4-flash',
+  'deepseek-v4-pro',
+  'gemini-2.5-flash',
+  'gemini-3-flash-preview',
+  'gemini-3.5-flash-lite',
+  'gemini-3.6-flash',
+  'glm-5.2',
+  'qwen/qwen3-235b-a22b-instruct-2507',
+  'sonar-deep-research',
+  'voyage-4-large',
+]);
+
+const SAFE_USAGE_NUMERIC_FIELDS = new Set([
+  'actual_tokens',
+  'estimated_sections',
+  'gaps',
+  'pass',
+  'recency_days',
+  'results',
+  'sections',
+]);
+
+function safeUsageString(key: string, value: string): string | undefined {
+  if (key === 'operation') return SAFE_USAGE_OPERATIONS.has(value) ? value : undefined;
+  if (key === 'sort') return SAFE_USAGE_SORTS.has(value) ? value : undefined;
+  if (key === 'source_mode') return SAFE_USAGE_SOURCE_MODES.has(value) ? value : undefined;
+  if (key === 'model') return SAFE_USAGE_MODELS.has(value) ? value : undefined;
+  return undefined;
+}
+
+export function sanitizePipelineUsageMetadata(
+  metadata: Record<string, unknown>,
+): Record<string, unknown> {
+  const safe: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (typeof value === 'number'
+        && Number.isFinite(value)
+        && SAFE_USAGE_NUMERIC_FIELDS.has(key)) {
+      safe[key] = value;
+    }
+    if (typeof value === 'string') {
+      const sanitized = safeUsageString(key, value);
+      if (sanitized !== undefined) safe[key] = sanitized;
+    }
+  }
+  return safe;
+}
+
 /** CostTracker that also notifies an OnPipelineUsage listener per entry. */
 class NotifyingCostTracker extends CostTracker {
   constructor(
@@ -231,13 +304,16 @@ class NotifyingCostTracker extends CostTracker {
     super.record(entry);
     if (this.listener !== undefined) {
       const modelRaw = entry.metadata['model'];
+      const safeModel = typeof modelRaw === 'string'
+        ? safeUsageString('model', modelRaw)
+        : undefined;
       const event: PipelineUsageEvent = {
         provider: entry.provider,
         category: entry.category,
-        model: typeof modelRaw === 'string' ? modelRaw : undefined,
+        model: safeModel,
         units: entry.units,
         costUsd: entry.units * entry.unit_cost_usd,
-        metadata: entry.metadata,
+        metadata: sanitizePipelineUsageMetadata(entry.metadata),
       };
       Promise.resolve(this.listener(event)).catch((err: unknown) => {
         this.log.warn(
@@ -433,7 +509,7 @@ export interface RunDeepResearchResult {
 export async function runDeepResearch(
   input: RunDeepResearchInput,
 ): Promise<RunDeepResearchResult> {
-  const log: Logger = input.logger !== undefined ? input.logger : defaultLogger;
+  const log: Logger = safeLogger(input.logger);
   const depth: ResearchDepth = input.depth !== undefined ? input.depth : 'standard';
   const depthConfig = DEPTH_CONFIG[depth];
   const capUsd: number = input.maxCostUsd !== undefined ? input.maxCostUsd : depthConfig.hardCapUsd;
@@ -891,7 +967,7 @@ async function searchOneProvider(
         units: 1,
         unit_cost_usd: perCall,
         metadata: {
-          query: subquery.query.slice(0, 80), results: results.length,
+          results: results.length,
           source_mode: subquery.source_mode,
           sort: effectiveOptions.sort,
           recency_days: effectiveOptions.recency_days,
@@ -1288,14 +1364,14 @@ async function extractQuotes(
           category: 'extract',
           units: extracted.usage.prompt_tokens,
           unit_cost_usd: EXTRACTION_INPUT_USD_PER_M / 1_000_000,
-          metadata: { model: EXTRACTION_MODEL, operation: 'extract-input', url: result.url.slice(0, 80) },
+          metadata: { model: EXTRACTION_MODEL, operation: 'extract-input' },
         });
         costTracker.record({
           provider: 'google',
           category: 'extract',
           units: extracted.usage.candidate_tokens,
           unit_cost_usd: EXTRACTION_OUTPUT_USD_PER_M / 1_000_000,
-          metadata: { model: EXTRACTION_MODEL, operation: 'extract-output', url: result.url.slice(0, 80) },
+          metadata: { model: EXTRACTION_MODEL, operation: 'extract-output' },
         });
       } else {
         const estimatedInputTokens = Math.ceil(Math.min(markdown.length, GEMINI_MAX_CONTENT_CHARS) / CHARS_PER_TOKEN);
@@ -1304,7 +1380,7 @@ async function extractQuotes(
           category: 'extract',
           units: estimatedInputTokens,
           unit_cost_usd: EXTRACTION_INPUT_USD_PER_M / 1_000_000,
-          metadata: { model: EXTRACTION_MODEL, operation: 'extract-input-estimated', url: result.url.slice(0, 80) },
+          metadata: { model: EXTRACTION_MODEL, operation: 'extract-input-estimated' },
         });
       }
 

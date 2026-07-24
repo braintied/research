@@ -37,7 +37,7 @@ All providers are raw `fetch` — no SDK dependencies. A provider is enabled whe
 | Tavily | search | `TAVILY_API_KEY` | quality tier, ~$8/1k |
 | Exa | search (semantic) | `EXA_API_KEY` | $7/1k, 1k free/mo |
 | SerpAPI | SERP + ads/PAA | `SERPAPI_KEY` | paid |
-| Crawl4AI (self-hosted) | fetch | `CRAWL4AI_URL` (default `https://ora-scraper.fly.dev`) | $0 |
+| Crawl4AI (self-hosted) | fetch | reviewed domains plus an egress-hardened crawler attestation | $0 |
 | Jina Reader | fetch fallback | `JINA_API_KEY` | free tier |
 | Reddit | social | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT` | free |
 | YouTube | video | `YOUTUBE_API_KEY` | free quota |
@@ -52,9 +52,31 @@ All providers are raw `fetch` — no SDK dependencies. A provider is enabled whe
 | LinkedIn / FB Groups (ingestion layer) | ingestion | Bright Data: `BRIGHTDATA_API_TOKEN` (+ dataset IDs) | paid |
 | Perplexity | managed deep research | `PERPLEXITY_API_KEY` | ~$0.40–1.30/query (sonar-deep-research) |
 
-Model/pipeline keys: `ANTHROPIC_API_KEY` (synthesis/critique), `GEMINI_RESEARCH_KEY` or `GEMINI_API_KEY` (planner/extraction), `VOYAGE_API_KEY` (rerank/embed), optional `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`.
+Model/pipeline keys: `ANTHROPIC_API_KEY` (synthesis/critique),
+`GEMINI_RESEARCH_KEY`, `GOOGLE_GEMINI_API_KEY`,
+`GOOGLE_GENERATIVE_AI_API_KEY`, or `GEMINI_API_KEY` (one shared resolver for
+planning/extraction/synthesis),
+`VOYAGE_API_KEY` (rerank/embed), optional `OPENROUTER_API_KEY`,
+`DEEPSEEK_API_KEY`.
+
+If multiple Gemini aliases contain different values, the shared package
+resolver fails closed. Set `BRAINTIED_GEMINI_KEY_NAME` to the approved variable
+name; the local runner also accepts `--gemini-key-name` and reports the selected
+name without printing its value.
 
 > Env naming is standardized here — `SERPAPI_KEY` (not `SERP_API_KEY`), `SERPER_API_KEY`, `SEARXNG_URLS`.
+
+Generic web fetches are fail-closed. The package accepts only public HTTP(S)
+targets on the standard port, pins each DNS-validated connection, revalidates
+every redirect, blocks private/link-local/reserved IPv4 and IPv6, and enforces
+content-type and byte limits. The self-hosted Crawl4AI service is additionally
+deny-by-default because a separate browser process cannot inherit the caller's
+pinned DNS result. It remains disabled unless the separate crawler enforces
+public-only DNS/IP checks on every navigation, redirect, and subresource and
+the caller sets `BRAINTIED_CRAWL4AI_NETWORK_GUARD=enforced-v1` to attest that
+boundary. `BRAINTIED_CRAWL4AI_ALLOWED_DOMAINS` is a second, comma-separated,
+human-reviewed gate: entries are exact hosts, while `*.example.com` explicitly
+allows subdomains. An allowlist alone is not an SSRF defense.
 
 Instagram has a stricter boundary than the general web-fetch stack. Hashtag
 search uses Bright Data snapshot discovery; direct `/p/`, `/reel/`, and `/tv/`
@@ -140,8 +162,15 @@ the run, that checkpoint also records the durable run ID; terminal success
 replaces it with final metadata. Preserve the checkpoint and use
 `--request-id <id>` to reattach after a local timeout or interruption.
 `run-research.mjs` remains available as an explicit local-provider fallback; it
-supports allowlisted interactive-shell environment loading and build-freshness
-checks. Exact lane preflight requires an as-of date:
+supports permission-checked, allowlisted dotenv loading, allowlisted
+interactive-shell environment loading, and build-freshness checks. Use
+`--research-env-file /absolute/path/to/.env` (or the
+`BRAINTIED_RESEARCH_ENV_FILE` pointer) when approved credentials live in a
+project file; this intentionally replaces or masks stale inherited research
+variables without importing unrelated env entries. Never use Node's built-in
+`--env-file` for this runner because Node imports every entry before the
+allowlist can run; the runner refuses when it detects that preload. Exact lane
+preflight requires an as-of date:
 
 ```bash
 node skills/run-braintied-research/scripts/run-research.mjs \
@@ -207,7 +236,7 @@ npm run pack:release          # → releases/braintied-research-<version>.tgz
 
 ```jsonc
 // consumer package.json
-"@braintied/research": "file:vendor/braintied-research-0.8.2.tgz"
+"@braintied/research": "file:vendor/braintied-research-0.8.3.tgz"
 ```
 
 ## Development

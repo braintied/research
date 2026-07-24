@@ -9,6 +9,12 @@
 
 import { z } from 'zod';
 import { logger } from './logger.js';
+import {
+  fetchPublicText,
+  outboundTargetFingerprint,
+  readBoundedWebResponseText,
+  resolvePublicHttpUrl,
+} from './public-http.js';
 
 // ============================================================================
 // Types — Crawl4AI
@@ -48,35 +54,35 @@ export interface CrawlStatusResponse {
 
 const CrawlTaskResponseSchema = z.object({
   success: z.boolean(),
-  id: z.string().optional().default(''),
+  id: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/).optional().default(''),
   results: z.array(z.object({
-    markdown: z.union([z.string(), z.object({
-      raw_markdown: z.string().default(''),
-      markdown_with_citations: z.string().default(''),
-      references_markdown: z.string().default(''),
-      fit_markdown: z.string().default(''),
+    markdown: z.union([z.string().max(5_000_000), z.object({
+      raw_markdown: z.string().max(5_000_000).default(''),
+      markdown_with_citations: z.string().max(5_000_000).default(''),
+      references_markdown: z.string().max(5_000_000).default(''),
+      fit_markdown: z.string().max(5_000_000).default(''),
     })]),
     metadata: z.object({
       statusCode: z.number().optional().default(0),
-      url: z.string().optional().default(''),
+      url: z.string().max(4096).optional().default(''),
     }).passthrough(),
-  })).optional(),
+  })).max(4).optional(),
 });
 
 const CrawlStatusResponseSchema = z.object({
-  status: z.string(),
+  status: z.enum(['queued', 'processing', 'completed', 'failed']),
   data: z.array(z.object({
-    markdown: z.union([z.string(), z.object({
-      raw_markdown: z.string().default(''),
-      markdown_with_citations: z.string().default(''),
-      references_markdown: z.string().default(''),
-      fit_markdown: z.string().default(''),
+    markdown: z.union([z.string().max(5_000_000), z.object({
+      raw_markdown: z.string().max(5_000_000).default(''),
+      markdown_with_citations: z.string().max(5_000_000).default(''),
+      references_markdown: z.string().max(5_000_000).default(''),
+      fit_markdown: z.string().max(5_000_000).default(''),
     })]),
     metadata: z.object({
       statusCode: z.number().optional().default(0),
-      url: z.string().optional().default(''),
+      url: z.string().max(4096).optional().default(''),
     }).passthrough(),
-  })),
+  })).max(4),
 });
 
 // ============================================================================
@@ -99,20 +105,82 @@ export const VOYAGE_API_URL = 'https://api.voyageai.com/v1/embeddings';
 export const GEMINI_MAX_CONTENT_CHARS = 12000;
 export const EXTRACTION_MODEL = 'gemini-3.5-flash-lite';
 
+const CRAWL4AI_ALLOWED_DOMAINS_ENV = 'BRAINTIED_CRAWL4AI_ALLOWED_DOMAINS';
+const CRAWL4AI_NETWORK_GUARD_ENV = 'BRAINTIED_CRAWL4AI_NETWORK_GUARD';
+const CRAWL4AI_NETWORK_GUARD_VALUE = 'enforced-v1';
+const MAX_CRAWL_RESPONSE_BYTES = 8_000_000;
+
+function crawl4aiDomainAllowed(hostname: string): boolean {
+  const allowlist = (process.env[CRAWL4AI_ALLOWED_DOMAINS_ENV] ?? '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase().replace(/\.$/, ''))
+    .filter((value) => value.length > 0);
+  const normalized = hostname.toLowerCase().replace(/\.$/, '');
+  return allowlist.some((entry) => {
+    if (entry.startsWith('*.')) {
+      const suffix = entry.slice(2);
+      return suffix.length > 0 && normalized.endsWith(`.${suffix}`);
+    }
+    return normalized === entry;
+  });
+}
+
+async function crawlResultMatchesTarget(initial: URL, resultUrl: string): Promise<boolean> {
+  if (resultUrl.length === 0) return false;
+  try {
+    const finalTarget = await resolvePublicHttpUrl(resultUrl);
+    if (finalTarget.url.hostname.toLowerCase() !== initial.hostname.toLowerCase()) return false;
+    if (initial.protocol === 'https:' && finalTarget.url.protocol !== 'https:') return false;
+    return crawl4aiDomainAllowed(finalTarget.url.hostname);
+  } catch {
+    return false;
+  }
+}
+
 // ============================================================================
 // Helpers — Environment
 // ============================================================================
 
+export const GEMINI_KEY_ENV_NAMES = [
+  'GEMINI_RESEARCH_KEY',
+  'GOOGLE_GEMINI_API_KEY',
+  'GOOGLE_GENERATIVE_AI_API_KEY',
+  'GEMINI_API_KEY',
+] as const;
+
+export const GEMINI_KEY_NAME_ENV = 'BRAINTIED_GEMINI_KEY_NAME';
+
 export function getGeminiKey(): string {
-  // GEMINI_RESEARCH_KEY is the dedicated research key; GEMINI_API_KEY is the
-  // documented alias (README promises either works — previously only the
-  // synthesis path honored GEMINI_API_KEY, so planner/extraction failed on
-  // consumers that set just one).
-  const key = process.env.GEMINI_RESEARCH_KEY;
-  if (key !== undefined && key !== '') return key;
-  const alias = process.env.GEMINI_API_KEY;
-  if (alias !== undefined && alias !== '') return alias;
-  throw new Error('GEMINI_RESEARCH_KEY (or GEMINI_API_KEY) environment variable is not configured');
+  // The package has consumers in both Braintied and Vercel AI SDK ecosystems.
+  // Keep one resolver so planning, extraction, and synthesis cannot select
+  // different/stale aliases for the same Gemini request path.
+  const configuredName = process.env[GEMINI_KEY_NAME_ENV]?.trim();
+  if (configuredName !== undefined && configuredName.length > 0
+    && !GEMINI_KEY_ENV_NAMES.includes(configuredName as (typeof GEMINI_KEY_ENV_NAMES)[number])) {
+    throw new Error(
+      `${GEMINI_KEY_NAME_ENV} must name one of: ${GEMINI_KEY_ENV_NAMES.join(', ')}`,
+    );
+  }
+
+  const candidates = GEMINI_KEY_ENV_NAMES.flatMap((name) => {
+    const value = process.env[name];
+    return value === undefined || value.trim().length === 0 ? [] : [{ name, value }];
+  });
+  if (configuredName !== undefined && configuredName.length > 0) {
+    const selected = candidates.find((candidate) => candidate.name === configuredName);
+    if (selected === undefined) {
+      throw new Error(`${GEMINI_KEY_NAME_ENV} selects ${configuredName}, but that variable is not configured`);
+    }
+    return selected.value;
+  }
+
+  if (new Set(candidates.map((candidate) => candidate.value)).size > 1) {
+    throw new Error(
+      `Conflicting Gemini aliases are configured (${candidates.map((candidate) => candidate.name).join(', ')}); set ${GEMINI_KEY_NAME_ENV}`,
+    );
+  }
+  if (candidates[0] !== undefined) return candidates[0].value;
+  throw new Error(`One of ${GEMINI_KEY_ENV_NAMES.join(', ')} must be configured`);
 }
 
 export function getVoyageKey(): string {
@@ -227,6 +295,7 @@ export async function fetchWithRetry(
     const response = await fetch(url, options);
     if (response.ok) return response;
     if (response.status === 429 || response.status >= 500) {
+      await response.body?.cancel().catch(() => undefined);
       const delay = baseDelayMs * Math.pow(2, attempt);
       logger.warn(
         { url: url.slice(0, 80), status: response.status, attempt, delayMs: delay },
@@ -238,7 +307,7 @@ export async function fetchWithRetry(
     // 4xx non-retry error — return as-is
     return response;
   }
-  throw new Error(`Failed after ${maxRetries} retries: ${url.slice(0, 100)}`);
+  throw new Error(`Request failed after ${maxRetries} retries`);
 }
 
 // ============================================================================
@@ -251,6 +320,18 @@ export async function fetchWithRetry(
  */
 export async function crawlWithCrawl4AI(url: string): Promise<string | null> {
   try {
+    if (process.env[CRAWL4AI_NETWORK_GUARD_ENV] !== CRAWL4AI_NETWORK_GUARD_VALUE) {
+      logger.debug({}, '[Crawl4AI] External browser crawler is disabled without an enforced network guard');
+      return null;
+    }
+    const target = await resolvePublicHttpUrl(url);
+    if (!crawl4aiDomainAllowed(target.url.hostname)) {
+      logger.debug(
+        { target: outboundTargetFingerprint(url) },
+        '[Crawl4AI] Target is not in the reviewed crawler domain allowlist',
+      );
+      return null;
+    }
     const response = await fetchWithRetry(
       `${SCRAPER_BASE_URL}/crawl`,
       {
@@ -262,7 +343,7 @@ export async function crawlWithCrawl4AI(url: string): Promise<string | null> {
         // apply, so JS-rendered SPAs come back empty (verified in Sentigen
         // 2026-06-20: flat → 1 char, typed → 5,898 chars on the same URL).
         body: JSON.stringify({
-          urls: [url],
+          urls: [target.url.toString()],
           browser_config: {
             type: 'BrowserConfig',
             params: { headless: true, java_script_enabled: true },
@@ -283,15 +364,22 @@ export async function crawlWithCrawl4AI(url: string): Promise<string | null> {
     );
 
     if (!response.ok) {
-      const body = await response.text();
-      logger.warn({ url, status: response.status, body: body.slice(0, 100) }, '[Crawl4AI] Submission failed');
+      await response.body?.cancel().catch(() => undefined);
+      logger.warn(
+        { target: outboundTargetFingerprint(url), status: response.status },
+        '[Crawl4AI] Submission failed',
+      );
       return null;
     }
 
-    const rawJson: unknown = await response.json();
+    const responseText = await readBoundedWebResponseText(response, MAX_CRAWL_RESPONSE_BYTES);
+    const rawJson: unknown = JSON.parse(responseText);
     const parseResult = CrawlTaskResponseSchema.safeParse(rawJson);
     if (!parseResult.success) {
-      logger.warn({ url, errors: parseResult.error.message }, '[Crawl4AI] Invalid response shape');
+      logger.warn(
+        { target: outboundTargetFingerprint(url), errors: parseResult.error.message },
+        '[Crawl4AI] Invalid response shape',
+      );
       return null;
     }
     const responseData = parseResult.data;
@@ -300,19 +388,35 @@ export async function crawlWithCrawl4AI(url: string): Promise<string | null> {
     if (responseData.results !== undefined && responseData.results.length > 0) {
       const first = responseData.results[0];
       if (first !== undefined) {
+        if (!await crawlResultMatchesTarget(target.url, first.metadata.url)) {
+          logger.warn(
+            { target: outboundTargetFingerprint(url) },
+            '[Crawl4AI] Result target did not match the reviewed source',
+          );
+          return null;
+        }
         const md = extractMarkdown(first.markdown as string | MarkdownDict);
         if (md.length > 100) {
-          logger.info({ url: url.slice(0, 60), chars: md.length }, '[Crawl4AI] Sync success');
+          logger.info(
+            { target: outboundTargetFingerprint(url), chars: md.length },
+            '[Crawl4AI] Sync success',
+          );
           return md;
         }
       }
-      logger.warn({ url }, '[Crawl4AI] Sync response had empty markdown');
+      logger.warn(
+        { target: outboundTargetFingerprint(url) },
+        '[Crawl4AI] Sync response had empty markdown',
+      );
       return null;
     }
 
     // Handle async response (task ID) — older Crawl4AI versions
     if (!responseData.success || responseData.id.length === 0) {
-      logger.warn({ url }, '[Crawl4AI] No task ID and no inline results');
+      logger.warn(
+        { target: outboundTargetFingerprint(url) },
+        '[Crawl4AI] No task ID and no inline results',
+      );
       return null;
     }
 
@@ -323,9 +427,13 @@ export async function crawlWithCrawl4AI(url: string): Promise<string | null> {
       const statusResp = await fetch(`${SCRAPER_BASE_URL}/task/${responseData.id}`, {
         signal: AbortSignal.timeout(10000),
       });
-      if (!statusResp.ok) continue;
+      if (!statusResp.ok) {
+        await statusResp.body?.cancel().catch(() => undefined);
+        continue;
+      }
 
-      const statusRaw: unknown = await statusResp.json();
+      const statusText = await readBoundedWebResponseText(statusResp, MAX_CRAWL_RESPONSE_BYTES);
+      const statusRaw: unknown = JSON.parse(statusText);
       const statusResult = CrawlStatusResponseSchema.safeParse(statusRaw);
       if (!statusResult.success) continue;
       const statusData = statusResult.data;
@@ -334,6 +442,13 @@ export async function crawlWithCrawl4AI(url: string): Promise<string | null> {
         if (statusData.data.length > 0) {
           const first = statusData.data[0];
           if (first !== undefined) {
+            if (!await crawlResultMatchesTarget(target.url, first.metadata.url)) {
+              logger.warn(
+                { target: outboundTargetFingerprint(url) },
+                '[Crawl4AI] Result target did not match the reviewed source',
+              );
+              return null;
+            }
             const md = extractMarkdown(first.markdown as string | MarkdownDict);
             if (md.length > 100) return md;
           }
@@ -343,11 +458,17 @@ export async function crawlWithCrawl4AI(url: string): Promise<string | null> {
       if (statusData.status === 'failed') return null;
     }
 
-    logger.warn({ url, taskId: responseData.id }, '[Crawl4AI] Poll timed out');
+    logger.warn(
+      { target: outboundTargetFingerprint(url), taskId: responseData.id },
+      '[Crawl4AI] Poll timed out',
+    );
     return null;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logger.error({ url, error: msg }, '[Crawl4AI] Crawl error');
+    logger.error(
+      { target: outboundTargetFingerprint(url), error: msg },
+      '[Crawl4AI] Crawl error',
+    );
     return null;
   }
 }
@@ -358,17 +479,19 @@ export async function crawlWithCrawl4AI(url: string): Promise<string | null> {
  */
 export async function directFetchAsText(url: string): Promise<string | null> {
   try {
-    const response = await fetch(url, {
+    const response = await fetchPublicText(url, {
+      acceptedContentTypes: ['text/html', 'application/xhtml+xml', 'text/plain'],
       headers: {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
         'Accept': 'text/html,application/xhtml+xml',
       },
-      signal: AbortSignal.timeout(15000),
+      maxBytes: 2_000_000,
+      timeoutMs: 15_000,
     });
 
     if (!response.ok) return null;
 
-    const html = await response.text();
+    const html = response.text;
     if (html.length < 200) return null;
 
     const titleMatch = html.match(/<title>([^<]*)<\/title>/i);
@@ -393,11 +516,17 @@ export async function directFetchAsText(url: string): Promise<string | null> {
     if (cleaned.length < 200) return null;
 
     const result = title.length > 0 ? `# ${title}\n\n${cleaned}` : cleaned;
-    logger.info({ url: url.slice(0, 60), chars: result.length }, '[DirectFetch] Success');
+    logger.info(
+      { target: outboundTargetFingerprint(url), chars: result.length },
+      '[DirectFetch] Success',
+    );
     return result;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logger.warn({ url, error: msg }, '[DirectFetch] Failed');
+    logger.warn(
+      { target: outboundTargetFingerprint(url), error: msg },
+      '[DirectFetch] Failed',
+    );
     return null;
   }
 }
@@ -412,27 +541,40 @@ export async function jinaReaderFetch(url: string): Promise<string | null> {
   if (key === undefined || key === '') return null;
 
   try {
-    const response = await fetch(`https://r.jina.ai/${url}`, {
+    const target = await resolvePublicHttpUrl(url);
+    const response = await fetchPublicText(`https://r.jina.ai/${target.url.toString()}`, {
+      acceptedContentTypes: ['text/markdown', 'text/plain'],
       headers: {
         Authorization: `Bearer ${key}`,
         Accept: 'text/plain',
       },
-      signal: AbortSignal.timeout(30000),
+      maxBytes: 2_000_000,
+      maxRedirects: 0,
+      timeoutMs: 30_000,
     });
 
     if (!response.ok) {
-      logger.warn({ url: url.slice(0, 80), status: response.status }, '[JinaReader] Non-OK response');
+      logger.warn(
+        { target: outboundTargetFingerprint(target.url.toString()), status: response.status },
+        '[JinaReader] Non-OK response',
+      );
       return null;
     }
 
-    const markdown = await response.text();
+    const markdown = response.text;
     if (markdown.trim().length < 200) return null;
 
-    logger.info({ url: url.slice(0, 60), chars: markdown.length }, '[JinaReader] Success');
+    logger.info(
+      { target: outboundTargetFingerprint(target.url.toString()), chars: markdown.length },
+      '[JinaReader] Success',
+    );
     return markdown;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logger.warn({ url, error: msg }, '[JinaReader] Failed');
+    logger.warn(
+      { target: outboundTargetFingerprint(url), error: msg },
+      '[JinaReader] Failed',
+    );
     return null;
   }
 }

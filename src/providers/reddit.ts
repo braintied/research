@@ -81,8 +81,7 @@ async function getAccessToken(): Promise<string> {
   });
 
   if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Reddit OAuth2 token error: ${response.status} ${body.slice(0, 200)}`);
+    throw new Error(`Reddit OAuth2 token error: ${response.status}`);
   }
 
   const TokenResponseSchema = z.object({
@@ -387,21 +386,49 @@ export const redditProvider: SearchProvider = {
   },
 
   async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      return FetchResultSchema.parse({
+        provider: 'reddit',
+        url,
+        fetch_status: 'failed',
+        fetch_error: 'Reddit fetch requires a valid Reddit HTTPS URL',
+      });
+    }
+    const redditHosts = new Set([
+      'reddit.com',
+      'www.reddit.com',
+      'old.reddit.com',
+      'np.reddit.com',
+      'oauth.reddit.com',
+    ]);
+    if (parsedUrl.protocol !== 'https:'
+        || parsedUrl.username !== ''
+        || parsedUrl.password !== ''
+        || parsedUrl.port !== ''
+        || !redditHosts.has(parsedUrl.hostname.toLowerCase())) {
+      return FetchResultSchema.parse({
+        provider: 'reddit',
+        url,
+        fetch_status: 'failed',
+        fetch_error: 'Reddit fetch requires a canonical Reddit HTTPS URL',
+      });
+    }
+    parsedUrl.hostname = 'oauth.reddit.com';
+    if (!parsedUrl.pathname.endsWith('.json')) parsedUrl.pathname += '.json';
+    parsedUrl.searchParams.set('limit', '200');
+
+    // Resolve credentials only after the destination is proven canonical. A
+    // caller-controlled URL must never cause a bearer token to be attached to
+    // an unreviewed origin, even if fetch/redirect behavior changes later.
     const token = await getAccessToken();
     const userAgent = getUserAgent();
     await rateLimit();
 
-    // Normalize to API JSON endpoint
-    let jsonUrl = url;
-    if (!jsonUrl.endsWith('.json')) {
-      const separator = jsonUrl.includes('?') ? '&' : '?';
-      jsonUrl = `${jsonUrl}.json${separator}limit=200`;
-    }
-
-    // Ensure we're using oauth.reddit.com for authenticated requests
-    jsonUrl = jsonUrl.replace('www.reddit.com', 'oauth.reddit.com');
-
-    const response = await fetch(jsonUrl, {
+    const response = await fetch(parsedUrl, {
+      redirect: 'error',
       headers: {
         'Authorization': `Bearer ${token}`,
         'User-Agent': userAgent,
@@ -410,12 +437,11 @@ export const redditProvider: SearchProvider = {
     });
 
     if (!response.ok) {
-      const errorBody = await response.text();
       const result = FetchResultSchema.parse({
         provider: 'reddit',
         url,
         fetch_status: 'failed',
-        fetch_error: `Reddit fetch error: ${response.status} ${errorBody.slice(0, 100)}`,
+        fetch_error: `Reddit fetch error: ${response.status}`,
       });
       return result;
     }
