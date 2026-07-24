@@ -1,5 +1,37 @@
 # Internal Agent Research Release — July 24, 2026
 
+## 0.8.6 — Dedicated, fail-closed GitHub public-research authentication
+
+Version 0.8.6 removes broad ambient `GITHUB_TOKEN` and `GH_TOKEN` from both the
+GitHub provider and the portable runner's import allowlist. The provider accepts
+only `BRAINTIED_GITHUB_PUBLIC_TOKEN`; `BRAINTIED_GITHUB_REQUIRE_AUTH=true` makes a missing
+or malformed dedicated credential fail before any network request. Invalid
+policy values fail closed, HTTP failure bodies are never copied into errors, and
+anonymous public search remains available only when the explicit policy does not
+require authentication.
+
+All authenticated requests are pinned to `https://api.github.com` with redirects
+rejected. Repository and issue searches force public visibility, cross-bind API
+and HTML identities, and require explicit `private: false` plus `visibility:
+public` evidence. GitHub search cache entries use a new immutable public-proof
+namespace and attestation marker, so results cached by earlier versions cannot
+cross the boundary.
+
+`web-design-intelligence@2` is now the live website-intelligence contract. It
+requires the native GitHub provider and makes the open-implementation source
+pack GitHub-only; Tavily or SearXNG cannot satisfy that evidence lane. Pinned
+`web-design-intelligence@1` remains available with its original profile hash for
+reproducibility only.
+
+The release also pins the patched `esbuild` 0.28.1 through the package override
+until tsup widens its dependency range. The CommonJS/ESM/type builds and all 152
+tests pass on the override, and `npm audit` reports zero vulnerabilities.
+
+Release archive: `releases/braintied-research-0.8.6.tgz`
+
+- SHA-256: `d0a9c6dd6e45b4d1aba837cf70a201d0c5a523664d7487623914ad1c759d04aa`
+- npm integrity: `sha512-wAMkYsBsr1ATwTdhgKXE9Sjx44w9i8I94qb1w84BUPyJQIBOro2HeyGRVIQmTofpm5hgkFo3szKgU9Pk9HRqmg==`
+
 ## 0.8.5 — Evidence-bound synthesis and honest source coverage
 
 The July 22 website-intelligence run exposed a contract mismatch rather than a

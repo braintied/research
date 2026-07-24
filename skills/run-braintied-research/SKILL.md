@@ -64,7 +64,7 @@ model providers; treat every brief as outbound data.
      --brief-file /tmp/research-brief.md \
      --kind deep \
      --max-cost-usd 5 \
-     --profile web-design-intelligence@1 \
+     --profile web-design-intelligence@2 \
      --profile-mode snapshot \
      --as-of 2026-07-22 \
      --output /tmp/research-report.md \
@@ -165,7 +165,7 @@ Source modes are independent of research kind:
 | `x` | Direct posts/threads | twitterapi.io primary; official X v2 fallback; Bright Data known-URL/profile enrichment; Apify last |
 | `reddit` | Threads and comments | Free native OAuth; Bright Data backfill; Apify last |
 | `youtube` | Videos, transcripts, comments | Free native Data API/transcript path; Bright Data backfill |
-| `github` | Repositories, issues, pull requests | Native public REST; optional token recommended |
+| `github` | Repositories, issues, pull requests | Native public REST; only the dedicated `BRAINTIED_GITHUB_PUBLIC_TOKEN` is eligible, and `BRAINTIED_GITHUB_REQUIRE_AUTH=true` fails closed without it |
 | `community` | HN, RSS, podcasts | Free HN/RSS plus configured podcast provider |
 | `all_public` | All six public modes above | Expands deterministically and enforces every lane |
 

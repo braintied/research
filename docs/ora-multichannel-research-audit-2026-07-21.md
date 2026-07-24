@@ -28,7 +28,7 @@ Bright Data should be used heavily, but not indiscriminately. Its current catalo
 | Crawl4AI acquisition | Present; internal scraper reachable | Healthy; fetched 16,706 characters from a current Inngest page | Available | Keep out of the search planner; use only after URL discovery |
 | Reddit | OAuth client configured | Healthy; recharge recheck returned three dated threads, HTTP 200 | Available | Keep native OAuth primary; add Bright Data backfill for keyword/subreddit and comments |
 | YouTube | Data API key configured | Healthy; recharge recheck returned three dated videos, HTTP 200 | Available | Keep native API primary; add Bright Data transcript/comment backfill |
-| GitHub | No token configured | Public unauthenticated search returned six results | Degraded by restrictive unauthenticated search quota | Add a project-owned `GITHUB_TOKEN` and query-specific monitoring |
+| GitHub | No token configured | Public unauthenticated search returned six results | Degraded by restrictive unauthenticated search quota | Superseded by 0.8.6: provision the dedicated `BRAINTIED_GITHUB_PUBLIC_TOKEN`, set `BRAINTIED_GITHUB_REQUIRE_AUTH=true`, and monitor sanitized provider health; never use broad ambient GitHub credentials |
 | X | twitterapi.io configured; official X and Apify are fallbacks | Healthy after recharge: HTTP 200 and 20 tweets in the current status-less cursor envelope | Available in the local package; not deployed | Deploy the tested envelope/pagination fix; retain official X second and repair Apify only as the last fallback |
 | Bright Data social | Token configured; Instagram path tested offline | Healthy: a capped YouTube job reached `ready` and downloaded one structured transcript record | Acquisition contract proven; Reddit/YouTube routing not deployed | Deploy the tested asynchronous snapshot handler, then wire capped Reddit/YouTube backfill and X URL/profile enrichment |
 | Braintied internal research API | Source tree contains route work | Production catalog/execute surface returned HTTP 404 | **Unavailable** | Reconcile dirty Ora worktree, review, deploy, and probe the catalog before model research |
@@ -211,7 +211,7 @@ At the time of this report, the package test suite passed all 46 tests (38 unit/
 
 1. Configure Bright Data Reddit and YouTube dataset contracts as secondary discovery/backfill lanes with record and dollar caps.
 2. Configure Bright Data X known-URL/profile enrichment; never use it as evidence of global X keyword coverage.
-3. Add a project-owned GitHub token and source-specific query templates.
+3. Provision the dedicated `BRAINTIED_GITHUB_PUBLIC_TOKEN`, set `BRAINTIED_GITHUB_REQUIRE_AUTH=true`, and add source-specific query templates; broad ambient `GITHUB_TOKEN` and `GH_TOKEN` credentials are forbidden for this lane.
 4. Add recurring provider contract tests, freshness/coverage dashboards, quota alerts, and provider circuit breakers.
 5. Store a source manifest for every run: query hash, exact controls, provider, backend, retrieval time, publication bounds, pages/cursors, result/evidence counts, cache status, and cost/quota units.
 

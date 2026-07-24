@@ -107,7 +107,7 @@ function parsePositiveInteger(raw, label) {
 function parseProfileRef(raw) {
   if (raw === undefined) return undefined;
   if (!/^[a-z0-9][a-z0-9-]{2,80}@[1-9][0-9]*$/.test(raw)) {
-    throw new Error('--profile must be a versioned profile reference such as web-design-intelligence@1.');
+    throw new Error('--profile must be a versioned profile reference such as web-design-intelligence@2.');
   }
   return raw;
 }

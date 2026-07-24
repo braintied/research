@@ -41,7 +41,7 @@ All providers are raw `fetch` — no SDK dependencies. A provider is enabled whe
 | Jina Reader | fetch fallback | `JINA_API_KEY` | free tier |
 | Reddit | social | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT` | free |
 | YouTube | video | `YOUTUBE_API_KEY` | free quota |
-| GitHub | repository/issues/PRs | optional `GITHUB_TOKEN` or `GH_TOKEN` | public unauthenticated access; token recommended for search quota |
+| GitHub | repository/issues/PRs | dedicated `BRAINTIED_GITHUB_PUBLIC_TOKEN`; optional `BRAINTIED_GITHUB_REQUIRE_AUTH=true` policy | broad ambient `GITHUB_TOKEN` / `GH_TOKEN` are ignored; authenticated mode fails closed when required |
 | Hacker News | forum | (none) | $0; the HN item permalink is the fetchable evidence identity and the outbound article remains metadata |
 | RSS | newsletters | (none) | $0; profiles must provide explicit verified RSS/Atom endpoints (`feedUrls`) |
 | Podcasts | podcast | `LISTENNOTES_API_KEY` | paid |
@@ -236,7 +236,7 @@ npm run pack:release          # → releases/braintied-research-<version>.tgz
 
 ```jsonc
 // consumer package.json
-"@braintied/research": "file:vendor/braintied-research-0.8.5.tgz"
+"@braintied/research": "file:vendor/braintied-research-0.8.6.tgz"
 ```
 
 ## Development

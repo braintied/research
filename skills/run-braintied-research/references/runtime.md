@@ -32,7 +32,7 @@ node skills/run-braintied-research/scripts/run-internal-research.mjs \
   --brief-file /tmp/design-brief.md \
   --kind deep \
   --max-cost-usd 5 \
-  --profile web-design-intelligence@1 \
+  --profile web-design-intelligence@2 \
   --profile-mode snapshot \
   --as-of 2026-07-22 \
   --output /tmp/design-report.md \

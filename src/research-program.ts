@@ -246,12 +246,16 @@ export async function runResearchProgram(input: RunResearchProgramInput): Promis
   if (sourceModes === undefined || sourceModes.length === 0) {
     throw new Error('At least one source mode or a profile with executable source packs is required.');
   }
+  const requiredProviders = Array.from(new Set([
+    ...(profileExecution?.requiredProviders ?? []),
+    ...(input.requiredProviders ?? []),
+  ]));
   const plan = resolveSourceExecutionPlan({
     question: input.brief,
     modes: sourceModes,
     availableProviders,
     availableTrustedAdapters: adapters.map((adapter) => adapter.id),
-    requiredProviders: input.requiredProviders,
+    requiredProviders,
     asOf: input.asOf,
     scopes: input.scopes,
   });

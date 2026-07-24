@@ -154,7 +154,7 @@ const DEFINITIONS: Record<AtomicSourceMode, SourceModeDefinition> = {
     defaultSearchOptions: { sort: 'mixed', recency_days: 365, max_pages: 1 },
     searchResultLimit: 12,
     backendPolicy: [
-      { backend: 'native_github_api', role: 'discovery', priority: 1, state: 'implemented', note: 'Free public search; optional token increases quota.' },
+      { backend: 'native_github_api', role: 'discovery', priority: 1, state: 'implemented', note: 'Free public search; dedicated public-research auth can be required by policy.' },
       { backend: 'tavily', role: 'fallback', priority: 2, state: 'implemented', note: 'Site-scoped fallback for GitHub discussions/docs not covered by REST.' },
       { backend: 'crawl4ai', role: 'acquisition', priority: 1, state: 'implemented', note: 'Fetches repository, issue, release, and discussion pages.' },
     ],
