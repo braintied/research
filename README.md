@@ -13,16 +13,16 @@ Shared deep-research engine for Braintied products (Sentigen, Swishh, ora-ai, Kr
 3. **Fetch** — pull page content (Crawl4AI → fallbacks) as markdown
 4. **Extract** — verbatim quotes + key claims per source (Gemini)
 5. **Rerank** — Voyage rerank-2 per section
-6. **Synthesize** — Claude section drafts with inline citations, cost-capped
+6. **Synthesize** — a model selects immutable evidence IDs; code inserts exact source sentences and citations, while connective inference is visibly labeled
 7. **Critique loop** — find gaps, re-plan, re-search, re-synthesize
 8. **Assemble** — final report with bibliography
-9. **Ground** — validate citation-to-evidence ratio with explicit quality and pass/fail; weak reports receive a visible warning
+9. **Ground** — validate every citation use against exact fetched evidence with explicit quality and pass/fail; weak reports receive a visible warning
 10. **Index (optional)** — hand chunks to an injected `indexSink`
 
 Higher layers (this package):
 - **Research kinds** — presets (`answer` / `quick` / `standard` / `deep` / `managed` / `social`) so callers say *what kind* of research instead of tuning knobs
 - **Source modes** — explicit, enforceable evidence lanes (`web`, `x`, `reddit`, `youtube`, `github`, `community`, `cortex`, `telegram`); required lanes compile to deterministic searches and fail coverage rather than becoming prompt prose
-- **Investigation profiles** — versioned source, coverage, verification, output, update, and data-boundary contracts; public and private recall briefs compile separately
+- **Investigation profiles** — versioned source, coverage, verification, output, update, and data-boundary contracts; coverage counts only fetched, source-validated evidence rather than search snippets, and public/private recall briefs compile separately
 - **Documents** — `generateDocument({ docType, ... })` renders research into typed structured docs: `prd`, `market-report`, `tech-spec`, `client-brief`, `content-brief`, `estimate-research`
 - **Agent skill** — `skills/run-braintied-research/` provides a safe preflight, explicit cost caps, deterministic report/metadata output, and source-verification rules for Codex and other skill-aware agents
 
@@ -42,8 +42,8 @@ All providers are raw `fetch` — no SDK dependencies. A provider is enabled whe
 | Reddit | social | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT` | free |
 | YouTube | video | `YOUTUBE_API_KEY` | free quota |
 | GitHub | repository/issues/PRs | optional `GITHUB_TOKEN` or `GH_TOKEN` | public unauthenticated access; token recommended for search quota |
-| Hacker News | forum | (none) | $0 |
-| RSS | newsletters | (none) | $0 |
+| Hacker News | forum | (none) | $0; the HN item permalink is the fetchable evidence identity and the outbound article remains metadata |
+| RSS | newsletters | (none) | $0; profiles must provide explicit verified RSS/Atom endpoints (`feedUrls`) |
 | Podcasts | podcast | `LISTENNOTES_API_KEY` | paid |
 | X (Twitter) | social | `TWITTERAPI_IO_KEY` (lower-cost primary), `X_BEARER_TOKEN` (official fallback; `TWITTER_BEARER_TOKEN` / Ora's `X_APP_BEARER_TOKEN` aliases), and/or `APIFY_API_TOKEN` (last fallback) | plan-dependent |
 | TikTok | social | `APIFY_API_TOKEN` (search + comment-rich fetch) and/or `BRIGHTDATA_API_TOKEN` (fetch fallback, ~$1.50/1k records) | paid |
@@ -236,7 +236,7 @@ npm run pack:release          # → releases/braintied-research-<version>.tgz
 
 ```jsonc
 // consumer package.json
-"@braintied/research": "file:vendor/braintied-research-0.8.3.tgz"
+"@braintied/research": "file:vendor/braintied-research-0.8.5.tgz"
 ```
 
 ## Development

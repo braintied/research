@@ -294,7 +294,8 @@ test('section synthesis requires source-near claims and exact evidence details',
   assert.match(SECTION_SYNTHESIS_SYSTEM_PROMPT, /mechanically traceable/);
   assert.match(SECTION_SYNTHESIS_SYSTEM_PROMPT, /status code/);
   assert.match(SECTION_SYNTHESIS_SYSTEM_PROMPT, /exactly as stated/);
-  assert.match(SECTION_SYNTHESIS_SYSTEM_PROMPT, /smallest sentence fully supported/);
+  assert.match(SECTION_SYNTHESIS_SYSTEM_PROMPT, /\{\{EVIDENCE:E1\}\}/);
+  assert.match(SECTION_SYNTHESIS_SYSTEM_PROMPT, /never copy, paraphrase, combine/);
 });
 
 test('runner assessment treats legacy validated plus zero matches as weak', () => {

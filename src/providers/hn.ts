@@ -56,6 +56,8 @@ const HnSearchResponseSchema = z.object({
   hits: z.array(HnHitSchema).default([]),
 });
 
+type HnHit = z.infer<typeof HnHitSchema>;
+
 // =============================================================================
 // Item (full comment tree) schema
 // =============================================================================
@@ -101,6 +103,38 @@ function toIsoString(dateStr: string): string | undefined {
 
 function hnItemUrl(objectId: string): string {
   return `https://news.ycombinator.com/item?id=${objectId}`;
+}
+
+/**
+ * HN owns the discussion evidence, so its item permalink is the canonical,
+ * fetchable identity. The linked article remains available as provenance
+ * metadata without displacing the discussion URL.
+ */
+export function searchResultFromHnHit(hit: HnHit): SearchResult | null {
+  const outboundUrl = hit.url?.trim();
+  const candidate = {
+    provider: 'hn' as const,
+    url: hnItemUrl(hit.objectID),
+    canonical_id: hit.objectID,
+    title: hit.title,
+    snippet: hit.story_text !== undefined ? hit.story_text.slice(0, 500) : '',
+    author: hit.author.length > 0 ? hit.author : undefined,
+    published_at: toIsoString(hit.created_at),
+    engagement: {
+      upvotes: hit.points,
+      comment_count: hit.num_comments,
+    },
+    raw_metadata: {
+      hn_url: hnItemUrl(hit.objectID),
+      ...(outboundUrl !== undefined && outboundUrl.length > 0
+        ? { outbound_url: outboundUrl }
+        : {}),
+      tags: hit._tags,
+    },
+  };
+
+  const validated = SearchResultSchema.safeParse(candidate);
+  return validated.success ? validated.data : null;
 }
 
 function stripHtmlTags(html: string): string {
@@ -198,33 +232,8 @@ export const hnProvider: SearchProvider = {
     const results: SearchResult[] = [];
 
     for (const hit of parsed.data.hits) {
-      // Use the external URL if present, otherwise the HN item URL
-      const url = (hit.url !== undefined && hit.url.length > 0) ? hit.url : hnItemUrl(hit.objectID);
-      const snippet = hit.story_text !== undefined ? hit.story_text.slice(0, 500) : '';
-      const publishedAt = toIsoString(hit.created_at);
-
-      const candidate = {
-        provider: 'hn' as const,
-        url,
-        canonical_id: hit.objectID,
-        title: hit.title,
-        snippet,
-        author: hit.author.length > 0 ? hit.author : undefined,
-        published_at: publishedAt,
-        engagement: {
-          upvotes: hit.points,
-          comment_count: hit.num_comments,
-        },
-        raw_metadata: {
-          hn_url: hnItemUrl(hit.objectID),
-          tags: hit._tags,
-        },
-      };
-
-      const validated = SearchResultSchema.safeParse(candidate);
-      if (validated.success) {
-        results.push(validated.data);
-      }
+      const result = searchResultFromHnHit(hit);
+      if (result !== null) results.push(result);
     }
 
     logger.info(
@@ -236,7 +245,7 @@ export const hnProvider: SearchProvider = {
   },
 
   async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
-    // Extract the HN item ID — handle both external URLs and HN item URLs
+    // Extract the HN item ID from the canonical discussion URL.
     let objectId: string | null = null;
 
     // Try HN item URL first: https://news.ycombinator.com/item?id=12345678

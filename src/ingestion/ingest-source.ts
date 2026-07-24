@@ -252,11 +252,11 @@ export async function ingestSource(
       }
       case 'rss':
       case 'podcast': {
-        // RSS provider scans feed URLs supplied via include_domains; the
+        // RSS provider scans explicit feed URLs supplied via feed_urls; the
         // identifier IS the feed URL. A blank query => match-all in the feed.
         const r = await rssProvider.search(source.topics.join(' '), {
           ...searchOpts,
-          include_domains: [source.identifier],
+          feed_urls: [source.identifier],
         });
         items = mapSearchResults(r, source.id, sourceType);
         break;

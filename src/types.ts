@@ -66,6 +66,11 @@ export const ExpectedSourceTypeSchema = z.enum([
 
 export type ExpectedSourceType = z.infer<typeof ExpectedSourceTypeSchema>;
 
+export const FeedUrlSchema = z.string().url().refine(
+  (value) => /^https?:\/\//iu.test(value),
+  'Feed URL must use HTTP or HTTPS.',
+);
+
 // =============================================================================
 // Subquery — emitted by planner, consumed by search-fanout
 // =============================================================================
@@ -90,6 +95,8 @@ export const SubquerySchema = z.object({
     sort: z.enum(['relevance', 'latest', 'top', 'new', 'comments', 'views', 'rating', 'mixed']).optional(),
     include_domains: z.array(z.string().min(1)).optional(),
     exclude_domains: z.array(z.string().min(1)).optional(),
+    /** Explicit RSS/Atom endpoints. These are never inferred from domain filters. */
+    feed_urls: z.array(FeedUrlSchema).optional(),
     communities: z.array(z.string().min(1)).optional(),
     handles: z.array(z.string().min(1)).optional(),
     channel_ids: z.array(z.string().min(1)).optional(),
@@ -215,12 +222,16 @@ export type SearchSort =
 export interface SearchOpts {
   limit?: number;                                   // top-N results
   recency_days?: number;                            // restrict to last N days
+  /** Requested evidence kinds; specialist providers use this to avoid unrelated result classes. */
+  expected_source_types?: ExpectedSourceType[];
   /** Exclude evidence newer than this timestamp (reproducible as-of runs). */
   published_before?: string;
   /** Provider-specific ranking/sampling strategy; mixed means multiple strata. */
   sort?: SearchSort;
   include_domains?: string[];
   exclude_domains?: string[];
+  /** Explicit RSS/Atom endpoints for the RSS provider. */
+  feed_urls?: string[];
   /** Reddit subreddit names (without r/), GitHub orgs, or similar scopes. */
   communities?: string[];
   /** X handles (with or without @). */

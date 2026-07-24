@@ -1,9 +1,10 @@
 /**
  * RSS Search Provider
  *
- * Discovery provider: accepts a query and scans feed URLs supplied via
- * opts.include_domains (treated as feed URLs). Filters items by title+description
- * match and returns up to 5 results per feed. No fetch() — use crawl4ai.
+ * Discovery provider: accepts a query and scans explicit RSS/Atom endpoints
+ * supplied via opts.feed_urls. Domain allowlists remain ordinary result filters
+ * and are never reinterpreted as network endpoints. Filters items by
+ * title+description match and returns up to 5 results per feed.
  */
 
 import { logger } from '../logger.js';
@@ -31,12 +32,17 @@ function toIsoString(dateStr: string | null): string | undefined {
 }
 
 /**
- * Simple word-based relevance match — returns true if at least half of the
- * meaningful query words (≥4 chars) appear in the combined title + description.
+ * Simple word-based relevance match. Planner/profile queries are intentionally
+ * descriptive, so requiring half of every term makes first-party feeds
+ * structurally return zero. Two distinct meaningful terms are enough to admit
+ * a candidate; downstream synthesis and coverage still require fetched,
+ * validated evidence.
  */
-function matchesQuery(query: string, title: string, description: string): boolean {
+export function rssItemMatchesQuery(query: string, title: string, description: string): boolean {
   const combined = `${title} ${description}`.toLowerCase();
-  const words = query.toLowerCase().split(/\s+/).filter(w => w.length >= 4);
+  const words = Array.from(new Set(
+    query.toLowerCase().split(/\s+/).filter((word) => word.length >= 4),
+  ));
 
   if (words.length === 0) {
     // Fall back to full substring match
@@ -50,7 +56,12 @@ function matchesQuery(query: string, title: string, description: string): boolea
     }
   }
 
-  return matchCount >= Math.ceil(words.length / 2);
+  return matchCount >= Math.min(2, words.length);
+}
+
+/** Keep feed configuration explicit, deterministic, and independent of domain filters. */
+export function rssFeedUrlsFromSearchOptions(opts: SearchOpts): string[] {
+  return Array.from(new Set(opts.feed_urls ?? []));
 }
 
 // =============================================================================
@@ -65,10 +76,10 @@ export const rssProvider: SearchProvider = {
   },
 
   async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
-    const feedUrls = opts.include_domains;
+    const feedUrls = rssFeedUrlsFromSearchOptions(opts);
 
-    if (feedUrls === undefined || feedUrls.length === 0) {
-      logger.warn({ query: query.slice(0, 60) }, '[RSS] No feed URLs provided in opts.include_domains');
+    if (feedUrls.length === 0) {
+      logger.warn({ query: query.slice(0, 60) }, '[RSS] No explicit feed URLs provided in opts.feed_urls');
       return [];
     }
 
@@ -88,7 +99,7 @@ export const rssProvider: SearchProvider = {
 
         for (const item of feed.items) {
           if (matchCount >= 5) break;
-          if (!matchesQuery(query, item.title, item.description)) continue;
+          if (!rssItemMatchesQuery(query, item.title, item.description)) continue;
           if (item.url.length === 0) continue;
 
           const publishedAt = toIsoString(item.publishedAt);

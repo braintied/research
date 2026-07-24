@@ -20,6 +20,7 @@ import type {
   IndexSink,
   OnPipelineUsage,
   ResearchCacheAdapter,
+  ValidatedEvidenceExcerpt,
 } from './index.js';
 import { runManagedResearch } from './managed-research.js';
 import { runAnswer } from './answer.js';
@@ -165,6 +166,12 @@ export interface KindResearchResult {
   grounding: GroundingResult | null;
   /** Search discoveries are populated by pipeline runs. */
   discoveries: SearchResult[];
+  /**
+   * Exact fetched evidence accepted by the pipeline validation boundary.
+   * Optional for patch-level compatibility with injected runners; absence is
+   * interpreted as zero accepted evidence and can never satisfy coverage.
+   */
+  validatedEvidence?: ValidatedEvidenceExcerpt[];
 }
 
 /**
@@ -193,6 +200,7 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
       costUsd: answer.costUsd,
       grounding: null,
       discoveries: [],
+      validatedEvidence: [],
     };
   }
 
@@ -209,6 +217,7 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
       costUsd: managed.costUsd,
       grounding: null,
       discoveries: [],
+      validatedEvidence: [],
     };
   }
 
@@ -244,5 +253,6 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
     costUsd: result.costUsd,
     grounding: result.grounding,
     discoveries: result.discoveries,
+    validatedEvidence: result.validatedEvidence,
   };
 }

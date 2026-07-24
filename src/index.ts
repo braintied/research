@@ -13,9 +13,14 @@ import { z } from 'zod';
 import {
   hashUrl,
   canonicalizeUrl,
+  resolveSameSourceCitationUrl,
   SearchResultSchema,
   SubquerySchema,
 } from './types.js';
+import {
+  isKeyClaimSupportedBySource,
+  isVerbatimQuoteSupportedBySource,
+} from './evidence-validation.js';
 import type {
   Subquery,
   SearchResult,
@@ -489,12 +494,23 @@ export interface RunDeepResearchResult {
   /** Deduplicated discoveries, with source-mode/source-pack lineage. */
   discoveries: SearchResult[];
   /**
+   * Exact fetched evidence that survived extraction validation. Coverage
+   * gates consume these excerpts rather than unverified search snippets.
+   */
+  validatedEvidence: ValidatedEvidenceExcerpt[];
+  /**
    * Faithfulness verdict for the assembled report (audit F2: this was
    * computed and then discarded — callers could never see, gate on, or
    * surface it). Diagnostic: the pipeline never aborts on a low ratio; the
    * CALLER decides whether to flag, retry, or reject.
    */
   grounding: GroundingResult;
+}
+
+export interface ValidatedEvidenceExcerpt {
+  source_url: string;
+  content: string;
+  kind: 'verbatim_quote' | 'key_claim';
 }
 
 /**
@@ -840,6 +856,16 @@ export async function runDeepResearch(
     bibliography: report.bibliography,
     chunks: groundingChunks,
   });
+  const validatedEvidence: ValidatedEvidenceExcerpt[] = groundingChunks.flatMap((chunk) => {
+    if (chunk.source_url === null) return [];
+    return [{
+      source_url: chunk.source_url,
+      content: chunk.content,
+      kind: chunk.metadata['grounding_basis'] === 'verbatim_quote'
+        ? 'verbatim_quote' as const
+        : 'key_claim' as const,
+    }];
+  });
   log.info(
     { ratio: grounding.ratio, valid: grounding.valid_citations, total: grounding.total_citations },
     '[runDeepResearch] Grounding validation complete',
@@ -894,6 +920,7 @@ export async function runDeepResearch(
     quotes: allQuotes,
     costUsd: costTracker.total(),
     discoveries: allDiscoveries,
+    validatedEvidence,
     grounding,
   };
 }
@@ -905,6 +932,22 @@ export async function runDeepResearch(
 type EnabledProviders = ReturnType<typeof getEnabledProviders>;
 
 const CachedSearchResultsSchema = z.array(SearchResultSchema);
+
+/**
+ * Required/seeded searches are a locked source contract. Planner routing may
+ * broaden an ordinary generated subquery, but it must never inject a web
+ * provider into a source pack that explicitly requires HN/RSS/podcasts (or
+ * any other specialist lane).
+ */
+export function providersForSubquery(subquery: Subquery): ProviderName[] {
+  const providerNames = new Set<ProviderName>(subquery.providers);
+  if (!subquery.required && subquery.source_pack_id === undefined) {
+    for (const providerName of routeProvidersForSourceTypes(subquery.expected_source_types)) {
+      providerNames.add(providerName);
+    }
+  }
+  return Array.from(providerNames);
+}
 
 /**
  * Search one provider for one subquery — cache-aware, cost-recorded (audit
@@ -924,6 +967,7 @@ async function searchOneProvider(
     ...runSearchOptions,
     ...providerSearchOptions?.[providerName],
     ...subquery.search_options,
+    expected_source_types: subquery.expected_source_types,
     limit: subquery.search_options.limit ?? SEARCH_RESULT_LIMIT,
   };
   const cacheIdentity = JSON.stringify({
@@ -938,10 +982,12 @@ async function searchOneProvider(
       sort: effectiveOptions.sort ?? null,
       include_domains: effectiveOptions.include_domains ?? [],
       exclude_domains: effectiveOptions.exclude_domains ?? [],
+      feed_urls: effectiveOptions.feed_urls ?? [],
       communities: effectiveOptions.communities ?? [],
       handles: effectiveOptions.handles ?? [],
       channel_ids: effectiveOptions.channel_ids ?? [],
       max_pages: effectiveOptions.max_pages ?? null,
+      expected_source_types: effectiveOptions.expected_source_types ?? [],
     },
   });
   const cacheKey = `search:${providerName}:${hashUrl(cacheIdentity)}`;
@@ -1047,10 +1093,7 @@ async function runSearch(
     subqueries,
     4,
     async (subquery): Promise<SearchResult[]> => {
-      const providerNames = new Set<ProviderName>(subquery.providers);
-      for (const pn of routeProvidersForSourceTypes(subquery.expected_source_types)) {
-        providerNames.add(pn);
-      }
+      const providerNames = providersForSubquery(subquery);
 
       interface TierEntry {
         name: ProviderName;
@@ -1384,7 +1427,28 @@ async function extractQuotes(
         });
       }
 
-      const quotes = extracted.verbatim_quotes;
+      // Provider-native extractors cross the same immutable evidence boundary
+      // as Gemini. Nothing becomes synthesis or coverage evidence unless it is
+      // one complete sentence/line from the fetched source. Quote URLs are
+      // normalized back to the fetched source (or a same-source anchor) so an
+      // extractor cannot redirect provenance to an unrelated page.
+      const quotes = extracted.verbatim_quotes
+        .filter((quote) => isVerbatimQuoteSupportedBySource(quote.quote, markdown))
+        .map((quote) => ({
+          ...quote,
+          source_url: resolveSameSourceCitationUrl(result.url, quote.source_url),
+        }));
+      const claims = extracted.key_claims.filter((claim) =>
+        isKeyClaimSupportedBySource(claim, markdown));
+      const droppedEvidence =
+        (extracted.verbatim_quotes.length - quotes.length) +
+        (extracted.key_claims.length - claims.length);
+      if (droppedEvidence > 0) {
+        log.warn(
+          { url: result.url.slice(0, 80), droppedEvidence },
+          '[runDeepResearch] Dropped source-unsupported extracted evidence',
+        );
+      }
       sourceQuotesByUrl[result.url] = quotes;
 
       for (const [sectionPath, sectionUrls] of sectionToUrls.entries()) {
@@ -1400,7 +1464,7 @@ async function extractQuotes(
         if (claimsBySection[sectionPath] === undefined) {
           claimsBySection[sectionPath] = [];
         }
-        for (const claim of extracted.key_claims) {
+        for (const claim of claims) {
           claimsBySection[sectionPath].push({
             claim,
             source_url: result.url,
@@ -1441,7 +1505,8 @@ async function synthesizeSections(
     if (sectionGoals[subquery.section_path] === undefined) {
       sectionGoals[subquery.section_path] = [];
     }
-    if (subquery.rationale.length > 0) {
+    if (subquery.rationale.length > 0
+        && !sectionGoals[subquery.section_path].includes(subquery.rationale)) {
       sectionGoals[subquery.section_path].push(subquery.rationale);
     }
   }

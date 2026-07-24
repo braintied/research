@@ -130,6 +130,10 @@ model providers; treat every brief as outbound data.
    Treat `grounding.passed: false`, `grounding_quality: weak`, or
    `grounding_quality: ungrounded` as an explicit verification failure; do not
    present those reports as source-verified even if the execution succeeded.
+   Treat prose explicitly labeled `Editorial synthesis — inference, not
+   source-validated` as analysis, never as a supported source claim. Profile
+   coverage counts only fetched, exact evidence; search snippets cannot satisfy
+   a required lane.
 7. **Deliver with provenance.** State the research date, kind, engine, actual
    cost, grounding status, known gaps, and which important claims remain
    unverified. For source-mode runs, also state requested modes, per-lane

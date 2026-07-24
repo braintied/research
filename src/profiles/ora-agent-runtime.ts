@@ -44,6 +44,7 @@ export const ORA_AGENT_RUNTIME_PROFILE = ResearchProfileSchema.parse({
       executionMode: 'web',
       providers: ['tavily', 'searxng', 'rss'], expectedSourceTypes: ['documentation'],
       includeDomains: ['inngest.com', 'openclaw.ai', 'temporal.io', 'restate.dev', 'dbos.dev', 'trigger.dev', 'docs.langchain.com', 'pydantic.dev'],
+      feedUrls: ['https://temporal.io/blog/feed.xml'],
       queryHints: [
         'durable agents dynamic workflow graph deterministic replay',
         'task flow background tasks approvals resume cancellation revision conflicts',
@@ -60,6 +61,7 @@ export const ORA_AGENT_RUNTIME_PROFILE = ResearchProfileSchema.parse({
       providers: ['tavily', 'searxng', 'rss'],
       expectedSourceTypes: ['longform', 'academic', 'documentation'],
       includeDomains: ['anthropic.com', 'openai.com', 'developers.openai.com', 'metr.org', 'opentelemetry.io', 'genai.owasp.org', 'nist.gov', 'arxiv.org'],
+      feedUrls: ['https://openai.com/news/rss.xml'],
       queryHints: [
         'effective harnesses long-running agents persistent workspace verification',
         'multi-agent research token cost parallelism evaluation',
@@ -121,6 +123,7 @@ export const ORA_AGENT_RUNTIME_PROFILE = ResearchProfileSchema.parse({
       lane: 'community', visibility: 'public', transport: 'external_search',
       executionMode: 'community', providers: ['hn', 'rss', 'podcasts'],
       expectedSourceTypes: ['forum', 'newsletter', 'podcast'],
+      feedUrls: ['https://www.latent.space/feed', 'https://simonwillison.net/atom/everything/'],
       queryHints: ['agent orchestration graphs loops durable workflows production', 'long-running coding agents harness reliability'],
       recencyDays: 365,
     },
