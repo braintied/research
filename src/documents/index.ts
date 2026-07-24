@@ -14,7 +14,7 @@ import { z } from 'zod';
 import { synthesisGenerate } from '../synthesis.js';
 import { runResearch } from '../kinds.js';
 import type { KindResearchResult, ResearchKind } from '../kinds.js';
-import { logger as defaultLogger } from '../logger.js';
+import { safeLogger } from '../logger.js';
 import type { Logger } from '../logger.js';
 import { deepResearchSynthesisCostUsd } from '../depth-config.js';
 import type { FinalReport } from '../types.js';
@@ -121,7 +121,7 @@ export async function generateDocument<T extends DocType>(
 export async function generateDocument(
   input: GenerateDocumentInput,
 ): Promise<GenerateDocumentResult> {
-  const log: Logger = input.logger !== undefined ? input.logger : defaultLogger;
+  const log: Logger = safeLogger(input.logger);
   const definition = DOC_TYPE_REGISTRY[input.docType];
   const model = input.model !== undefined ? input.model : DEFAULT_DOC_MODEL;
 

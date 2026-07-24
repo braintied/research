@@ -9,10 +9,13 @@ import { z } from 'zod';
 import { getGeminiKey, fetchWithRetry, EXTRACTION_MODEL } from '../pipeline-core.js';
 import {
   ExtractedQuotesSchema,
-  resolveSameSourceCitationUrl,
   type ExtractedQuotes,
   type ProviderName,
 } from '../types.js';
+import {
+  isKeyClaimSupportedBySource,
+  isVerbatimQuoteSupportedBySource,
+} from '../evidence-validation.js';
 import { logger } from '../logger.js';
 
 // =============================================================================
@@ -49,8 +52,6 @@ const GeminiResponseEnvelopeSchema = z.object({
 // =============================================================================
 
 const SENTIMENT_VALUES = ['positive', 'negative', 'neutral', 'mixed'] as const;
-type QuoteSentiment = (typeof SENTIMENT_VALUES)[number];
-const SENTIMENT_VALUE_SET = new Set<string>(SENTIMENT_VALUES);
 
 const RawQuoteSchema = z.object({
   quote: z.string().min(1),
@@ -88,66 +89,20 @@ function stringEntries(value: unknown): string[] {
   return value.filter((entry): entry is string => typeof entry === 'string');
 }
 
-function normalizeSentiment(value: unknown): QuoteSentiment | undefined {
-  if (typeof value !== 'string') return undefined;
-  const normalized = value.trim().toLowerCase();
-  return SENTIMENT_VALUE_SET.has(normalized) ? normalized as QuoteSentiment : undefined;
-}
-
-function optionalString(value: unknown): string | undefined {
-  return typeof value === 'string' ? value : undefined;
-}
-
-function optionalPublishedAt(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  return z.string().datetime({ offset: true }).safeParse(value).success ? value : undefined;
-}
-
-function sanitizedEngagement(value: unknown): {
-  upvotes?: number;
-  likes?: number;
-  replies?: number;
-  views?: number;
-} {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return {};
-  const record = value as Record<string, unknown>;
-  const engagement: { upvotes?: number; likes?: number; replies?: number; views?: number } = {};
-  for (const key of ['upvotes', 'likes', 'replies', 'views'] as const) {
-    const candidate = record[key];
-    if (typeof candidate === 'number' && Number.isFinite(candidate)) engagement[key] = candidate;
-  }
-  return engagement;
-}
-
-const ANCHORED_SOURCE_MODES = new Set<GeminiExtractInput['mode']>(['reddit', 'youtube', 'hn']);
-
-/**
- * Bind model-returned quote URLs to the page that was actually fetched.
- * Long-form/SERP evidence always cites that parent page. Thread/video modes
- * may preserve a fragment (comment/timestamp), but only when resolving the
- * candidate produces the same origin and canonical source as the parent.
- */
-function validatedQuoteSourceUrl(input: GeminiExtractInput, candidate: unknown): string {
-  if (!ANCHORED_SOURCE_MODES.has(input.mode) || typeof candidate !== 'string' || candidate.length === 0) {
-    return input.url;
-  }
-  return resolveSameSourceCitationUrl(input.url, candidate);
-}
-
 function parseRawQuote(value: unknown, input: GeminiExtractInput): z.infer<typeof RawQuoteSchema> | null {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   if (typeof record.quote !== 'string' || record.quote.trim().length === 0) return null;
 
+  const rawContext = typeof record.context === 'string' ? record.context : '';
   const candidate = {
     quote: record.quote,
-    context: typeof record.context === 'string' ? record.context : '',
-    source_url: validatedQuoteSourceUrl(input, record.source_url),
-    author: optionalString(record.author),
-    published_at: optionalPublishedAt(record.published_at),
-    engagement: sanitizedEngagement(record.engagement),
-    sentiment: normalizeSentiment(record.sentiment),
-    category: optionalString(record.category),
+    // Context is retained only when it is itself exact source text. Model
+    // authorship, dates, engagement, sentiment, categories, and anchors are
+    // not source facts and therefore never cross this normalization boundary.
+    context: isVerbatimQuoteSupportedBySource(rawContext, input.content) ? rawContext : '',
+    source_url: input.url,
+    engagement: {},
   };
   const parsed = RawQuoteSchema.safeParse(candidate);
   return parsed.success ? parsed.data : null;
@@ -173,15 +128,30 @@ export function normalizeGeminiExtractionPayload(
   const rawQuotes = Array.isArray(rawResult.data.verbatim_quotes)
     ? rawResult.data.verbatim_quotes
     : [];
-  const validQuotes = rawQuotes.flatMap((quote) => {
+  const structurallyValidQuotes = rawQuotes.flatMap((quote) => {
     const parsedQuote = parseRawQuote(quote, input);
     return parsedQuote === null ? [] : [parsedQuote];
   });
+  const validQuotes = structurallyValidQuotes.filter((quote) => (
+    isVerbatimQuoteSupportedBySource(quote.quote, input.content)
+  ));
   const droppedQuotes = rawQuotes.length - validQuotes.length;
   if (droppedQuotes > 0) {
     logger.warn(
       { url: input.url, dropped_quotes: droppedQuotes },
-      '[GeminiExtractor] Dropped malformed quote entries',
+      '[GeminiExtractor] Dropped malformed or source-unsupported quote entries',
+    );
+  }
+
+  const rawClaims = stringEntries(rawResult.data.key_claims);
+  const validClaims = rawClaims.filter((claim) => (
+    isKeyClaimSupportedBySource(claim, input.content)
+  ));
+  const droppedClaims = rawClaims.length - validClaims.length;
+  if (droppedClaims > 0) {
+    logger.warn(
+      { url: input.url, dropped_claims: droppedClaims },
+      '[GeminiExtractor] Dropped source-unsupported key claims',
     );
   }
 
@@ -194,11 +164,11 @@ export function normalizeGeminiExtractionPayload(
           candidate_tokens: usageMeta.candidatesTokenCount,
         }
       : undefined,
-    key_claims: stringEntries(rawResult.data.key_claims),
+    key_claims: validClaims,
     verbatim_quotes: validQuotes,
-    dates_mentioned: stringEntries(rawResult.data.dates_mentioned),
-    entities_mentioned: stringEntries(rawResult.data.entities_mentioned),
-    themes: stringEntries(rawResult.data.themes),
+    dates_mentioned: [],
+    entities_mentioned: [],
+    themes: [],
   };
 
   const final = ExtractedQuotesSchema.safeParse(assembled);
@@ -368,7 +338,7 @@ export async function extractQuotesWithGemini(input: GeminiExtractInput): Promis
   const geminiKey = getGeminiKey();
   const prompt = buildPrompt(input);
 
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${EXTRACTION_MODEL}:generateContent?key=${geminiKey}`;
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${EXTRACTION_MODEL}:generateContent`;
 
   let rawJson: unknown;
 
@@ -377,7 +347,10 @@ export async function extractQuotesWithGemini(input: GeminiExtractInput): Promis
       geminiUrl,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': geminiKey,
+        },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: {
@@ -392,8 +365,7 @@ export async function extractQuotesWithGemini(input: GeminiExtractInput): Promis
     );
 
     if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`Gemini API error: ${response.status} ${body.slice(0, 200)}`);
+      throw new Error(`Gemini API error: ${response.status}`);
     }
 
     rawJson = await response.json();

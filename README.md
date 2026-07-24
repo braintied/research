@@ -37,7 +37,7 @@ All providers are raw `fetch` — no SDK dependencies. A provider is enabled whe
 | Tavily | search | `TAVILY_API_KEY` | quality tier, ~$8/1k |
 | Exa | search (semantic) | `EXA_API_KEY` | $7/1k, 1k free/mo |
 | SerpAPI | SERP + ads/PAA | `SERPAPI_KEY` | paid |
-| Crawl4AI (self-hosted) | fetch | `CRAWL4AI_URL` (default `https://ora-scraper.fly.dev`) | $0 |
+| Crawl4AI (self-hosted) | fetch | reviewed domains plus an egress-hardened crawler attestation | $0 |
 | Jina Reader | fetch fallback | `JINA_API_KEY` | free tier |
 | Reddit | social | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT` | free |
 | YouTube | video | `YOUTUBE_API_KEY` | free quota |
@@ -65,6 +65,18 @@ name; the local runner also accepts `--gemini-key-name` and reports the selected
 name without printing its value.
 
 > Env naming is standardized here — `SERPAPI_KEY` (not `SERP_API_KEY`), `SERPER_API_KEY`, `SEARXNG_URLS`.
+
+Generic web fetches are fail-closed. The package accepts only public HTTP(S)
+targets on the standard port, pins each DNS-validated connection, revalidates
+every redirect, blocks private/link-local/reserved IPv4 and IPv6, and enforces
+content-type and byte limits. The self-hosted Crawl4AI service is additionally
+deny-by-default because a separate browser process cannot inherit the caller's
+pinned DNS result. It remains disabled unless the separate crawler enforces
+public-only DNS/IP checks on every navigation, redirect, and subresource and
+the caller sets `BRAINTIED_CRAWL4AI_NETWORK_GUARD=enforced-v1` to attest that
+boundary. `BRAINTIED_CRAWL4AI_ALLOWED_DOMAINS` is a second, comma-separated,
+human-reviewed gate: entries are exact hosts, while `*.example.com` explicitly
+allows subdomains. An allowlist alone is not an SSRF defense.
 
 Instagram has a stricter boundary than the general web-fetch stack. Hashtag
 search uses Bright Data snapshot discovery; direct `/p/`, `/reel/`, and `/tv/`

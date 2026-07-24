@@ -8,14 +8,15 @@
  *   1. Extract all [^N] markers + the sentence containing each marker
  *   2. Look up bibliography[N-1] to resolve source_url
  *   3. Find chunks where chunk.source_url === source_url
- *   4. Accept either strong 3-gram overlap or conservative content-token
- *      overlap with exact numeric consistency (for faithful paraphrases)
+ *   4. Accept only a material citation sentence that matches one complete
+ *      punctuation-preserving evidence sentence/line
  *   5. Return ratio + per-citation diagnostics
  *
  * Pure TS, no external deps.
  */
 
 import { resolveSameSourceCitationUrl } from './types.js';
+import { isKeyClaimSupportedBySource } from './evidence-validation.js';
 import type {
   FinalReport,
   ProviderName,
@@ -204,46 +205,7 @@ function extractCitationWindows(
 }
 
 /**
- * Build 3-word phrases (trigrams) from a text string.
- * Returns an array of lower-cased trigrams.
- */
-function buildTrigrams(text: string): string[] {
-  const words = text
-    .toLowerCase()
-    // Citation markers are markup, not content — stripped whole so their
-    // digits don't pollute trigrams in citation-dense windows.
-    .replace(/\[\^\d+\]/g, ' ')
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .trim()
-    .split(/\s+/)
-    .filter((w) => w.length > 0);
-
-  if (words.length < 3) {
-    // Fall back to bigrams or unigrams if text is very short
-    return words;
-  }
-
-  const trigrams: string[] = [];
-  for (let i = 0; i <= words.length - 3; i++) {
-    const w0 = words[i];
-    const w1 = words[i + 1];
-    const w2 = words[i + 2];
-    if (w0 !== undefined && w1 !== undefined && w2 !== undefined) {
-      trigrams.push(`${w0} ${w1} ${w2}`);
-    }
-  }
-  return trigrams;
-}
-
-/**
- * Check if ≥60% of the claim trigrams appear in the chunk content.
- */
-/**
- * Normalize text for trigram substring matching — same transform as
- * buildTrigrams' word stream. Both sides MUST be normalized identically:
- * matching normalized word-trigrams against RAW text (the original
- * behavior) silently fails on any trigram straddling punctuation or a
- * citation marker, structurally deflating every ratio.
+ * Normalize text for stable evidence identities.
  */
 function normalizeForMatch(text: string): string {
   return text
@@ -254,148 +216,12 @@ function normalizeForMatch(text: string): string {
     .trim();
 }
 
-function directionalTrigramRatio(needleText: string, haystackText: string): number {
-  const needleTrigrams = buildTrigrams(needleText);
-  if (needleTrigrams.length === 0) {
-    return 0;
-  }
-
-  const haystackNormalized = normalizeForMatch(haystackText);
-  let matched = 0;
-  for (const trigram of needleTrigrams) {
-    if (haystackNormalized.includes(trigram)) {
-      matched++;
-    }
-  }
-  return matched / needleTrigrams.length;
-}
-
-/**
- * Bidirectional trigram overlap between a citation's ±200-char claim window
- * and a chunk (verbatim quote).
- *
- * Forward (window→chunk) alone was structurally near-zero: the window is
- * dominated by the model's own prose, so even a correctly-cited verbatim
- * quote drowned in paraphrase. The reverse direction (chunk→window) measures
- * the right thing for short quotes embedded in longer prose: what fraction of
- * the QUOTE's content appears near the citation. Take the max.
- */
-function trigramMatchRatio(claimText: string, chunkContent: string): number {
-  const forward = directionalTrigramRatio(claimText, chunkContent);
-  const reverse = directionalTrigramRatio(chunkContent, claimText);
-  return Math.max(forward, reverse);
-}
-
-const TRIGRAM_MATCH_THRESHOLD = 0.6;
-
-const CONTENT_STOP_WORDS = new Set([
-  'a', 'about', 'after', 'again', 'against', 'all', 'also', 'an', 'and', 'any',
-  'are', 'as', 'at', 'be', 'because', 'been', 'before', 'being', 'between',
-  'both', 'but', 'by', 'can', 'could', 'did', 'do', 'does', 'doing', 'during',
-  'each', 'for', 'from', 'further', 'had', 'has', 'have', 'having', 'he', 'her',
-  'here', 'hers', 'herself', 'him', 'himself', 'his', 'how', 'i', 'if', 'in',
-  'into', 'is', 'it', 'its', 'itself', 'just', 'may', 'me', 'more', 'most',
-  'my', 'myself', 'no', 'nor', 'not', 'now', 'of', 'off', 'on', 'once', 'only',
-  'or', 'other', 'our', 'ours', 'ourselves', 'out', 'over', 'own', 'same', 'she',
-  'should', 'so', 'some', 'such', 'than', 'that', 'the', 'their', 'theirs',
-  'them', 'themselves', 'then', 'there', 'these', 'they', 'this', 'those',
-  'through', 'to', 'too', 'under', 'until', 'up', 'very', 'was', 'we', 'were',
-  'what', 'when', 'where', 'which', 'while', 'who', 'whom', 'why', 'will',
-  'with', 'would', 'you', 'your', 'yours', 'yourself', 'yourselves',
-]);
-
-function stemContentToken(token: string): string {
-  if (/\d/.test(token) || token.includes('/') || token.includes(':')) return token;
-  if (token.length > 6 && token.endsWith('ies')) return `${token.slice(0, -3)}y`;
-  if (token.length > 6 && token.endsWith('ing')) return token.slice(0, -3);
-  if (token.length > 5 && token.endsWith('ed')) return token.slice(0, -2);
-  if (token.length > 5 && token.endsWith('es')) return token.slice(0, -2);
-  if (token.length > 4 && token.endsWith('s')) return token.slice(0, -1);
-  return token;
-}
-
-function buildContentTokenSet(text: string): Set<string> {
-  const withoutCitations = text.toLowerCase().replace(/\[\^\d+\]/g, ' ');
-  const tokens = withoutCitations.match(/[a-z0-9]+(?:[./:-][a-z0-9]+)*/g) ?? [];
-  const result = new Set<string>();
-  for (const rawToken of tokens) {
-    const token = stemContentToken(rawToken);
-    if (CONTENT_STOP_WORDS.has(token)) continue;
-    if (token.length < 2 && !/\d/.test(token)) continue;
-    result.add(token);
-  }
-  return result;
-}
-
-function buildNumberSet(text: string): Set<string> {
-  const withoutCitations = text
-    .replace(/\[\^\d+\]/g, ' ')
-    .replace(/(\d+(?:[.,]\d+)*)\s+percent\b/gi, '$1%');
-  const matches = withoutCitations.match(/\d+(?:[.,]\d+)*(?:%|\b)/g) ?? [];
-  return new Set(matches.map((value) => value.replace(/,/g, '')));
-}
-
-function setsEqual<T>(left: Set<T>, right: Set<T>): boolean {
-  if (left.size !== right.size) return false;
-  for (const value of left) {
-    if (!right.has(value)) return false;
-  }
-  return true;
-}
-
-/**
- * Conservative bag-of-content-words match for paraphrases.
- *
- * This is deliberately an additional high bar, not a lower trigram threshold:
- * - at least four meaningful tokens (or every token for a short claim) match;
- * - both the shorter and longer text need substantial coverage;
- * - at least two matched tokens must be distinctive; and
- * - every number/version/percentage must agree exactly.
- *
- * Numeric consistency is important: a sentence that changes 91% to 81% must
- * not pass merely because the surrounding prose is similar.
- */
-function contentTokenMatchRatio(claimText: string, evidenceText: string): number {
-  const claimTokens = buildContentTokenSet(claimText);
-  const evidenceTokens = buildContentTokenSet(evidenceText);
-  if (claimTokens.size === 0 || evidenceTokens.size === 0) return 0;
-
-  if (!setsEqual(buildNumberSet(claimText), buildNumberSet(evidenceText))) {
-    return 0;
-  }
-
-  const shared = new Set<string>();
-  for (const token of claimTokens) {
-    if (evidenceTokens.has(token)) shared.add(token);
-  }
-
-  const shorterSize = Math.min(claimTokens.size, evidenceTokens.size);
-  const longerSize = Math.max(claimTokens.size, evidenceTokens.size);
-  const requiredShared = shorterSize <= 3 ? shorterSize : 4;
-  if (shared.size < requiredShared) return 0;
-
-  const distinctiveShared = Array.from(shared).filter(
-    (token) => token.length >= 5 || /\d/.test(token) || token.includes('/') || token.includes(':'),
-  ).length;
-  if (distinctiveShared < Math.min(2, requiredShared)) return 0;
-
-  const shorterCoverage = shared.size / shorterSize;
-  const longerCoverage = shared.size / longerSize;
-  if (shorterCoverage < 0.7 || longerCoverage < 0.4) return 0;
-
-  return shorterCoverage * 0.65 + longerCoverage * 0.35;
-}
-
 function evidenceMatchRatio(claimText: string, evidenceText: string): number {
-  // Apply numeric consistency to every matching strategy, including otherwise
-  // high verbatim overlap. This closes the classic "91%" → "81%" mutation.
-  if (!setsEqual(buildNumberSet(claimText), buildNumberSet(evidenceText))) {
-    return 0;
-  }
-  return Math.max(
-    trigramMatchRatio(claimText, evidenceText),
-    contentTokenMatchRatio(claimText, evidenceText),
-  );
+  const claimWithoutCitations = claimText.replace(/\[\^\d+\]/gu, ' ');
+  const claimTokens = normalizeForMatch(claimWithoutCitations).split(' ').filter(Boolean);
+  const evidenceTokens = normalizeForMatch(evidenceText).split(' ').filter(Boolean);
+  if (claimTokens.length < 4 || evidenceTokens.length < 4) return 0;
+  return isKeyClaimSupportedBySource(claimWithoutCitations, evidenceText) ? 1 : 0;
 }
 
 /**
@@ -485,7 +311,7 @@ export function validateGrounding(input: ValidateGroundingInput): GroundingResul
         if (matchRatio > bestRatio) {
           bestRatio = matchRatio;
         }
-        if (matchRatio >= TRIGRAM_MATCH_THRESHOLD) {
+        if (matchRatio === 1) {
           foundMatch = true;
           break;
         }

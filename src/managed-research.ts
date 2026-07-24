@@ -13,7 +13,7 @@
  */
 
 import { z } from 'zod';
-import { logger as defaultLogger } from './logger.js';
+import { safeLogger } from './logger.js';
 import type { Logger } from './logger.js';
 import { PERPLEXITY_API_URL, getPerplexityApiKey } from './providers/perplexity.js';
 import { FinalReportSchema } from './types.js';
@@ -93,7 +93,7 @@ export interface RunManagedResearchResult {
 export async function runManagedResearch(
   input: RunManagedResearchInput,
 ): Promise<RunManagedResearchResult> {
-  const log: Logger = input.logger !== undefined ? input.logger : defaultLogger;
+  const log: Logger = safeLogger(input.logger);
   const apiKey = getPerplexityApiKey();
   const timeoutMs = input.timeoutMs !== undefined ? input.timeoutMs : 600_000;
 

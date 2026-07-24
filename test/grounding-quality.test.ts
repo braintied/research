@@ -144,12 +144,12 @@ test('grounding falls back to the fetched parent for a cross-source quote URL', 
   assert.equal(chunks[0]?.source_url, parentUrl);
 });
 
-test('a conservative paraphrase of a source-bound key claim validates without lowering the threshold', () => {
+test('a complete source-bound key claim validates', () => {
   const chunks = buildGroundingEvidenceChunks({
     sourceQuotesByUrl: {},
     claimsBySection: {
       'A.1': [{
-        claim: 'WCAG 2.2 was approved as ISO/IEC 40500:2025, an international standard.',
+        claim: 'The international standards body formally recognizes WCAG 2.2 under ISO/IEC 40500:2025.',
         source_url: 'https://docs.example/source',
         provider: 'searxng',
       }],
@@ -164,6 +164,43 @@ test('a conservative paraphrase of a source-bound key claim validates without lo
   assert.equal(result.ratio, 1);
   assert.equal(result.quality, 'strong');
   assert.equal(result.passed, true);
+});
+
+test('tiny reverse evidence cannot validate a much larger fabricated claim', () => {
+  const result = validateGrounding({
+    fullMarkdown: 'The FDA approved a miracle cancer cure with no side effects [^1].',
+    bibliography,
+    chunks: [quoteChunk('approved')],
+  });
+
+  assert.equal(result.ratio, 0);
+  assert.equal(result.quality, 'weak');
+  assert.equal(result.passed, false);
+});
+
+test('role and predicate reversals cannot validate through shared vocabulary', () => {
+  for (const [claim, evidence] of [
+    [
+      'Bob sold the rare ceremonial artifact to Alice in London yesterday after a private appraisal',
+      'Alice sold the rare ceremonial artifact to Bob in London yesterday after a private appraisal',
+    ],
+    [
+      'The council rejected the comprehensive accessibility standard after extensive independent review by five experts',
+      'The council approved the comprehensive accessibility standard after extensive independent review by five experts',
+    ],
+    [
+      'Treatment B outperformed Treatment A in every measured cohort during the controlled clinical evaluation',
+      'Treatment A outperformed Treatment B in every measured cohort during the controlled clinical evaluation',
+    ],
+  ]) {
+    const result = validateGrounding({
+      fullMarkdown: `${claim} [^1].`,
+      bibliography,
+      chunks: [quoteChunk(evidence)],
+    });
+    assert.equal(result.ratio, 0, claim);
+    assert.equal(result.passed, false, claim);
+  }
 });
 
 test('lexically similar evidence cannot validate a changed number', () => {
@@ -209,8 +246,8 @@ test('source-near wording for the canary evidence is verifiable with its exact s
     'answer that is completely wrong for your domain.';
   const result = validateGrounding({
     fullMarkdown:
-      'Traditional software has well-defined pass/fail criteria, while AI systems have none by default; ' +
-      'an LLM can return a 200 response and still hallucinate or contradict its own context [^1].',
+      'An LLM can return a 200 response in under a second and still hallucinate, contradict its own context, ' +
+      'leak PII, or give a technically correct answer that is completely wrong for your domain [^1].',
     bibliography,
     chunks: [quoteChunk(evidence)],
   });

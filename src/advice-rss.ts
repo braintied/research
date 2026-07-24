@@ -13,6 +13,7 @@
  */
 
 import { logger } from './logger.js';
+import { fetchPublicText } from './public-http.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -287,19 +288,27 @@ export async function fetchRssFeed(
   };
 
   try {
-    const response = await fetch(feedUrl, {
+    const response = await fetchPublicText(feedUrl, {
+      acceptedContentTypes: [
+        'application/atom+xml',
+        'application/rss+xml',
+        'application/xml',
+        'text/plain',
+        'text/xml',
+      ],
       headers: {
         'User-Agent': 'OraResearch/1.0 (advice-pipeline; contact: team@braintied.com)',
         'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
       },
-      signal: AbortSignal.timeout(20000),
+      maxBytes: 5_000_000,
+      timeoutMs: 20_000,
     });
 
     if (!response.ok) {
       return { ...empty, error: `Feed returned ${response.status}` };
     }
 
-    const xml = await response.text();
+    const xml = response.text;
 
     if (xml.length < 100) {
       return { ...empty, error: 'Feed response too short' };

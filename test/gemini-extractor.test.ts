@@ -2,7 +2,23 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { normalizeGeminiExtractionPayload } from '../src/providers/gemini-extractor.js';
+import { buildGroundingEvidenceChunks, validateGrounding } from '../src/grounding.js';
 import type { GeminiExtractInput } from '../src/providers/gemini-extractor.js';
+
+const DEFAULT_SOURCE_CONTENT = [
+  'The source documents the behavior.',
+  'Unknown labels do not destroy this quote.',
+  'Mixed-case labels normalize safely.',
+  'A valid claim survives.',
+  'A second valid claim survives.',
+  'A valid sibling survives.',
+  'Malformed optional metadata is omitted, not fatal.',
+  'A model-selected anchor cannot replace the long-form parent.',
+  'A safe timestamp anchor is preserved.',
+  'A safe relative timestamp anchor is preserved.',
+  'A cross-origin URL is rejected.',
+  'A different same-origin video is rejected.',
+].join('\n');
 
 function extractFixture(
   payload: Record<string, unknown>,
@@ -13,7 +29,7 @@ function extractFixture(
     {
       provider: 'tavily',
       url: 'https://docs.example/article',
-      content: 'Offline fixture content.',
+      content: DEFAULT_SOURCE_CONTENT,
       mode: 'longform',
       ...input,
     },
@@ -21,7 +37,7 @@ function extractFixture(
   );
 }
 
-test('unknown sentiment is omitted and valid sentiment is normalized case-insensitively', () => {
+test('model-inferred quote metadata is discarded even when it looks well formed', () => {
   const result = extractFixture({
     key_claims: ['The source documents the behavior.'],
     verbatim_quotes: [
@@ -40,7 +56,9 @@ test('unknown sentiment is omitted and valid sentiment is normalized case-insens
 
   assert.equal(result.verbatim_quotes.length, 2);
   assert.equal(result.verbatim_quotes[0]?.sentiment, undefined);
-  assert.equal(result.verbatim_quotes[1]?.sentiment, 'positive');
+  assert.equal(result.verbatim_quotes[1]?.sentiment, undefined);
+  assert.equal(result.verbatim_quotes[1]?.category, undefined);
+  assert.deepEqual(result.verbatim_quotes[1]?.engagement, {});
 });
 
 test('one malformed quote or optional field cannot erase valid siblings and key claims', () => {
@@ -84,7 +102,187 @@ test('one malformed quote or optional field cannot erase valid siblings and key 
   assert.equal(result.verbatim_quotes[1]?.category, undefined);
 });
 
-test('long-form citations are always bound to the fetched parent URL', () => {
+test('a fabricated quote and claim from an unrelated source cannot circularly pass grounding', () => {
+  const sourceUrl = 'https://docs.example/article';
+  const fabricatedClaim = 'The platform guarantees a 91% reduction in checkout failures.';
+  const extracted = extractFixture({
+    key_claims: [fabricatedClaim],
+    verbatim_quotes: [{
+      quote: fabricatedClaim,
+      source_url: sourceUrl,
+      sentiment: 'positive',
+    }],
+  }, {
+    url: sourceUrl,
+    content: 'This source discusses orchard irrigation schedules and soil moisture.',
+  });
+
+  assert.deepEqual(extracted.key_claims, []);
+  assert.deepEqual(extracted.verbatim_quotes, []);
+
+  const chunks = buildGroundingEvidenceChunks({
+    sourceQuotesByUrl: { [sourceUrl]: extracted.verbatim_quotes },
+    claimsBySection: {
+      'A.1': extracted.key_claims.map((claim) => ({
+        claim,
+        source_url: sourceUrl,
+        provider: 'tavily',
+      })),
+    },
+  });
+  const grounding = validateGrounding({
+    fullMarkdown: `${fabricatedClaim} [^1].`,
+    bibliography: [{
+      citation_anchor: '[^1]',
+      source_url: sourceUrl,
+      title: 'Unrelated source',
+      author: '',
+      provider: 'tavily',
+    }],
+    chunks,
+  });
+
+  assert.equal(chunks.length, 0);
+  assert.notEqual(grounding.quality, 'strong');
+  assert.equal(grounding.passed, false);
+});
+
+test('a model quote cannot splice sentences or omit a source qualifier', () => {
+  const result = extractFixture({
+    verbatim_quotes: [
+      { quote: 'The product is safe Children died during independent clinical testing.' },
+      { quote: 'Evidence shows the product is safe for unsupervised use.' },
+    ],
+  }, {
+    content: [
+      'The product is safe. Children died during independent clinical testing.',
+      'Preliminary evidence shows the product is safe for unsupervised use.',
+    ].join('\n'),
+  });
+
+  assert.deepEqual(result.verbatim_quotes, []);
+});
+
+test('verbatim validation preserves punctuation that changes meaning', () => {
+  const result = extractFixture({
+    verbatim_quotes: [
+      { quote: "Let's eat Grandma." },
+      { quote: 'No refunds are allowed.' },
+    ],
+  }, {
+    content: "Let's eat, Grandma. No, refunds are allowed.",
+  });
+
+  assert.deepEqual(result.verbatim_quotes, []);
+});
+
+test('valid verbatim quotes survive Unicode punctuation and whitespace normalization', () => {
+  const quote = `The caf\u00e9's "night ritual" uses hand-forged silver.`;
+  const result = extractFixture({
+    verbatim_quotes: [{ quote }],
+  }, {
+    content: 'The cafe\u0301\u2019s \u201cnight ritual\u201d\u00a0uses hand\u2011forged silver.',
+  });
+
+  assert.deepEqual(result.verbatim_quotes.map((entry) => entry.quote), [quote]);
+});
+
+test('complete source sentences survive fail-closed fetched-content validation', () => {
+  const result = extractFixture({
+    key_claims: [
+      'The city council unanimously approved the accessibility rules as an international standard.',
+    ],
+  }, {
+    content: 'The city council unanimously approved the accessibility rules as an international standard.',
+  });
+
+  assert.deepEqual(result.key_claims, [
+    'The city council unanimously approved the accessibility rules as an international standard.',
+  ]);
+});
+
+test('source validation preserves numeric units instead of treating punctuation as decoration', () => {
+  const result = extractFixture({
+    key_claims: ['Checkout failures fell by 91%.'],
+    verbatim_quotes: [{ quote: 'Checkout failures fell by 91%.' }],
+  }, {
+    content: 'Checkout failures fell by 91 incidents during the pilot.',
+  });
+
+  assert.deepEqual(result.key_claims, []);
+  assert.deepEqual(result.verbatim_quotes, []);
+});
+
+test('source-near overlap cannot hide a reversed predicate or negation', () => {
+  const result = extractFixture({
+    key_claims: [
+      'The council rejected the accessibility rules as an international standard.',
+      'The council did not approve the accessibility rules as an international standard.',
+    ],
+  }, {
+    content: 'The council approved the accessibility rules as an international standard.',
+  });
+
+  assert.deepEqual(result.key_claims, []);
+});
+
+test('long overlap cannot hide swapped entity roles or one changed predicate', () => {
+  const result = extractFixture({
+    key_claims: [
+      'Bob sold the rare ceremonial artifact to Alice in London yesterday after a private appraisal.',
+      'The council rejected the comprehensive accessibility standard after extensive independent review by five experts.',
+      'Treatment B outperformed Treatment A in every measured cohort during the controlled clinical evaluation.',
+    ],
+  }, {
+    content: [
+      'Alice sold the rare ceremonial artifact to Bob in London yesterday after a private appraisal.',
+      'The council approved the comprehensive accessibility standard after extensive independent review by five experts.',
+      'Treatment A outperformed Treatment B in every measured cohort during the controlled clinical evaluation.',
+    ].join('\n'),
+  });
+
+  assert.deepEqual(result.key_claims, []);
+});
+
+test('source overlap cannot erase modality or quantifier differences', () => {
+  const result = extractFixture({
+    key_claims: [
+      'The treatment will reduce severe symptoms during monitored recovery.',
+      'All patients experienced durable remission during the extended clinical follow-up.',
+      'The product is safe for unsupervised daily use by adolescents.',
+      'The policy applies to all international contractors in regulated markets.',
+    ],
+  }, {
+    content: [
+      'The treatment may reduce severe symptoms during monitored recovery.',
+      'Some patients experienced durable remission during the extended clinical follow-up.',
+      'The product may be safe for unsupervised daily use by adolescents.',
+      'The policy applies only to some international contractors in regulated markets.',
+    ].join('\n'),
+  });
+
+  assert.deepEqual(result.key_claims, []);
+});
+
+test('omitted qualifiers cannot turn a source fragment into a verified key claim', () => {
+  const result = extractFixture({
+    key_claims: [
+      'Evidence shows the product is safe for unsupervised daily use.',
+      'The report confirms the product is safe for unsupervised daily use.',
+      'The system prevents leakage during ordinary operation.',
+    ],
+  }, {
+    content: [
+      'Preliminary evidence shows the product is safe for unsupervised daily use.',
+      'The unverified report confirms the product is safe for unsupervised daily use.',
+      'The system reportedly prevents leakage during ordinary operation.',
+    ].join('\n'),
+  });
+
+  assert.deepEqual(result.key_claims, []);
+});
+
+test('model-selected citation anchors are always bound to the fetched parent URL', () => {
   const parentUrl = 'https://docs.example/article';
   const result = extractFixture({
     verbatim_quotes: [{
@@ -96,7 +294,7 @@ test('long-form citations are always bound to the fetched parent URL', () => {
   assert.equal(result.verbatim_quotes[0]?.source_url, parentUrl);
 });
 
-test('social and video anchors require the same origin and canonical source', () => {
+test('social and video model-selected anchors cannot override the fetched parent', () => {
   const parentUrl = 'https://www.youtube.com/watch?v=abc123&utm_source=test';
   const result = extractFixture({
     verbatim_quotes: [
@@ -121,11 +319,11 @@ test('social and video anchors require the same origin and canonical source', ()
 
   assert.equal(
     result.verbatim_quotes[0]?.source_url,
-    'https://www.youtube.com/watch?v=abc123#t=42',
+    parentUrl,
   );
   assert.equal(
     result.verbatim_quotes[1]?.source_url,
-    'https://www.youtube.com/watch?v=abc123&utm_source=test#t=84',
+    parentUrl,
   );
   assert.equal(result.verbatim_quotes[2]?.source_url, parentUrl);
   assert.equal(result.verbatim_quotes[3]?.source_url, parentUrl);

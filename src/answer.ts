@@ -16,7 +16,7 @@ import { crawlWithCrawl4AI } from './pipeline-core.js';
 import { synthesisGenerate } from './synthesis.js';
 import { getModelPricing } from './depth-config.js';
 import type { FinalReport } from './types.js';
-import { logger as defaultLogger } from './logger.js';
+import { safeLogger } from './logger.js';
 import type { Logger } from './logger.js';
 
 const ANSWER_SYNTH_MODEL_DEFAULT = 'gemini-3.6-flash';
@@ -128,7 +128,7 @@ export function deriveSearchQuery(query: string): string {
  * Answer a question with inline citations using the self-hosted search stack.
  */
 export async function runAnswer(input: RunAnswerInput): Promise<RunAnswerResult> {
-  const log = input.logger !== undefined ? input.logger : defaultLogger;
+  const log = safeLogger(input.logger);
   const startedAt = Date.now();
   const maxSources = Math.min(input.maxSources !== undefined ? input.maxSources : MAX_SOURCES_TO_READ, SEARCH_LIMIT);
   const synthModel = input.synthesisModelOverride !== undefined && input.synthesisModelOverride.length > 0

@@ -160,7 +160,7 @@ function buildPrompt(batch: IngestedItem[]): string {
 
 async function categorizeBatch(batch: IngestedItem[]): Promise<void> {
   const geminiKey = getGeminiKey();
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${EXTRACTION_MODEL}:generateContent?key=${geminiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${EXTRACTION_MODEL}:generateContent`;
   const prompt = buildPrompt(batch);
 
   let rawJson: unknown;
@@ -169,7 +169,10 @@ async function categorizeBatch(batch: IngestedItem[]): Promise<void> {
       url,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': geminiKey,
+        },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: { temperature: 0.1, maxOutputTokens: 4096 },
@@ -180,8 +183,7 @@ async function categorizeBatch(batch: IngestedItem[]): Promise<void> {
       2000,
     );
     if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`Gemini categorize error: ${response.status} ${body.slice(0, 200)}`);
+      throw new Error(`Gemini categorize error: ${response.status}`);
     }
     rawJson = await response.json();
   } catch (err) {

@@ -130,7 +130,7 @@ export interface PlannerUsage {
 
 async function callGemini(userMessage: string, systemPrompt: string): Promise<{ text: string; usage: PlannerUsage }> {
   const key = getGeminiKey();
-  const url = `${GEMINI_API_BASE}/${EXTRACTION_MODEL}:generateContent?key=${key}`;
+  const url = `${GEMINI_API_BASE}/${EXTRACTION_MODEL}:generateContent`;
 
   const body = {
     system_instruction: { parts: [{ text: systemPrompt }] },
@@ -144,12 +144,15 @@ async function callGemini(userMessage: string, systemPrompt: string): Promise<{ 
 
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': key,
+    },
     body: JSON.stringify(body),
   });
 
   if (!response.ok) {
-    throw new Error(`Gemini API error ${response.status}: ${await response.text()}`);
+    throw new Error(`Gemini API error: ${response.status}`);
   }
 
   const raw: unknown = await response.json();
@@ -325,7 +328,7 @@ export async function planSubqueries(input: PlanSubqueriesInput): Promise<Subque
 
 export async function summarizePromptBrief(promptMd: string): Promise<string> {
   const key = getGeminiKey();
-  const url = `${GEMINI_API_BASE}/${EXTRACTION_MODEL}:generateContent?key=${key}`;
+  const url = `${GEMINI_API_BASE}/${EXTRACTION_MODEL}:generateContent`;
 
   const systemInstruction =
     'You are a research coordinator. Distill the following research brief into a single paragraph of 2–4 sentences that captures the core question, audience, and desired output. Be precise and concrete. Return only the paragraph text — no labels, no markdown.';
@@ -341,12 +344,15 @@ export async function summarizePromptBrief(promptMd: string): Promise<string> {
 
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': key,
+    },
     body: JSON.stringify(body),
   });
 
   if (!response.ok) {
-    throw new Error(`Gemini summarize error ${response.status}: ${await response.text()}`);
+    throw new Error(`Gemini summarize error: ${response.status}`);
   }
 
   const raw: unknown = await response.json();
