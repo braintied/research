@@ -1,7 +1,7 @@
 {
   "name": "@braintied/research",
   "version": "1.5.0",
-  "description": "Cited web research with a budget. Multi-provider search, grounded citations, typed briefs.",
+  "description": "Cited research with a budget. Free search/fetch via SearXNG + Crawl4AI. Multi-provider lanes, typed credentials, grounded citations.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",

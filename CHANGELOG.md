@@ -1,3 +1,10 @@
+## Unreleased
+
+- Public GitHub snapshot (`braintied/research`) now ships a comprehensive
+  README plus `AGENTS.md` from `packages/research/oss/`. Sync substitutes
+  `{{VERSION}}` so the next `stack.mjs publish` of `@braintied/research`
+  does not wipe the product page back to the short stub.
+
 ## 1.5.0
 
 ### Minor Changes
