@@ -4,6 +4,10 @@
   README plus `AGENTS.md` from `packages/research/oss/`. Sync substitutes
   `{{VERSION}}` so the next `stack.mjs publish` of `@braintied/research`
   does not wipe the product page back to the short stub.
+- `stack.mjs snapshot` refreshes GitHub without an npm publish.
+  `publish` also snapshots on a registry skip: `oss/` is outside the
+  tarball, so "already on the registry" used to leave the public page
+  stale (measured 2026-08-17 at 1.5.0).
 
 ## 1.5.0
 

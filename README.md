@@ -276,17 +276,19 @@ ln -s "$PWD/skills/run-braintied-research" \
 
 ## This repo
 
-Public source snapshot of the engine. Issues live here.
-
-Publishing `@braintied/research` is owned by `braintied/stack`:
+Public source snapshot of the engine. Issues live here. Edit
+`packages/research/oss/` in `braintied/stack`, not this checkout.
 
 ```bash
-node packages/research/scripts/sync-oss.mjs            # dry run
-node packages/research/scripts/sync-oss.mjs --apply --push
+node scripts/stack.mjs snapshot                        # GitHub only, no npm
+node scripts/stack.mjs publish --only @braintied/research
 ```
 
-`stack.mjs publish` runs that hook after the package. Do not
-`npm publish` from this checkout.
+`publish` snapshots after a new version, and also when this version is
+already on the registry. A docs-only change does not need a bump.
+`snapshot` is the same GitHub push without touching npm.
+
+Do not `npm publish` from this checkout.
 
 Do not build a second research, search, or crawl engine beside this one.
 If a surface needs web research, depend on the package. The consumer

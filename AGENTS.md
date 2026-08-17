@@ -5,6 +5,16 @@ How a coding agent runs `@braintied/research`. Humans can start at
 
 **1.5.0** · package-owned skill: `skills/run-braintied-research/`.
 
+Edit `braintied/stack` → `packages/research/oss/`, then:
+
+```bash
+node scripts/stack.mjs snapshot --only @braintied/research
+```
+
+Do not wait for a version bump. `oss/` is outside the npm tarball, so
+a registry skip used to leave this GitHub page stale. `snapshot` and
+`publish` both refresh it.
+
 ## Do this first
 
 1. **Recall** whatever corpus the host already has. Paid web is not a
