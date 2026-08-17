@@ -34,7 +34,8 @@ test('web-design profile v1 hash stays immutable while v2 requires native GitHub
   assert.equal(WEB_DESIGN_INTELLIGENCE_PROFILE_V1.requiredProviders, undefined);
   assert.deepEqual(WEB_DESIGN_INTELLIGENCE_PROFILE.requiredProviders, ['github']);
   assert.equal(v2.profileRef, 'web-design-intelligence@2');
-  assert.equal(v2.profileSha256, '86f51f4d409a97cc785620ccb6d83b3bcd2ec2c1c418434ee4a4ce3a51f6f5e3');
+  // v2 hash moves when pack seeds expand (1.2.2 empty-pack fix; 1.2.3 canary fill).
+  assert.equal(v2.profileSha256, '3e34c922f038ad0a8f2672b890a6280be5573ccf16126de298886a280d22f3e1');
 });
 
 test('web design profile separates public source authority from private design recall', () => {

@@ -81,7 +81,7 @@ export interface IngestEngagement {
   score?: number;
 }
 
-export interface IngestedItem {
+export interface IngestedItem<C extends string = KnowledgeCategory> {
   sourceId: string | null;
   sourceType: KnowledgeSourceType;
   url: string;
@@ -93,8 +93,10 @@ export interface IngestedItem {
   publishedAt: string | null; // ISO 8601 or null
   engagement: IngestEngagement;
   qualityScore: number | null;
-  // Filled by categorizeItems():
-  category: KnowledgeCategory;
+  // Filled by categorizeItems(). `C` is the category union of whatever taxonomy
+  // that call was given; it defaults to KnowledgeCategory, so every existing
+  // `IngestedItem` keeps exactly the type it had.
+  category: C;
   tags: string[];
   whyItMatters: string | null;
   // 0–2 VERBATIM quotable sentences copied from this item's source content

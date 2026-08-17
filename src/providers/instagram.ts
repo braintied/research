@@ -1,17 +1,23 @@
 /**
  * Instagram Search Provider
  *
- * Strictly uses Bright Data's Instagram datasets for hashtag discovery,
- * direct post/reel fetches, and one-segment profile fetches. Instagram must
- * never route through another scraper or a generic web-fetch chain: missing
- * credentials, provider failures, terminal snapshot states, timeouts, and
- * contentless records all fail closed.
+ * Bright Data (strict, fail-closed) for hashtag discovery, direct post/reel/tv
+ * fetches, and one-segment profile fetches. Instagram posts and profiles must
+ * never route through a generic crawl or browser recovery chain.
  *
- * Env required: BRIGHTDATA_API_TOKEN.
+ * Stories are a separate lane: Bright Data has no Stories dataset, so active
+ * public stories are fetched via Apify actor
+ * `datavoyantlab/advanced-instagram-stories-scraper` (usernames only, no
+ * Instagram session cookie). Stories use `APIFY_API_TOKEN` as the primary
+ * transport — they are not gated by `APIFY_ALLOW_FALLBACK`.
+ *
+ * Env: BRIGHTDATA_API_TOKEN (search/posts/profiles).
+ *      APIFY_API_TOKEN (stories only).
  */
 
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import { MissingCredentialError, type ResearchCredentials } from '../credentials.js';
 import {
   SearchResultSchema,
   FetchResultSchema,
@@ -26,6 +32,15 @@ import { extractQuotesWithGemini } from './gemini-extractor.js';
 const BRIGHTDATA_BASE_URL = 'https://api.brightdata.com/datasets/v3';
 export const BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID = 'gd_lk5ns7kz21pck8jpis';
 export const BRIGHTDATA_INSTAGRAM_PROFILES_DATASET_ID = 'gd_l1vikfch901nx3by4';
+
+/** Apify actor for public Instagram Stories (no session cookie required). */
+export const APIFY_INSTAGRAM_STORIES_ACTOR_ID = 'datavoyantlab/advanced-instagram-stories-scraper';
+const APIFY_BASE_URL = 'https://api.apify.com/v2';
+const APIFY_START_TIMEOUT_MS = 30_000;
+const APIFY_POLL_TIMEOUT_MS = 15_000;
+const APIFY_DATASET_TIMEOUT_MS = 30_000;
+const APIFY_POLL_INTERVAL_MS = 5_000;
+const APIFY_MAX_WAIT_MS = 180_000;
 
 const TRIGGER_TIMEOUT_MS = 30_000;
 const PROGRESS_TIMEOUT_MS = 15_000;
@@ -85,17 +100,40 @@ interface NormalizedInstagramProfile {
   private: boolean | undefined;
 }
 
-function getBrightDataToken(): string {
-  const token = process.env.BRIGHTDATA_API_TOKEN;
-  if (token === undefined || token.trim().length === 0) {
-    throw new Error('BRIGHTDATA_API_TOKEN environment variable is not configured');
-  }
-  return token;
+export interface InstagramStoriesTarget {
+  username: string;
+  storyId: string | undefined;
+  /** Always the active-stories watch URL for the account. */
+  watchUrl: string;
+  /** Specific story permalink when a story id was present in the input URL. */
+  storyUrl: string | undefined;
 }
 
-function isEnabled(): boolean {
-  const token = process.env.BRIGHTDATA_API_TOKEN;
-  return token !== undefined && token.trim().length > 0;
+interface NormalizedInstagramStory {
+  url: string;
+  storyId: string;
+  username: string;
+  caption: string;
+  mediaType: 'image' | 'video' | 'unknown';
+  mediaUrls: string[];
+  publishedAt: string | undefined;
+  expiresAt: string | undefined;
+  linkUrl: string | undefined;
+  hashtags: string[];
+}
+
+function requireBrightDataToken(credentials: ResearchCredentials): string {
+  if (credentials.brightdata === undefined) {
+    throw new MissingCredentialError('brightdata', 'required for Instagram post/profile/search');
+  }
+  return credentials.brightdata.apiToken;
+}
+
+function requireApifyToken(credentials: ResearchCredentials): string {
+  if (credentials.apifyApiToken === undefined) {
+    throw new MissingCredentialError('apifyApiToken', 'required for Instagram stories');
+  }
+  return credentials.apifyApiToken;
 }
 
 function safeErrorName(error: unknown): string {
@@ -115,7 +153,7 @@ async function fetchWithTimeout(
   externalSignal?: AbortSignal,
 ): Promise<Response> {
   if (externalSignal?.aborted === true) {
-    throw new Error('Bright Data request aborted');
+    throw new Error('Instagram request aborted');
   }
 
   const controller = new AbortController();
@@ -135,12 +173,12 @@ async function fetchWithTimeout(
     return await fetch(url, { ...init, signal: controller.signal });
   } catch (error) {
     if (timedOut) {
-      throw new Error(`Bright Data request timed out after ${timeoutMs}ms`);
+      throw new Error(`Instagram request timed out after ${timeoutMs}ms`);
     }
     if (callerAborted) {
-      throw new Error('Bright Data request aborted');
+      throw new Error('Instagram request aborted');
     }
-    throw new Error(`Bright Data request failed (${safeErrorName(error)})`);
+    throw new Error(`Instagram request failed (${safeErrorName(error)})`);
   } finally {
     clearTimeout(timeout);
     externalSignal?.removeEventListener('abort', abortFromCaller);
@@ -329,6 +367,44 @@ function shortcodeFromInstagramUrl(value: string): string | null {
   if (canonical === null) return null;
   const segments = new URL(canonical).pathname.split('/').filter(Boolean);
   return segments[1] ?? null;
+}
+
+/**
+ * Parse `/stories/{username}/` or `/stories/{username}/{storyId}/`.
+ * Returns null for non-stories Instagram URLs.
+ */
+export function parseInstagramStoriesUrl(value: string): InstagramStoriesTarget | null {
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    if (hostname !== 'instagram.com' && hostname !== 'www.instagram.com') return null;
+    const segments = url.pathname.split('/').filter(Boolean);
+    if (segments.length < 2 || segments[0]?.toLowerCase() !== 'stories') return null;
+    const rawUsername = segments[1];
+    if (rawUsername === undefined) return null;
+    const username = rawUsername.replace(/^@/, '').toLowerCase();
+    if (!/^[a-z0-9._]{1,30}$/.test(username) || RESERVED_INSTAGRAM_ROUTES.has(username)) {
+      return null;
+    }
+    const rawStoryId = segments[2];
+    const storyId = rawStoryId !== undefined && /^[A-Za-z0-9_-]+$/.test(rawStoryId)
+      ? rawStoryId
+      : undefined;
+    const watchUrl = `https://www.instagram.com/stories/${username}/`;
+    const storyUrl = storyId !== undefined
+      ? `https://www.instagram.com/stories/${username}/${storyId}/`
+      : undefined;
+    return { username, storyId, watchUrl, storyUrl };
+  } catch {
+    return null;
+  }
+}
+
+export function canonicalizeInstagramStoriesUrl(value: string): string | null {
+  const parsed = parseInstagramStoriesUrl(value);
+  if (parsed === null) return null;
+  if (parsed.storyUrl !== undefined) return parsed.storyUrl;
+  return parsed.watchUrl;
 }
 
 function uniqueStrings(values: string[]): string[] {
@@ -551,7 +627,7 @@ function normalizeLimit(limit: number | undefined): number {
 }
 
 async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted === true) throw new Error('Bright Data request aborted');
+  if (signal?.aborted === true) throw new Error('Instagram request aborted');
   await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
       signal?.removeEventListener('abort', abort);
@@ -559,7 +635,7 @@ async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
     }, ms);
     const abort = (): void => {
       clearTimeout(timeout);
-      reject(new Error('Bright Data request aborted'));
+      reject(new Error('Instagram request aborted'));
     };
     signal?.addEventListener('abort', abort, { once: true });
   });
@@ -851,6 +927,406 @@ function profileToFetchResult(profile: NormalizedInstagramProfile): FetchResult 
   });
 }
 
+
+// =============================================================================
+// Stories via Apify (primary path — Bright Data has no Stories dataset)
+// =============================================================================
+
+interface ApifyRunData {
+  id: string;
+  defaultDatasetId: string;
+  status: string;
+}
+
+async function startApifyStoriesRun(
+  usernames: string[],
+  token: string,
+  signal?: AbortSignal,
+): Promise<{ runId: string; datasetId: string }> {
+  const actorPath = encodeURIComponent(APIFY_INSTAGRAM_STORIES_ACTOR_ID);
+  const endpoint = `${APIFY_BASE_URL}/acts/${actorPath}/runs?token=${encodeURIComponent(token)}`;
+  const response = await fetchWithTimeout(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ usernames }),
+  }, APIFY_START_TIMEOUT_MS, signal);
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(
+      `Apify Instagram stories start failed with HTTP ${response.status}: ${body.slice(0, 200)}`,
+    );
+  }
+  let json: unknown;
+  try {
+    json = await response.json();
+  } catch {
+    throw new Error('Apify Instagram stories start returned invalid JSON');
+  }
+  const data = (json as { data?: ApifyRunData }).data;
+  if (data === undefined || typeof data.id !== 'string' || data.id.length === 0) {
+    throw new Error('Apify Instagram stories start response missing run id');
+  }
+  if (typeof data.defaultDatasetId !== 'string' || data.defaultDatasetId.length === 0) {
+    throw new Error('Apify Instagram stories start response missing dataset id');
+  }
+  return { runId: data.id, datasetId: data.defaultDatasetId };
+}
+
+async function pollApifyRunUntilDone(
+  runId: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const endpoint = `${APIFY_BASE_URL}/actor-runs/${encodeURIComponent(runId)}?token=${encodeURIComponent(token)}`;
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < APIFY_MAX_WAIT_MS) {
+    const response = await fetchWithTimeout(endpoint, {
+      method: 'GET',
+    }, APIFY_POLL_TIMEOUT_MS, signal);
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Apify Instagram stories poll failed with HTTP ${response.status}: ${body.slice(0, 100)}`);
+    }
+    let json: unknown;
+    try {
+      json = await response.json();
+    } catch {
+      throw new Error('Apify Instagram stories poll returned invalid JSON');
+    }
+    const status = (json as { data?: { status?: string } }).data?.status;
+    if (status === 'SUCCEEDED') return;
+    if (status === 'FAILED' || status === 'ABORTED' || status === 'TIMED-OUT') {
+      throw new Error(`Apify Instagram stories run ended with status "${status}"`);
+    }
+    await abortableSleep(APIFY_POLL_INTERVAL_MS, signal);
+  }
+  throw new Error(`Apify Instagram stories run timed out after ${APIFY_MAX_WAIT_MS}ms`);
+}
+
+async function fetchApifyDatasetItems(
+  datasetId: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<InstagramRecord[]> {
+  const endpoint = `${APIFY_BASE_URL}/datasets/${encodeURIComponent(datasetId)}/items?token=${encodeURIComponent(token)}`;
+  const response = await fetchWithTimeout(endpoint, {
+    method: 'GET',
+  }, APIFY_DATASET_TIMEOUT_MS, signal);
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(
+      `Apify Instagram stories dataset failed with HTTP ${response.status}: ${body.slice(0, 100)}`,
+    );
+  }
+  let raw: unknown;
+  try {
+    raw = await response.json();
+  } catch {
+    throw new Error('Apify Instagram stories dataset returned invalid JSON');
+  }
+  const arrayResult = RecordArraySchema.safeParse(raw);
+  if (!arrayResult.success) {
+    throw new Error('Apify Instagram stories dataset did not return a JSON array');
+  }
+  const records: InstagramRecord[] = [];
+  for (const item of arrayResult.data) {
+    const parsed = RecordSchema.safeParse(item);
+    if (parsed.success) records.push(parsed.data);
+  }
+  return records;
+}
+
+function unixToIso(value: unknown): string | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const ms = value > 1_000_000_000_000 ? value : value * 1000;
+    const date = new Date(ms);
+    if (Number.isFinite(date.getTime())) return date.toISOString();
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    return toIsoString(value.trim());
+  }
+  return undefined;
+}
+
+function mediaTypeFromRecord(record: InstagramRecord): 'image' | 'video' | 'unknown' {
+  const mediaType = record['media_type'];
+  if (mediaType === 1 || mediaType === '1' || mediaType === 'Image' || mediaType === 'image') {
+    return 'image';
+  }
+  if (mediaType === 2 || mediaType === '2' || mediaType === 'Video' || mediaType === 'video') {
+    return 'video';
+  }
+  const productType = readString(record, 'product_type', 'mediaType');
+  if (productType !== null) {
+    const lower = productType.toLowerCase();
+    if (lower.includes('video')) return 'video';
+    if (lower.includes('image') || lower.includes('photo')) return 'image';
+  }
+  return 'unknown';
+}
+
+function extractStoryMediaUrls(record: InstagramRecord): string[] {
+  const candidates: string[] = [];
+  const imageVersions = record['image_versions2'];
+  if (imageVersions !== undefined && typeof imageVersions === 'object' && imageVersions !== null) {
+    const candidatesField = (imageVersions as { candidates?: unknown }).candidates;
+    if (Array.isArray(candidatesField)) {
+      for (const candidate of candidatesField) {
+        if (candidate !== null && typeof candidate === 'object') {
+          const url = (candidate as { url?: unknown }).url;
+          if (typeof url === 'string' && url.trim().length > 0) candidates.push(url.trim());
+        }
+      }
+    }
+  }
+  const videoVersions = record['video_versions'];
+  if (Array.isArray(videoVersions)) {
+    for (const version of videoVersions) {
+      if (version !== null && typeof version === 'object') {
+        const url = (version as { url?: unknown }).url;
+        if (typeof url === 'string' && url.trim().length > 0) candidates.push(url.trim());
+      }
+    }
+  }
+  for (const key of ['mediaUrl', 'media_url', 'video_url', 'display_url', 'thumbnailUrl', 'thumbnail_url']) {
+    const value = readString(record, key);
+    if (value !== null) candidates.push(value);
+  }
+  return uniqueStrings(
+    candidates
+      .map(normalizeMediaUrl)
+      .filter((value): value is string => value !== null),
+  );
+}
+
+function extractStoryLinkUrl(record: InstagramRecord): string | undefined {
+  const direct = readString(record, 'linkUrl', 'link_url', 'story_link_url');
+  if (direct !== null) {
+    const normalized = normalizeMediaUrl(direct);
+    if (normalized !== null) return normalized;
+  }
+  const stickers = record['story_link_stickers'];
+  if (!Array.isArray(stickers)) return undefined;
+  for (const sticker of stickers) {
+    if (sticker === null || typeof sticker !== 'object') continue;
+    const storyLink = (sticker as { story_link?: unknown }).story_link;
+    if (storyLink === null || typeof storyLink !== 'object') continue;
+    const rawUrl = (storyLink as { url?: unknown; display_url?: unknown }).url
+      ?? (storyLink as { display_url?: unknown }).display_url;
+    if (typeof rawUrl !== 'string' || rawUrl.trim().length === 0) continue;
+    // Instagram wraps destinations; prefer display_url when present.
+    const display = (storyLink as { display_url?: unknown }).display_url;
+    const preferred = typeof display === 'string' && display.trim().length > 0
+      ? display.trim()
+      : rawUrl.trim();
+    if (preferred.startsWith('http://') || preferred.startsWith('https://')) {
+      return preferred.startsWith('http') ? preferred : `https://${preferred}`;
+    }
+    return `https://${preferred}`;
+  }
+  return undefined;
+}
+
+function extractStoryHashtags(record: InstagramRecord): string[] {
+  const fromArray = readStringArray(record, 'hashtags', 'stickerTypes');
+  if (fromArray.length > 0) {
+    return uniqueStrings(fromArray.map(tag => tag.replace(/^#/, '').toLowerCase()));
+  }
+  const stickers = record['story_hashtags'];
+  if (!Array.isArray(stickers)) return [];
+  const tags: string[] = [];
+  for (const sticker of stickers) {
+    if (sticker === null || typeof sticker !== 'object') continue;
+    const hashtag = (sticker as { hashtag?: unknown }).hashtag;
+    if (hashtag === null || typeof hashtag !== 'object') continue;
+    const name = (hashtag as { name?: unknown }).name;
+    if (typeof name === 'string' && name.trim().length > 0) {
+      tags.push(name.trim().replace(/^#/, '').toLowerCase());
+    }
+  }
+  return uniqueStrings(tags);
+}
+
+function extractStoryCaption(record: InstagramRecord): string {
+  const direct = readString(record, 'caption', 'text', 'title');
+  if (direct !== null) return direct;
+  const captionObj = record['caption'];
+  if (captionObj !== null && typeof captionObj === 'object') {
+    const text = (captionObj as { text?: unknown }).text;
+    if (typeof text === 'string' && text.trim().length > 0) return text.trim();
+  }
+  return '';
+}
+
+function extractStoryUsername(record: InstagramRecord, fallback: string): string {
+  const top = readString(record, 'username', 'user_posted', 'ownerUsername');
+  if (top !== null) return top.replace(/^@/, '').toLowerCase();
+  const user = record['user'];
+  if (user !== null && typeof user === 'object') {
+    const username = (user as { username?: unknown }).username;
+    if (typeof username === 'string' && username.trim().length > 0) {
+      return username.trim().replace(/^@/, '').toLowerCase();
+    }
+  }
+  return fallback;
+}
+
+function extractStoryId(record: InstagramRecord): string | null {
+  const direct = readString(record, 'storyId', 'story_id', 'pk', 'id', 'code', 'strong_id__');
+  if (direct !== null) {
+    // Prefer the numeric pk portion when id is "pk_userid"
+    const pkOnly = direct.split('_')[0];
+    if (pkOnly !== undefined && pkOnly.length > 0) return pkOnly;
+    return direct;
+  }
+  const pk = record['pk'];
+  if (typeof pk === 'number' && Number.isFinite(pk)) return String(pk);
+  if (typeof pk === 'string' && pk.trim().length > 0) return pk.trim();
+  return null;
+}
+
+function normalizeInstagramStoryRecord(
+  record: InstagramRecord,
+  expectedUsername: string,
+): NormalizedInstagramStory | null {
+  const providerError = readString(record, 'error', 'error_message');
+  if (providerError !== null) {
+    throw new Error(`Apify Instagram stories returned a provider error: ${providerError.slice(0, 120)}`);
+  }
+  const username = extractStoryUsername(record, expectedUsername);
+  if (username !== expectedUsername.toLowerCase()) {
+    // Actor may return multi-user batches; ignore other usernames.
+    if (username.length > 0 && username !== expectedUsername.toLowerCase()) {
+      return null;
+    }
+  }
+  const storyId = extractStoryId(record);
+  if (storyId === null) return null;
+  const mediaUrls = extractStoryMediaUrls(record);
+  const caption = extractStoryCaption(record);
+  const linkUrl = extractStoryLinkUrl(record);
+  const hashtags = extractStoryHashtags(record);
+  const mediaType = mediaTypeFromRecord(record);
+  // A story with neither media nor caption nor link is not usable evidence.
+  if (mediaUrls.length === 0 && caption.length === 0 && linkUrl === undefined) {
+    return null;
+  }
+  return {
+    url: `https://www.instagram.com/stories/${username}/${storyId}/`,
+    storyId,
+    username,
+    caption,
+    mediaType,
+    mediaUrls,
+    publishedAt: unixToIso(record['taken_at'] ?? record['timestamp'] ?? record['device_timestamp']),
+    expiresAt: unixToIso(record['expiring_at'] ?? record['expiresAt'] ?? record['expires_at']),
+    linkUrl,
+    hashtags,
+  };
+}
+
+async function scrapeStories(
+  target: InstagramStoriesTarget,
+  token: string,
+  signal?: AbortSignal,
+): Promise<NormalizedInstagramStory[]> {
+  const { runId, datasetId } = await startApifyStoriesRun([target.username], token, signal);
+  await pollApifyRunUntilDone(runId, token, signal);
+  const records = await fetchApifyDatasetItems(datasetId, token, signal);
+  const stories = records
+    .map(record => normalizeInstagramStoryRecord(record, target.username))
+    .filter((story): story is NormalizedInstagramStory => story !== null);
+
+  const filtered = target.storyId !== undefined
+    ? stories.filter(story => story.storyId === target.storyId || story.url.endsWith(`/${target.storyId}/`))
+    : stories;
+
+  if (filtered.length === 0) {
+    if (target.storyId !== undefined) {
+      throw new Error(
+        `Apify Instagram stories scrape returned no matching story "${target.storyId}" for @${target.username}`,
+      );
+    }
+    throw new Error(
+      `Apify Instagram stories scrape returned no active stories for @${target.username}`,
+    );
+  }
+  return filtered;
+}
+
+function storiesToFetchResult(
+  target: InstagramStoriesTarget,
+  stories: NormalizedInstagramStory[],
+): FetchResult {
+  const title = stories.length === 1
+    ? `Instagram story from @${target.username}`
+    : `${stories.length} Instagram stories from @${target.username}`;
+  const lines: string[] = [
+    `# ${title}`,
+    '',
+    `**Source:** ${target.storyUrl ?? target.watchUrl}`,
+    `**Creator:** @${target.username}`,
+    `**Stories:** ${stories.length}`,
+    '**Instagram data provider:** Apify',
+    `**Apify actor:** ${APIFY_INSTAGRAM_STORIES_ACTOR_ID}`,
+    '',
+  ];
+  for (const [index, story] of stories.entries()) {
+    lines.push(`## Story ${index + 1}`, '');
+    lines.push(`- **URL:** ${story.url}`);
+    lines.push(`- **Story ID:** ${story.storyId}`);
+    lines.push(`- **Media type:** ${story.mediaType}`);
+    if (story.publishedAt !== undefined) lines.push(`- **Posted:** ${story.publishedAt}`);
+    if (story.expiresAt !== undefined) lines.push(`- **Expires:** ${story.expiresAt}`);
+    if (story.linkUrl !== undefined) lines.push(`- **Link:** ${story.linkUrl}`);
+    if (story.hashtags.length > 0) lines.push(`- **Hashtags:** ${story.hashtags.map(tag => `#${tag}`).join(' ')}`);
+    if (story.caption.length > 0) {
+      lines.push('', story.caption, '');
+    }
+    if (story.mediaUrls.length > 0) {
+      lines.push('**Media:**');
+      for (const mediaUrl of story.mediaUrls) lines.push(`- ${mediaUrl}`);
+      lines.push('');
+    }
+  }
+  const rawContent = stories
+    .map(story => {
+      const parts = [story.caption];
+      if (story.linkUrl !== undefined) parts.push(story.linkUrl);
+      return parts.filter(part => part.length > 0).join('\n');
+    })
+    .filter(part => part.length > 0)
+    .join('\n\n');
+  return FetchResultSchema.parse({
+    provider: 'instagram',
+    url: target.storyUrl ?? target.watchUrl,
+    canonical_id: target.storyId ?? target.username,
+    title,
+    author: `@${target.username}`,
+    published_at: stories[0]?.publishedAt,
+    raw_content: rawContent,
+    markdown: lines.join('\n'),
+    engagement: {
+      story_count: stories.length,
+      instagram_provider: 'apify',
+      apify_actor_id: APIFY_INSTAGRAM_STORIES_ACTOR_ID,
+      source_kind: 'stories',
+      stories: stories.map(story => ({
+        story_id: story.storyId,
+        url: story.url,
+        media_type: story.mediaType,
+        media_urls: story.mediaUrls,
+        published_at: story.publishedAt,
+        expires_at: story.expiresAt,
+        link_url: story.linkUrl,
+        hashtags: story.hashtags,
+        caption: story.caption,
+      })),
+    },
+    fetch_status: 'ok',
+  });
+}
+
 function failedFetch(url: string, message: string): FetchResult {
   return FetchResultSchema.parse({
     provider: 'instagram',
@@ -860,89 +1336,109 @@ function failedFetch(url: string, message: string): FetchResult {
   });
 }
 
-export const instagramProvider: SearchProvider = {
-  name: 'instagram',
+export function createInstagramProvider(credentials: ResearchCredentials): SearchProvider {
+  return {
+    name: 'instagram',
 
-  get enabled(): boolean {
-    return isEnabled();
-  },
+    // Enabled when either transport is configured. Search/posts/profiles still
+    // require Bright Data; stories require Apify. Callers hit the missing-key
+    // error on the path they actually use.
+    enabled: credentials.brightdata !== undefined || credentials.apifyApiToken !== undefined,
 
-  async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
-    const token = getBrightDataToken();
-    const limit = normalizeLimit(opts.limit);
-    const hashtags = deriveHashtags(query);
-    if (hashtags.length === 0) {
-      throw new Error('Instagram search query did not produce a usable hashtag');
-    }
+    async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
+      const token = requireBrightDataToken(credentials);
+      const limit = normalizeLimit(opts.limit);
+      const hashtags = deriveHashtags(query);
+      if (hashtags.length === 0) {
+        throw new Error('Instagram search query did not produce a usable hashtag');
+      }
 
-    const byUrl = new Map<string, SearchResult>();
-    for (const hashtag of hashtags) {
-      const posts = await discoverHashtag(hashtag, limit, token, opts.signal);
-      for (const post of posts) {
-        const existing = byUrl.get(post.url);
-        if (existing === undefined) {
-          byUrl.set(post.url, postToSearchResult(post, hashtag));
-          continue;
+      const byUrl = new Map<string, SearchResult>();
+      for (const hashtag of hashtags) {
+        const posts = await discoverHashtag(hashtag, limit, token, opts.signal);
+        for (const post of posts) {
+          const existing = byUrl.get(post.url);
+          if (existing === undefined) {
+            byUrl.set(post.url, postToSearchResult(post, hashtag));
+            continue;
+          }
+          const metadata = { ...existing.raw_metadata };
+          const prior = Array.isArray(metadata.discovery_hashtags)
+            ? metadata.discovery_hashtags.filter((value): value is string => typeof value === 'string')
+            : [String(metadata.discovery_hashtag ?? '')].filter(value => value.length > 0);
+          metadata.discovery_hashtags = uniqueStrings([...prior, hashtag]);
+          byUrl.set(post.url, SearchResultSchema.parse({ ...existing, raw_metadata: metadata }));
         }
-        const metadata = { ...existing.raw_metadata };
-        const prior = Array.isArray(metadata.discovery_hashtags)
-          ? metadata.discovery_hashtags.filter((value): value is string => typeof value === 'string')
-          : [String(metadata.discovery_hashtag ?? '')].filter(value => value.length > 0);
-        metadata.discovery_hashtags = uniqueStrings([...prior, hashtag]);
-        byUrl.set(post.url, SearchResultSchema.parse({ ...existing, raw_metadata: metadata }));
       }
-    }
 
-    const results = [...byUrl.values()].slice(0, limit);
-    if (results.length === 0) {
-      throw new Error('Bright Data Instagram search returned no usable content');
-    }
-    logger.info(
-      { resultCount: results.length, hashtagCount: hashtags.length },
-      '[Instagram] Bright Data search complete',
-    );
-    return results;
-  },
-
-  async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
-    const canonicalPostUrl = canonicalizeInstagramPostUrl(url);
-    const canonicalProfileUrl = canonicalizeInstagramProfileUrl(url);
-    if (canonicalPostUrl === null && canonicalProfileUrl === null) {
-      return failedFetch(
-        url,
-        'Instagram fetch requires a direct /p/, /reel/, /tv/, or one-segment profile URL',
+      const results = [...byUrl.values()].slice(0, limit);
+      if (results.length === 0) {
+        throw new Error('Bright Data Instagram search returned no usable content');
+      }
+      logger.info(
+        { resultCount: results.length, hashtagCount: hashtags.length },
+        '[Instagram] Bright Data search complete',
       );
-    }
+      return results;
+    },
 
-    try {
-      const token = getBrightDataToken();
-      if (canonicalPostUrl !== null) {
-        const post = await scrapePost(canonicalPostUrl, token, signal);
-        logger.info('[Instagram] Bright Data post fetch complete');
-        return postToFetchResult(post);
+    async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
+      const storiesTarget = parseInstagramStoriesUrl(url);
+      if (storiesTarget !== null) {
+        try {
+          const apifyToken = requireApifyToken(credentials);
+          const stories = await scrapeStories(storiesTarget, apifyToken, signal);
+          logger.info(
+            { username: storiesTarget.username, storyCount: stories.length },
+            '[Instagram] Apify stories fetch complete',
+          );
+          return storiesToFetchResult(storiesTarget, stories);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Apify Instagram stories fetch failed';
+          return failedFetch(storiesTarget.storyUrl ?? storiesTarget.watchUrl, message);
+        }
       }
-      if (canonicalProfileUrl === null) {
-        return failedFetch(url, 'Instagram URL could not be canonicalized');
-      }
-      const profile = await scrapeProfile(canonicalProfileUrl, token, signal);
-      logger.info('[Instagram] Bright Data profile fetch complete');
-      return profileToFetchResult(profile);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Bright Data Instagram fetch failed';
-      return failedFetch(canonicalPostUrl ?? canonicalProfileUrl ?? url, message);
-    }
-  },
 
-  async extract(raw: FetchResult): Promise<ExtractedQuotes> {
-    const content = raw.markdown.length > 0 ? raw.markdown : raw.raw_content;
-    if (raw.fetch_status === 'failed' || content.trim().length === 0) {
-      throw new Error('Cannot extract Instagram evidence from a failed or empty Bright Data fetch');
-    }
-    return extractQuotesWithGemini({
-      provider: 'instagram',
-      url: raw.url,
-      content,
-      mode: 'reddit',
-    });
-  },
-};
+      const canonicalPostUrl = canonicalizeInstagramPostUrl(url);
+      const canonicalProfileUrl = canonicalizeInstagramProfileUrl(url);
+      if (canonicalPostUrl === null && canonicalProfileUrl === null) {
+        return failedFetch(
+          url,
+          'Instagram fetch requires a direct /p/, /reel/, /tv/, /stories/{user}/, or one-segment profile URL',
+        );
+      }
+
+      try {
+        const token = requireBrightDataToken(credentials);
+        if (canonicalPostUrl !== null) {
+          const post = await scrapePost(canonicalPostUrl, token, signal);
+          logger.info('[Instagram] Bright Data post fetch complete');
+          return postToFetchResult(post);
+        }
+        if (canonicalProfileUrl === null) {
+          return failedFetch(url, 'Instagram URL could not be canonicalized');
+        }
+        const profile = await scrapeProfile(canonicalProfileUrl, token, signal);
+        logger.info('[Instagram] Bright Data profile fetch complete');
+        return profileToFetchResult(profile);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Bright Data Instagram fetch failed';
+        return failedFetch(canonicalPostUrl ?? canonicalProfileUrl ?? url, message);
+      }
+    },
+
+    async extract(raw: FetchResult): Promise<ExtractedQuotes> {
+      const content = raw.markdown.length > 0 ? raw.markdown : raw.raw_content;
+      if (raw.fetch_status === 'failed' || content.trim().length === 0) {
+        throw new Error('Cannot extract Instagram evidence from a failed or empty Instagram fetch');
+      }
+      return extractQuotesWithGemini({
+        credentials,
+        provider: 'instagram',
+        url: raw.url,
+        content,
+        mode: 'reddit',
+      });
+    },
+  };
+}

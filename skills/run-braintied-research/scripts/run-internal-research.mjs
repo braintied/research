@@ -781,10 +781,30 @@ async function submitDurableResearch({
       if ((response.status === 202 || response.status === 200) && validRun) {
         return run;
       }
+      // Admission / deploy pauses are operator-actionable — do not spin for the full
+      // deadline while the local checkpoint stays submission_pending (2026-08-01).
+      const errorCode = payload?.error?.code;
+      if (
+        response.status === 429
+        && (errorCode === 'ADMISSION_LIMIT_REACHED'
+          || errorCode === 'ADMISSION_PAUSED')
+      ) {
+        throw new Error(
+          `${boundedServerMessage(response, payload)} (${errorCode}). `
+            + 'Raise ora_core.internal_tool_admission_policies limits or wait for the '
+            + 'daily reserved-cost window to roll, then re-run with the same --request-id.',
+        );
+      }
       if (!retryableHttpStatus(response.status)) {
         throw new Error(boundedServerMessage(response, payload));
       }
-      lastDiagnostic = `HTTP_${response.status}`;
+      lastDiagnostic = `HTTP_${response.status}${errorCode ? `_${errorCode}` : ''}`;
+      // Surface retry progress so operators see the hang is admission/retry, not silence.
+      if (attempt === 0 || attempt % 5 === 0) {
+        process.stderr.write(
+          `run-braintied-internal-research: submit retry attempt=${attempt} diagnostic=${lastDiagnostic} request=${requestId}\n`,
+        );
+      }
     } else if (outcome.kind === 'invalid-json') {
       if (!retryableHttpStatus(outcome.response.status)) {
         throw new Error(`Internal durable submission returned HTTP ${outcome.response.status} with invalid JSON.`);

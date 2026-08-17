@@ -14,6 +14,7 @@ import type { IndexSink, OnPipelineUsage, ResearchCacheAdapter } from './index.j
 import type { Logger } from './logger.js';
 import { canonicalizeUrl, type ProviderName, type SearchOpts } from './types.js';
 import { getEnabledSearchProviders } from './providers/index.js';
+import type { ResearchCredentials } from './credentials.js';
 import {
   evaluateSourceModeCoverage,
   resolveSourceExecutionPlan,
@@ -52,6 +53,8 @@ export interface TrustedSourceAdapter {
 }
 
 export interface RunResearchProgramInput {
+  /** Host-resolved credentials, forwarded to the public research runner. */
+  credentials: ResearchCredentials;
   brief: string;
   /** Explicit ISO date/timestamp makes freshness and reruns reproducible. */
   asOf: string;
@@ -166,15 +169,112 @@ function sourceClassForMode(mode: string | undefined): EvidenceItem['sourceClass
   return 'secondary_analysis';
 }
 
+// Deterministic pack attribution: a discovery whose host sits inside a public
+// pack's includeDomains is evidence for that pack no matter which subquery
+// surfaced it. Pack seeds are already host-restricted by include_domains, so
+// this only adds planner-found URLs on the same authorities. Without it,
+// coverage requirements silently under-count whenever the planner (not a pack
+// seed) finds the page — the 2026-07-27 release-canary failure mode, where
+// award-source-coverage found 6 of 8 required items despite healthy award
+// evidence in the report.
+export function domainMatchedPublicPackIds(
+  discovery: KindResearchResult['discoveries'][number],
+  profile: ResearchProfile,
+): string[] {
+  let host: string;
+  try {
+    host = new URL(discovery.url).hostname.toLowerCase();
+  } catch {
+    // A non-URL discovery (provider-native id) keeps its seed attribution only.
+    return [];
+  }
+  const matched: string[] = [];
+  for (const pack of profile.sourcePacks) {
+    if (pack.visibility !== 'public') continue;
+    for (const domain of pack.includeDomains) {
+      const normalized = domain.toLowerCase().replace(/^www\./, '');
+      if (host === normalized || host.endsWith(`.${normalized}`)) {
+        matched.push(pack.id);
+        break;
+      }
+    }
+  }
+  return matched;
+}
+
+/**
+ * Providers whose discovery payload is the primary evidence surface (title +
+ * snippet or discussion body). HN/RSS/podcasts do not ship page HTML with the
+ * search hit, and re-fetch/extract often returns empty under bot walls or
+ * discussion-thread shapes. Without this path, community packs can search
+ * successfully and still assemble 0 coverage evidence (2026-08 release canary:
+ * guidance/practitioner at 0e while award/template still filled via Tavily
+ * raw_content).
+ *
+ * GitHub joins the set for the same reason: REST search returns repository
+ * identity + description, but github.com HTML extract is routinely empty
+ * (SPA / bot walls). Without native admission, open-implementation-sources
+ * can search 10+ public repos and still assemble 0e/0s (2026-08-04 canary
+ * after models 1.2.6: implementation-coverage only, other packs green).
+ */
+// Tavily/SearXNG/GitHub join when domain-filtered packs still surface hits
+// but Gemini extract fails (empty body / bot walls). Seed or domain pack
+// attribution is still required — never invent packs from a bare host.
+// Pack provider lists still bind provenance (github-native cannot fill a
+// web-only pack).
+const PROVIDER_NATIVE_DISCOVERY_PROVIDERS = new Set([
+  'hn',
+  'rss',
+  'podcasts',
+  'tavily',
+  'searxng',
+  'github',
+]);
+
+const MIN_PROVIDER_NATIVE_BODY_CHARS = 40;
+
+function discoveryBody(discovery: KindResearchResult['discoveries'][number]): string {
+  return [discovery.title, discovery.snippet]
+    .map((part) => (typeof part === 'string' ? part.trim() : ''))
+    .filter((part) => part.length > 0)
+    .join('\n')
+    .trim();
+}
+
+function packIdsForDiscovery(
+  discovery: KindResearchResult['discoveries'][number],
+  profile: ResearchProfile,
+): string[] {
+  const packIds = [...discovery.source_pack_ids];
+  for (const packId of domainMatchedPublicPackIds(discovery, profile)) {
+    if (!packIds.includes(packId)) packIds.push(packId);
+  }
+  return packIds;
+}
+
+function withinAsOfBoundary(
+  discovery: KindResearchResult['discoveries'][number],
+  publishedBeforeMs: number | null,
+): boolean {
+  if (publishedBeforeMs === null) return true;
+  if (discovery.published_at === undefined) return true;
+  return new Date(discovery.published_at).getTime() <= publishedBeforeMs;
+}
+
 function validatedPublicEvidenceItems(
   discoveries: KindResearchResult['discoveries'],
   validatedEvidence: NonNullable<KindResearchResult['validatedEvidence']>,
   profile: ResearchProfile | null,
+  publishedBefore: string | null,
 ): EvidenceItem[] {
   if (profile === null) return [];
+  const publishedBeforeMs = publishedBefore === null ? null : new Date(publishedBefore).getTime();
   const retrievedAt = new Date().toISOString();
   const evidence: EvidenceItem[] = [];
   const seen = new Set<string>();
+  // Exact-fetched quotes win over provider-native title+snippet for the same
+  // pack+URL (content hashes differ, so the identity Set alone is not enough).
+  const exactFetchedPackUrls = new Set<string>();
   const discoveryByUrl = new Map(
     discoveries.map((discovery) => [canonicalizeUrl(discovery.url), discovery]),
   );
@@ -182,9 +282,30 @@ function validatedPublicEvidenceItems(
   for (const accepted of validatedEvidence) {
     const discovery = discoveryByUrl.get(canonicalizeUrl(accepted.source_url));
     if (discovery === undefined) continue;
-    for (const sourcePackId of discovery.source_pack_ids) {
+    // Snapshot contract: a profile run assembles the evidence ledger as of its
+    // date boundary, so an item dated after the boundary can never be ledger
+    // evidence. Coverage evaluation already treats such items as ineligible
+    // (futureEvidenceCount) and the release canary rejects any manifest that
+    // contains one (public_manifest_invalid, 2026-07-27: a planner-found
+    // repository stamped with its post-as-of pushed_at). Providers enforce
+    // published_before only when the subquery carries it; planner queries do
+    // not, so the boundary is enforced here, once, at assembly.
+    if (!withinAsOfBoundary(discovery, publishedBeforeMs)) continue;
+    for (const sourcePackId of packIdsForDiscovery(discovery, profile)) {
       const pack = profile.sourcePacks.find((candidate) => candidate.id === sourcePackId);
       if (pack === undefined || pack.visibility !== 'public') continue;
+      // Evidence provenance: a discovery becomes pack evidence only when it was
+      // acquired through one of the pack's declared providers. Seed attribution
+      // satisfies this by construction (compileProfileExecution builds pack
+      // seeds from the same providers list), so this binds the domain-matched
+      // path: without it a tavily/searxng result on github.com is attributed to
+      // open-implementation-sources, whose v2 contract is native GitHub evidence
+      // only, and a github-native repository record is attributed to
+      // ai-design-guidance, whose contract is web providers. The release
+      // canary's independent per-pack provider whitelist rejects both
+      // (public_manifest_invalid, 2026-07-27). Dropped discoveries still inform
+      // synthesis; they just never enter the pack's evidence ledger.
+      if (!pack.providers.includes(discovery.provider)) continue;
       const identity = createEvidenceIdentity({
         sourceRef: accepted.source_url,
         content: accepted.content,
@@ -193,6 +314,7 @@ function validatedPublicEvidenceItems(
       const packedIdentity = `${sourcePackId}\u0000${identity.id}`;
       if (seen.has(packedIdentity)) continue;
       seen.add(packedIdentity);
+      exactFetchedPackUrls.add(`${sourcePackId}\u0000${canonicalizeUrl(accepted.source_url)}`);
       evidence.push(EvidenceItemSchema.parse({
         ...identity,
         sourceRef: accepted.source_url,
@@ -220,6 +342,58 @@ function validatedPublicEvidenceItems(
       }));
     }
   }
+
+  // Provider-native discovery evidence for HN / RSS / podcasts / tavily /
+  // searxng. Only when the discovery already carries a seed or domain pack id
+  // — never invent packs from a bare host. Prefer exact-fetched quotes when
+  // both exist for the same pack+URL.
+  for (const discovery of discoveries) {
+    if (!PROVIDER_NATIVE_DISCOVERY_PROVIDERS.has(discovery.provider)) continue;
+    if (!withinAsOfBoundary(discovery, publishedBeforeMs)) continue;
+    const body = discoveryBody(discovery);
+    if (body.length < MIN_PROVIDER_NATIVE_BODY_CHARS) continue;
+    for (const sourcePackId of packIdsForDiscovery(discovery, profile)) {
+      const pack = profile.sourcePacks.find((candidate) => candidate.id === sourcePackId);
+      if (pack === undefined || pack.visibility !== 'public') continue;
+      if (!pack.providers.includes(discovery.provider)) continue;
+      const packUrlKey = `${sourcePackId}\u0000${canonicalizeUrl(discovery.url)}`;
+      if (exactFetchedPackUrls.has(packUrlKey)) continue;
+      const identity = createEvidenceIdentity({
+        sourceRef: discovery.url,
+        content: body,
+        publishedAt: discovery.published_at,
+      });
+      const packedIdentity = `${sourcePackId}\u0000${identity.id}`;
+      if (seen.has(packedIdentity)) continue;
+      seen.add(packedIdentity);
+      evidence.push(EvidenceItemSchema.parse({
+        ...identity,
+        sourceRef: discovery.url,
+        canonicalUrl: canonicalizeUrl(discovery.url),
+        title: discovery.title,
+        author: discovery.author,
+        publishedAt: discovery.published_at,
+        retrievedAt,
+        provider: discovery.provider,
+        sourceClass: sourceClassForMode(discovery.source_modes[0]),
+        lane: pack.lane as SourceLane,
+        sourcePackId,
+        visibility: 'public',
+        exactQuote: body.slice(0, 2_000),
+        contentRef: discovery.url,
+        engagement: Object.fromEntries(
+          Object.entries(discovery.engagement).filter((entry): entry is [string, number] => typeof entry[1] === 'number'),
+        ),
+        metadata: {
+          source_modes: discovery.source_modes,
+          backend: discovery.raw_metadata['backend'],
+          evidence_kind: 'provider_native_discovery',
+          validation: 'provider_native_discovery',
+        },
+      }));
+    }
+  }
+
   return evidence;
 }
 
@@ -233,7 +407,7 @@ function exactAsOfBoundary(asOf: string): string {
 export async function runResearchProgram(input: RunResearchProgramInput): Promise<ResearchProgramResult> {
   const adapters = input.trustedAdapters ?? [];
   const availableProviders = input.availableProviders ??
-    (Object.keys(getEnabledSearchProviders()) as ProviderName[]);
+    (Object.keys(getEnabledSearchProviders(input.credentials)) as ProviderName[]);
   const asOfDate = input.asOf.slice(0, 10);
   const profileExecution = input.profileRef !== undefined
     ? compileProfileExecution(input.profileRef, {
@@ -259,8 +433,8 @@ export async function runResearchProgram(input: RunResearchProgramInput): Promis
     asOf: input.asOf,
     scopes: input.scopes,
   });
-  if (profileExecution !== null) {
-    const publishedBefore = exactAsOfBoundary(input.asOf);
+  const publishedBefore = profileExecution !== null ? exactAsOfBoundary(input.asOf) : null;
+  if (profileExecution !== null && publishedBefore !== null) {
     plan.seededSubqueries = profileExecution.seedSubqueries.map((subquery) => ({
       ...subquery,
       search_options: { ...subquery.search_options, published_before: publishedBefore },
@@ -284,6 +458,7 @@ export async function runResearchProgram(input: RunResearchProgramInput): Promis
   const publicPromise: Promise<KindResearchResult | null> = plan.publicModes.length === 0
     ? Promise.resolve(null)
     : (input.publicRunner ?? runResearch)({
+        credentials: input.credentials,
         brief: `${profileExecution?.compiledBrief.outboundBrief ?? input.brief}\n\n${plan.outboundPreamble}`,
         kind,
         maxCostUsd: input.maxCostUsd,
@@ -338,15 +513,17 @@ export async function runResearchProgram(input: RunResearchProgramInput): Promis
     publicResearch?.discoveries ?? [],
     publicResearch?.validatedEvidence ?? [],
     profileExecution?.profile ?? null,
+    publishedBefore,
   );
-  const validatedPublicUrls = new Set(
-    (publicResearch?.validatedEvidence ?? []).map((item) => canonicalizeUrl(item.source_url)),
-  );
-  const validatedDiscoveries = (publicResearch?.discoveries ?? []).filter((discovery) =>
-    validatedPublicUrls.has(canonicalizeUrl(discovery.url)));
+  // Source-mode coverage is discovery coverage: a mode is covered when its
+  // search returned enough hits. Do NOT require exact-fetched quotes —
+  // provider-native modes (github REST, HN, RSS) routinely lack HTML extract
+  // while still producing pack evidence. Filtering to validatedEvidence here
+  // was the 2026-08-04 canary failure after github native admission:
+  // program_incomplete uncovered community+github while pack floors passed.
   const coverage = evaluateSourceModeCoverage(
     plan,
-    validatedDiscoveries,
+    publicResearch?.discoveries ?? [],
     trustedCounts(evidenceByMode),
   );
   const profileCoverage = profileExecution !== null

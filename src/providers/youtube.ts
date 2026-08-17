@@ -15,6 +15,7 @@
 
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import { MissingCredentialError, type ResearchCredentials } from '../credentials.js';
 import { sleep } from '../pipeline-core.js';
 import {
   SearchResultSchema,
@@ -77,17 +78,11 @@ async function quotaAwareThrottle(): Promise<void> {
 // API key
 // =============================================================================
 
-function getApiKey(): string {
-  const key = process.env.YOUTUBE_API_KEY;
-  if (key === undefined || key === '') {
-    throw new Error('YOUTUBE_API_KEY environment variable is not configured');
+function requireApiKey(credentials: ResearchCredentials): string {
+  if (credentials.youtubeApiKey === undefined) {
+    throw new MissingCredentialError('youtubeApiKey', 'required for the YouTube Data API lane');
   }
-  return key;
-}
-
-function isEnabled(): boolean {
-  const key = process.env.YOUTUBE_API_KEY;
-  return key !== undefined && key !== '';
+  return credentials.youtubeApiKey;
 }
 
 // =============================================================================
@@ -240,13 +235,14 @@ function youtubeOrders(sort: SearchOpts['sort']): YouTubeOrder[] {
 }
 
 async function searchYouTubeOrder(
+  credentials: ResearchCredentials,
   query: string,
   opts: SearchOpts,
   order: YouTubeOrder,
   target: number,
   channelId: string | undefined,
 ): Promise<SearchResult[]> {
-  const apiKey = getApiKey();
+  const apiKey = requireApiKey(credentials);
   const maxPages = Math.max(1, Math.min(opts.max_pages ?? 1, 10));
   const perPage = Math.max(1, Math.min(50, Math.ceil(target / maxPages)));
   const results: SearchResult[] = [];
@@ -339,285 +335,286 @@ function interleaveYouTubeResults(groups: SearchResult[][], limit: number): Sear
 // Provider
 // =============================================================================
 
-export const youtubeProvider: SearchProvider = {
-  name: 'youtube',
+export function createYoutubeProvider(credentials: ResearchCredentials): SearchProvider {
+  return {
+    name: 'youtube',
 
-  capabilities: {
-    search: true,
-    fetch: true,
-    extract: true,
-    backends: ['youtube_data_api', 'youtube_transcript'],
-  },
+    capabilities: {
+      search: true,
+      fetch: true,
+      extract: true,
+      backends: ['youtube_data_api', 'youtube_transcript'],
+    },
 
-  get enabled(): boolean {
-    return isEnabled();
-  },
+    enabled: credentials.youtubeApiKey !== undefined,
 
-  async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
-    const limit = Math.max(1, Math.min(opts.limit ?? 15, 50));
-    const orders = youtubeOrders(opts.sort);
-    const channels = opts.channel_ids !== undefined && opts.channel_ids.length > 0
-      ? opts.channel_ids
-      : [undefined];
-    const strategyCount = orders.length * channels.length;
-    const target = Math.max(1, Math.ceil(limit / strategyCount));
-    const groups: SearchResult[][] = [];
-    for (const order of orders) {
-      for (const channelId of channels) {
-        groups.push(await searchYouTubeOrder(query, opts, order, target, channelId));
+    async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
+      const limit = Math.max(1, Math.min(opts.limit ?? 15, 50));
+      const orders = youtubeOrders(opts.sort);
+      const channels = opts.channel_ids !== undefined && opts.channel_ids.length > 0
+        ? opts.channel_ids
+        : [undefined];
+      const strategyCount = orders.length * channels.length;
+      const target = Math.max(1, Math.ceil(limit / strategyCount));
+      const groups: SearchResult[][] = [];
+      for (const order of orders) {
+        for (const channelId of channels) {
+          groups.push(await searchYouTubeOrder(credentials, query, opts, order, target, channelId));
+        }
       }
-    }
-    const results = interleaveYouTubeResults(groups, limit);
+      const results = interleaveYouTubeResults(groups, limit);
 
-    logger.info(
-      { query: query.slice(0, 60), count: results.length, orders, channels: channels.length },
-      '[YouTube] Search complete',
-    );
+      logger.info(
+        { query: query.slice(0, 60), count: results.length, orders, channels: channels.length },
+        '[YouTube] Search complete',
+      );
 
-    return results;
-  },
+      return results;
+    },
 
-  async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
-    const apiKey = getApiKey();
+    async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
+      const apiKey = requireApiKey(credentials);
 
-    const videoId = extractVideoId(url);
-    if (videoId === null) {
-      return FetchResultSchema.parse({
-        provider: 'youtube',
-        url,
-        fetch_status: 'failed',
-        fetch_error: `Could not extract video ID from URL: ${url}`,
-      });
-    }
-
-    // Fetch transcript using existing helper
-    const transcriptResult = await fetchYouTubeTranscript(url);
-
-    // Determine comment budget: 500 for videos >1M views, else 200
-    const viewCount = transcriptResult.viewCount;
-    const maxCommentTarget = viewCount > 1_000_000 ? 500 : 200;
-
-    // -------------------------------------------------------------------------
-    // Phase 1.5: Paginated comment fetch (up to maxCommentTarget), order=relevance
-    // -------------------------------------------------------------------------
-    type CommentRecord = { id: string; author: string; text: string; likes: number; publishedAt: string; totalReplyCount: number };
-    let topComments: CommentRecord[] = [];
-
-    try {
-      let pageToken: string | undefined = undefined;
-      let fetched = 0;
-
-      while (fetched < maxCommentTarget) {
-        const remaining = maxCommentTarget - fetched;
-        const pageSize = Math.min(remaining, 100); // API max is 100
-
-        await rateLimit();
-        await quotaAwareThrottle();
-
-        const commentParams = new URLSearchParams({
-          part: 'snippet',
-          videoId,
-          maxResults: String(pageSize),
-          order: 'relevance',
-          key: apiKey,
+      const videoId = extractVideoId(url);
+      if (videoId === null) {
+        return FetchResultSchema.parse({
+          provider: 'youtube',
+          url,
+          fetch_status: 'failed',
+          fetch_error: `Could not extract video ID from URL: ${url}`,
         });
-        if (pageToken !== undefined) {
-          commentParams.set('pageToken', pageToken);
-        }
-
-        const commentResponse = await fetch(`${YT_BASE}/commentThreads?${commentParams.toString()}`, {
-          signal: signal !== undefined ? signal : AbortSignal.timeout(20000),
-        });
-
-        if (!commentResponse.ok) {
-          break;
-        }
-
-        const rawComments: unknown = await commentResponse.json();
-        const commentsParsed = YtCommentThreadsResponseSchema.safeParse(rawComments);
-
-        if (!commentsParsed.success) {
-          break;
-        }
-
-        for (const thread of commentsParsed.data.items) {
-          const tlc = thread.snippet.topLevelComment;
-          topComments.push({
-            id: tlc.id,
-            author: tlc.snippet.authorDisplayName,
-            text: tlc.snippet.textDisplay,
-            likes: tlc.snippet.likeCount,
-            publishedAt: tlc.snippet.publishedAt,
-            totalReplyCount: thread.snippet.totalReplyCount,
-          });
-          fetched++;
-        }
-
-        const nextPage = commentsParsed.data.nextPageToken;
-        if (nextPage === undefined || commentsParsed.data.items.length === 0) {
-          break;
-        }
-        pageToken = nextPage;
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn({ videoId, error: msg }, '[YouTube] Comment fetch failed, continuing without comments');
-    }
 
-    // Sort by likes desc before reply fetch so we pick the top 30 by engagement
-    topComments.sort((a, b) => b.likes - a.likes);
+      // Fetch transcript using existing helper
+      const transcriptResult = await fetchYouTubeTranscript(url);
 
-    // -------------------------------------------------------------------------
-    // Phase 1.5: Fetch reply threads for top 30 comments (up to 5 replies each)
-    // -------------------------------------------------------------------------
-    type ReplyRecord = { parentId: string; author: string; text: string; likes: number; publishedAt: string };
-    const replysByParentId: Record<string, ReplyRecord[]> = {};
+      // Determine comment budget: 500 for videos >1M views, else 200
+      const viewCount = transcriptResult.viewCount;
+      const maxCommentTarget = viewCount > 1_000_000 ? 500 : 200;
 
-    const commentsWithReplies = topComments.slice(0, 30).filter((c) => c.totalReplyCount > 0);
+      // -------------------------------------------------------------------------
+      // Phase 1.5: Paginated comment fetch (up to maxCommentTarget), order=relevance
+      // -------------------------------------------------------------------------
+      type CommentRecord = { id: string; author: string; text: string; likes: number; publishedAt: string; totalReplyCount: number };
+      let topComments: CommentRecord[] = [];
 
-    for (const comment of commentsWithReplies) {
       try {
-        await rateLimit();
-        await quotaAwareThrottle();
+        let pageToken: string | undefined = undefined;
+        let fetched = 0;
 
-        const replyParams = new URLSearchParams({
-          part: 'snippet',
-          parentId: comment.id,
-          maxResults: '5',
-          key: apiKey,
-        });
+        while (fetched < maxCommentTarget) {
+          const remaining = maxCommentTarget - fetched;
+          const pageSize = Math.min(remaining, 100); // API max is 100
 
-        const replyResponse = await fetch(`${YT_BASE}/comments?${replyParams.toString()}`, {
-          signal: signal !== undefined ? signal : AbortSignal.timeout(15000),
-        });
+          await rateLimit();
+          await quotaAwareThrottle();
 
-        if (!replyResponse.ok) {
-          continue;
+          const commentParams = new URLSearchParams({
+            part: 'snippet',
+            videoId,
+            maxResults: String(pageSize),
+            order: 'relevance',
+            key: apiKey,
+          });
+          if (pageToken !== undefined) {
+            commentParams.set('pageToken', pageToken);
+          }
+
+          const commentResponse = await fetch(`${YT_BASE}/commentThreads?${commentParams.toString()}`, {
+            signal: signal !== undefined ? signal : AbortSignal.timeout(20000),
+          });
+
+          if (!commentResponse.ok) {
+            break;
+          }
+
+          const rawComments: unknown = await commentResponse.json();
+          const commentsParsed = YtCommentThreadsResponseSchema.safeParse(rawComments);
+
+          if (!commentsParsed.success) {
+            break;
+          }
+
+          for (const thread of commentsParsed.data.items) {
+            const tlc = thread.snippet.topLevelComment;
+            topComments.push({
+              id: tlc.id,
+              author: tlc.snippet.authorDisplayName,
+              text: tlc.snippet.textDisplay,
+              likes: tlc.snippet.likeCount,
+              publishedAt: tlc.snippet.publishedAt,
+              totalReplyCount: thread.snippet.totalReplyCount,
+            });
+            fetched++;
+          }
+
+          const nextPage = commentsParsed.data.nextPageToken;
+          if (nextPage === undefined || commentsParsed.data.items.length === 0) {
+            break;
+          }
+          pageToken = nextPage;
         }
-
-        const rawReplies: unknown = await replyResponse.json();
-        const repliesParsed = YtRepliesResponseSchema.safeParse(rawReplies);
-
-        if (!repliesParsed.success) {
-          continue;
-        }
-
-        replysByParentId[comment.id] = repliesParsed.data.items.map((r) => ({
-          parentId: comment.id,
-          author: r.snippet.authorDisplayName,
-          text: r.snippet.textDisplay,
-          likes: r.snippet.likeCount,
-          publishedAt: r.snippet.publishedAt,
-        }));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        logger.warn({ videoId, parentId: comment.id, error: msg }, '[YouTube] Reply fetch failed, skipping');
+        logger.warn({ videoId, error: msg }, '[YouTube] Comment fetch failed, continuing without comments');
       }
-    }
 
-    // -------------------------------------------------------------------------
-    // Phase 1.5: Build timestamp-anchored transcript text
-    // Each segment prefixed with [t=<sec>] for Gemini to emit source_url#t=<sec>
-    // -------------------------------------------------------------------------
-    let timestampedTranscript = '';
-    if (transcriptResult.success && transcriptResult.segments.length > 0) {
-      const segmentLines: string[] = [];
-      for (const seg of transcriptResult.segments) {
-        const secInt = Math.floor(seg.start);
-        segmentLines.push(`[t=${secInt}] ${seg.text}`);
-      }
-      timestampedTranscript = segmentLines.join('\n');
-    }
+      // Sort by likes desc before reply fetch so we pick the top 30 by engagement
+      topComments.sort((a, b) => b.likes - a.likes);
 
-    // Build markdown
-    const title = transcriptResult.title.length > 0 ? transcriptResult.title : `YouTube Video ${videoId}`;
-    const lines: string[] = [`# ${title}`, ''];
+      // -------------------------------------------------------------------------
+      // Phase 1.5: Fetch reply threads for top 30 comments (up to 5 replies each)
+      // -------------------------------------------------------------------------
+      type ReplyRecord = { parentId: string; author: string; text: string; likes: number; publishedAt: string };
+      const replysByParentId: Record<string, ReplyRecord[]> = {};
 
-    if (transcriptResult.channelName.length > 0) {
-      lines.push(`**Channel:** ${transcriptResult.channelName}`, '');
-    }
+      const commentsWithReplies = topComments.slice(0, 30).filter((c) => c.totalReplyCount > 0);
 
-    if (timestampedTranscript.length > 0) {
-      lines.push('## Transcript (with timestamps)', '', timestampedTranscript, '');
-    } else if (transcriptResult.success && transcriptResult.transcript.length > 0) {
-      lines.push('## Transcript', '', transcriptResult.transcript, '');
-    } else if (transcriptResult.error !== null) {
-      lines.push(`*Transcript unavailable: ${transcriptResult.error}*`, '');
-    }
+      for (const comment of commentsWithReplies) {
+        try {
+          await rateLimit();
+          await quotaAwareThrottle();
 
-    if (topComments.length > 0) {
-      lines.push('## Top Comments', '');
-      for (const comment of topComments) {
-        lines.push(`**${comment.author}** (${comment.likes} likes)`);
-        lines.push('');
-        lines.push(comment.text);
+          const replyParams = new URLSearchParams({
+            part: 'snippet',
+            parentId: comment.id,
+            maxResults: '5',
+            key: apiKey,
+          });
 
-        const replies = replysByParentId[comment.id];
-        if (replies !== undefined && replies.length > 0) {
-          lines.push('');
-          lines.push('*Replies:*');
-          for (const reply of replies) {
-            lines.push(`  > **${reply.author}** (${reply.likes} likes): ${reply.text}`);
+          const replyResponse = await fetch(`${YT_BASE}/comments?${replyParams.toString()}`, {
+            signal: signal !== undefined ? signal : AbortSignal.timeout(15000),
+          });
+
+          if (!replyResponse.ok) {
+            continue;
           }
+
+          const rawReplies: unknown = await replyResponse.json();
+          const repliesParsed = YtRepliesResponseSchema.safeParse(rawReplies);
+
+          if (!repliesParsed.success) {
+            continue;
+          }
+
+          replysByParentId[comment.id] = repliesParsed.data.items.map((r) => ({
+            parentId: comment.id,
+            author: r.snippet.authorDisplayName,
+            text: r.snippet.textDisplay,
+            likes: r.snippet.likeCount,
+            publishedAt: r.snippet.publishedAt,
+          }));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn({ videoId, parentId: comment.id, error: msg }, '[YouTube] Reply fetch failed, skipping');
         }
-
-        lines.push('');
-        lines.push('---');
-        lines.push('');
       }
-    }
 
-    const markdown = lines.join('\n');
-    const publishedAt = transcriptResult.publishDate.length > 0 ? toIsoString(transcriptResult.publishDate) : undefined;
+      // -------------------------------------------------------------------------
+      // Phase 1.5: Build timestamp-anchored transcript text
+      // Each segment prefixed with [t=<sec>] for Gemini to emit source_url#t=<sec>
+      // -------------------------------------------------------------------------
+      let timestampedTranscript = '';
+      if (transcriptResult.success && transcriptResult.segments.length > 0) {
+        const segmentLines: string[] = [];
+        for (const seg of transcriptResult.segments) {
+          const secInt = Math.floor(seg.start);
+          segmentLines.push(`[t=${secInt}] ${seg.text}`);
+        }
+        timestampedTranscript = segmentLines.join('\n');
+      }
 
-    const result = FetchResultSchema.parse({
-      provider: 'youtube',
-      url,
-      canonical_id: videoId,
-      title,
-      author: transcriptResult.channelName.length > 0 ? transcriptResult.channelName : undefined,
-      published_at: publishedAt,
-      raw_content: timestampedTranscript.length > 0 ? timestampedTranscript : transcriptResult.transcript,
-      markdown,
-      engagement: {
-        view_count: transcriptResult.viewCount > 0 ? transcriptResult.viewCount : undefined,
-        like_count: transcriptResult.likeCount > 0 ? transcriptResult.likeCount : undefined,
-        comment_count: topComments.length > 0 ? topComments.length : undefined,
-      },
-      fetch_status: transcriptResult.success ? 'ok' : 'partial',
-      fetch_error: transcriptResult.error !== null ? transcriptResult.error : undefined,
-      raw_metadata: {
-        backend: 'youtube_data_api+youtube_transcript',
-        top_comments: topComments,
-        replies_by_parent_id: replysByParentId,
-        segments: transcriptResult.segments,
-        duration_seconds: transcriptResult.durationSeconds,
-        keywords: transcriptResult.keywords,
-      },
-    });
+      // Build markdown
+      const title = transcriptResult.title.length > 0 ? transcriptResult.title : `YouTube Video ${videoId}`;
+      const lines: string[] = [`# ${title}`, ''];
 
-    logger.info(
-      {
-        url: url.slice(0, 60),
-        videoId,
-        transcriptWords: transcriptResult.wordCount,
-        comments: topComments.length,
-        commentsWithReplies: commentsWithReplies.length,
-        maxCommentTarget,
-      },
-      '[YouTube] Fetch complete (Phase 1.5)',
-    );
+      if (transcriptResult.channelName.length > 0) {
+        lines.push(`**Channel:** ${transcriptResult.channelName}`, '');
+      }
 
-    return result;
-  },
+      if (timestampedTranscript.length > 0) {
+        lines.push('## Transcript (with timestamps)', '', timestampedTranscript, '');
+      } else if (transcriptResult.success && transcriptResult.transcript.length > 0) {
+        lines.push('## Transcript', '', transcriptResult.transcript, '');
+      } else if (transcriptResult.error !== null) {
+        lines.push(`*Transcript unavailable: ${transcriptResult.error}*`, '');
+      }
 
-  async extract(raw: FetchResult): Promise<ExtractedQuotes> {
-    const content = raw.markdown.length > 0 ? raw.markdown : raw.raw_content;
-    return extractQuotesWithGemini({
-      provider: 'youtube',
-      url: raw.url,
-      content,
-      mode: 'youtube',
-    });
-  },
-};
+      if (topComments.length > 0) {
+        lines.push('## Top Comments', '');
+        for (const comment of topComments) {
+          lines.push(`**${comment.author}** (${comment.likes} likes)`);
+          lines.push('');
+          lines.push(comment.text);
+
+          const replies = replysByParentId[comment.id];
+          if (replies !== undefined && replies.length > 0) {
+            lines.push('');
+            lines.push('*Replies:*');
+            for (const reply of replies) {
+              lines.push(`  > **${reply.author}** (${reply.likes} likes): ${reply.text}`);
+            }
+          }
+
+          lines.push('');
+          lines.push('---');
+          lines.push('');
+        }
+      }
+
+      const markdown = lines.join('\n');
+      const publishedAt = transcriptResult.publishDate.length > 0 ? toIsoString(transcriptResult.publishDate) : undefined;
+
+      const result = FetchResultSchema.parse({
+        provider: 'youtube',
+        url,
+        canonical_id: videoId,
+        title,
+        author: transcriptResult.channelName.length > 0 ? transcriptResult.channelName : undefined,
+        published_at: publishedAt,
+        raw_content: timestampedTranscript.length > 0 ? timestampedTranscript : transcriptResult.transcript,
+        markdown,
+        engagement: {
+          view_count: transcriptResult.viewCount > 0 ? transcriptResult.viewCount : undefined,
+          like_count: transcriptResult.likeCount > 0 ? transcriptResult.likeCount : undefined,
+          comment_count: topComments.length > 0 ? topComments.length : undefined,
+        },
+        fetch_status: transcriptResult.success ? 'ok' : 'partial',
+        fetch_error: transcriptResult.error !== null ? transcriptResult.error : undefined,
+        raw_metadata: {
+          backend: 'youtube_data_api+youtube_transcript',
+          top_comments: topComments,
+          replies_by_parent_id: replysByParentId,
+          segments: transcriptResult.segments,
+          duration_seconds: transcriptResult.durationSeconds,
+          keywords: transcriptResult.keywords,
+        },
+      });
+
+      logger.info(
+        {
+          url: url.slice(0, 60),
+          videoId,
+          transcriptWords: transcriptResult.wordCount,
+          comments: topComments.length,
+          commentsWithReplies: commentsWithReplies.length,
+          maxCommentTarget,
+        },
+        '[YouTube] Fetch complete (Phase 1.5)',
+      );
+
+      return result;
+    },
+
+    async extract(raw: FetchResult): Promise<ExtractedQuotes> {
+      const content = raw.markdown.length > 0 ? raw.markdown : raw.raw_content;
+      return extractQuotesWithGemini({
+        credentials,
+        provider: 'youtube',
+        url: raw.url,
+        content,
+        mode: 'youtube',
+      });
+    },
+  };
+}

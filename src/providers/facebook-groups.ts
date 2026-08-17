@@ -1,7 +1,9 @@
 /**
  * Facebook Groups Search Provider
  *
- * Uses Apify actor `apify/facebook-groups-scraper` to scrape posts + comments
+ * Prefers Bright Data Facebook-groups dataset when
+ * BRIGHTDATA_FB_GROUPS_DATASET_ID is set. Apify actor
+ * `apify/facebook-groups-scraper` is last-resort only (APIFY_ALLOW_FALLBACK=1).
  * from public Facebook groups. The provider's search() pivots a query string
  * against a curated allowlist of known AI-curious beginner groups (see SEED_GROUPS
  * below). For v1, group selection is keyword-matched against the query; no
@@ -13,6 +15,11 @@
 
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import {
+  isApifyFallbackAllowed,
+  MissingCredentialError,
+  type ResearchCredentials,
+} from '../credentials.js';
 import { sleep } from '../pipeline-core.js';
 import {
   SearchResultSchema,
@@ -24,6 +31,7 @@ import {
   type SearchOpts,
 } from '../types.js';
 import { extractQuotesWithGemini } from './gemini-extractor.js';
+import { fetchFacebookGroupPostsBrightData } from './brightdata.js';
 
 // =============================================================================
 // Rate limiter — 5-second queue between Apify calls
@@ -123,17 +131,11 @@ const ACTOR_ID = 'apify/facebook-groups-scraper';
 const POLL_INTERVAL_MS = 5_000;
 const MAX_WAIT_MS = 5 * 60 * 1_000;
 
-function getApifyToken(): string {
-  const token = process.env.APIFY_API_TOKEN;
-  if (token === undefined || token === '') {
-    throw new Error('APIFY_API_TOKEN environment variable is not configured');
+function requireApifyToken(credentials: ResearchCredentials): string {
+  if (credentials.apifyApiToken === undefined) {
+    throw new MissingCredentialError('apifyApiToken', 'required for the Facebook groups lane');
   }
-  return token;
-}
-
-function isEnabled(): boolean {
-  const token = process.env.APIFY_API_TOKEN;
-  return token !== undefined && token !== '';
+  return credentials.apifyApiToken;
 }
 
 interface ApifyRunData {
@@ -273,28 +275,171 @@ function toIsoString(dateStr: string): string | undefined {
 // Provider
 // =============================================================================
 
-export const facebookGroupsProvider: SearchProvider = {
-  name: 'facebook_groups',
+function hasFacebookGroupsBackend(credentials: ResearchCredentials): boolean {
+  const hasBrightData =
+    credentials.brightdata !== undefined &&
+    credentials.brightdata.facebookGroupsDatasetId !== undefined;
+  return hasBrightData || isApifyFallbackAllowed(credentials);
+}
 
-  get enabled(): boolean {
-    return isEnabled();
-  },
+export function createFacebookGroupsProvider(credentials: ResearchCredentials): SearchProvider {
+  return {
+    name: 'facebook_groups',
 
-  async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
-    const token = getApifyToken();
-    const limit = opts.limit !== undefined ? Math.min(opts.limit, 50) : 25;
+    enabled: hasFacebookGroupsBackend(credentials),
 
-    // Select 2 groups per search call to stay within cost budget
-    const groups = selectGroupsForQuery(query, 2);
-    const results: SearchResult[] = [];
+    async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
+      const limit = opts.limit !== undefined ? Math.min(opts.limit, 50) : 25;
 
-    for (const group of groups) {
+      // Select 2 groups per search call to stay within cost budget
+      const groups = selectGroupsForQuery(query, 2);
+      const results: SearchResult[] = [];
+
+      for (const group of groups) {
+        const groupUrl = `https://www.facebook.com/groups/${group.slug}`;
+
+        // Primary: Bright Data FB groups dataset when configured.
+        if (
+          credentials.brightdata !== undefined &&
+          credentials.brightdata.facebookGroupsDatasetId !== undefined
+        ) {
+          try {
+            const bdItems = await fetchFacebookGroupPostsBrightData(
+              credentials,
+              groupUrl,
+              limit,
+            );
+            for (const item of bdItems) {
+              const candidate = {
+                provider: 'facebook_groups' as const,
+                url: item.url,
+                title: item.title.slice(0, 200),
+                snippet: item.excerpt.slice(0, 500),
+                author: item.author !== null ? item.author : undefined,
+                published_at: item.publishedAt !== null ? item.publishedAt : undefined,
+                engagement: {
+                  upvotes: item.engagement.likes,
+                  comment_count: item.engagement.comments,
+                },
+                raw_metadata: {
+                  group_slug: group.slug,
+                  backend: 'brightdata',
+                },
+              };
+              const validated = SearchResultSchema.safeParse(candidate);
+              if (validated.success) results.push(validated.data);
+            }
+            logger.info(
+              {
+                group: group.name,
+                items: bdItems.length,
+                query: query.slice(0, 60),
+                backend: 'brightdata',
+              },
+              '[FacebookGroups] Scrape complete',
+            );
+            continue;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.warn(
+              { group: group.name, error: msg.slice(0, 120) },
+              '[FacebookGroups] Bright Data scrape failed',
+            );
+            if (!isApifyFallbackAllowed(credentials)) {
+              continue;
+            }
+          }
+        }
+
+        if (!isApifyFallbackAllowed(credentials)) {
+          logger.warn(
+            { group: group.name },
+            '[FacebookGroups] No Bright Data path and APIFY_ALLOW_FALLBACK is not set — skipping',
+          );
+          continue;
+        }
+
+        await rateLimit();
+        const token = requireApifyToken(credentials);
+        const input: Record<string, unknown> = {
+          startUrls: [{ url: groupUrl }],
+          resultsLimit: limit,
+        };
+
+        let items: unknown[] = [];
+
+        try {
+          const { runId, datasetId } = await startApifyRun(ACTOR_ID, input, token);
+          await pollRunUntilDone(runId, token);
+          items = await fetchDatasetItems(datasetId, token);
+          logger.info(
+            { group: group.name, items: items.length, query: query.slice(0, 60), backend: 'apify' },
+            '[FacebookGroups] Scrape complete',
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn({ group: group.name, error: msg }, '[FacebookGroups] Scrape failed, skipping group');
+          continue;
+        }
+
+        for (const rawItem of items) {
+          const parsed = FbPostItemSchema.safeParse(rawItem);
+          if (!parsed.success) continue;
+
+          const item = parsed.data;
+          const permalink = extractPermalink(item);
+          if (permalink === null) continue;
+
+          const snippetSource = item.text !== undefined ? item.text : (item.title !== undefined ? item.title : '');
+          const titleSource = item.title !== undefined && item.title.length > 0
+            ? item.title
+            : snippetSource.slice(0, 80);
+
+          const publishedAt = item.timestamp !== undefined ? toIsoString(item.timestamp) : undefined;
+          const author = extractAuthorName(item);
+
+          const candidate = {
+            provider: 'facebook_groups' as const,
+            url: permalink,
+            canonical_id: item.id !== undefined && item.id.length > 0 ? item.id : undefined,
+            title: titleSource.slice(0, 200),
+            snippet: snippetSource.slice(0, 500),
+            author,
+            published_at: publishedAt,
+            engagement: {
+              upvotes: item.reactionsCount,
+              comment_count: item.commentsCount,
+            },
+            raw_metadata: {
+              group_slug: group.slug,
+              group_name: group.name,
+              group_url: groupUrl,
+            },
+          };
+
+          const validated = SearchResultSchema.safeParse(candidate);
+          if (validated.success) {
+            results.push(validated.data);
+          }
+        }
+      }
+
+      logger.info(
+        { query: query.slice(0, 60), count: results.length, groups: groups.map(g => g.name) },
+        '[FacebookGroups] Search complete',
+      );
+
+      return results;
+    },
+
+    async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
+      const token = requireApifyToken(credentials);
       await rateLimit();
 
-      const groupUrl = `https://www.facebook.com/groups/${group.slug}`;
       const input: Record<string, unknown> = {
-        startUrls: [{ url: groupUrl }],
-        resultsLimit: limit,
+        startUrls: [{ url }],
+        resultsLimit: 1,
+        commentsLimit: 100,
       };
 
       let items: unknown[] = [];
@@ -303,201 +448,127 @@ export const facebookGroupsProvider: SearchProvider = {
         const { runId, datasetId } = await startApifyRun(ACTOR_ID, input, token);
         await pollRunUntilDone(runId, token);
         items = await fetchDatasetItems(datasetId, token);
-        logger.info(
-          { group: group.name, items: items.length, query: query.slice(0, 60) },
-          '[FacebookGroups] Scrape complete',
-        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        logger.warn({ group: group.name, error: msg }, '[FacebookGroups] Scrape failed, skipping group');
-        continue;
+        return FetchResultSchema.parse({
+          provider: 'facebook_groups',
+          url,
+          fetch_status: 'failed',
+          fetch_error: `Facebook Groups fetch failed: ${msg.slice(0, 200)}`,
+        });
       }
 
-      for (const rawItem of items) {
-        const parsed = FbPostItemSchema.safeParse(rawItem);
-        if (!parsed.success) continue;
+      const firstItem = items[0];
+      if (firstItem === undefined) {
+        return FetchResultSchema.parse({
+          provider: 'facebook_groups',
+          url,
+          fetch_status: 'failed',
+          fetch_error: 'No items returned from Apify',
+        });
+      }
 
-        const item = parsed.data;
-        const permalink = extractPermalink(item);
-        if (permalink === null) continue;
+      const parsed = FbPostItemSchema.safeParse(firstItem);
+      if (!parsed.success) {
+        return FetchResultSchema.parse({
+          provider: 'facebook_groups',
+          url,
+          fetch_status: 'failed',
+          fetch_error: `Invalid item shape: ${parsed.error.message.slice(0, 100)}`,
+        });
+      }
 
-        const snippetSource = item.text !== undefined ? item.text : (item.title !== undefined ? item.title : '');
-        const titleSource = item.title !== undefined && item.title.length > 0
-          ? item.title
-          : snippetSource.slice(0, 80);
+      const item = parsed.data;
+      const snippetSource = item.text !== undefined ? item.text : '';
+      const titleSource = item.title !== undefined && item.title.length > 0
+        ? item.title
+        : snippetSource.slice(0, 80);
 
-        const publishedAt = item.timestamp !== undefined ? toIsoString(item.timestamp) : undefined;
-        const author = extractAuthorName(item);
+      // Build markdown with post + comments
+      const lines: string[] = [
+        `# ${titleSource}`,
+        '',
+        `**Author:** ${extractAuthorName(item) !== undefined ? extractAuthorName(item) : 'Unknown'} | **Reactions:** ${item.reactionsCount !== undefined ? item.reactionsCount : 0} | **Comments:** ${item.commentsCount !== undefined ? item.commentsCount : 0}`,
+        '',
+      ];
 
-        const candidate = {
-          provider: 'facebook_groups' as const,
-          url: permalink,
-          canonical_id: item.id !== undefined && item.id.length > 0 ? item.id : undefined,
-          title: titleSource.slice(0, 200),
-          snippet: snippetSource.slice(0, 500),
-          author,
-          published_at: publishedAt,
-          engagement: {
-            upvotes: item.reactionsCount,
-            comment_count: item.commentsCount,
-          },
-          raw_metadata: {
-            group_slug: group.slug,
-            group_name: group.name,
-            group_url: groupUrl,
-          },
-        };
+      if (snippetSource.length > 0) {
+        lines.push('## Post', '', snippetSource, '');
+      }
 
-        const validated = SearchResultSchema.safeParse(candidate);
-        if (validated.success) {
-          results.push(validated.data);
+      // Include raw comments if Apify returned them inline
+      const rawComments = item.comments;
+      if (rawComments !== undefined && Array.isArray(rawComments) && rawComments.length > 0) {
+        lines.push('## Comments', '');
+
+        const FbCommentSchema = z.object({
+          text: z.string().optional(),
+          author: z.union([z.string(), z.object({ name: z.string().optional() })]).optional(),
+          timestamp: z.string().optional(),
+          likesCount: z.number().optional(),
+        }).passthrough();
+
+        for (const rawComment of rawComments) {
+          const commentParsed = FbCommentSchema.safeParse(rawComment);
+          if (!commentParsed.success) continue;
+          const c = commentParsed.data;
+
+          let commentAuthor = 'Unknown';
+          if (typeof c.author === 'string' && c.author.length > 0) {
+            commentAuthor = c.author;
+          } else if (typeof c.author === 'object' && c.author !== null && c.author.name !== undefined && c.author.name.length > 0) {
+            commentAuthor = c.author.name;
+          }
+
+          const commentText = c.text !== undefined ? c.text : '';
+          if (commentText.length > 0) {
+            lines.push(`**${commentAuthor}** (${c.likesCount !== undefined ? c.likesCount : 0} likes)`);
+            lines.push('');
+            lines.push(commentText);
+            lines.push('');
+            lines.push('---');
+            lines.push('');
+          }
         }
       }
-    }
 
-    logger.info(
-      { query: query.slice(0, 60), count: results.length, groups: groups.map(g => g.name) },
-      '[FacebookGroups] Search complete',
-    );
+      const markdown = lines.join('\n');
+      const publishedAt = item.timestamp !== undefined ? toIsoString(item.timestamp) : undefined;
 
-    return results;
-  },
-
-  async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
-    const token = getApifyToken();
-    await rateLimit();
-
-    const input: Record<string, unknown> = {
-      startUrls: [{ url }],
-      resultsLimit: 1,
-      commentsLimit: 100,
-    };
-
-    let items: unknown[] = [];
-
-    try {
-      const { runId, datasetId } = await startApifyRun(ACTOR_ID, input, token);
-      await pollRunUntilDone(runId, token);
-      items = await fetchDatasetItems(datasetId, token);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return FetchResultSchema.parse({
+      const result = FetchResultSchema.parse({
         provider: 'facebook_groups',
         url,
-        fetch_status: 'failed',
-        fetch_error: `Facebook Groups fetch failed: ${msg.slice(0, 200)}`,
+        canonical_id: item.id !== undefined && item.id.length > 0 ? item.id : undefined,
+        title: titleSource.slice(0, 200),
+        author: extractAuthorName(item),
+        published_at: publishedAt,
+        raw_content: snippetSource,
+        markdown,
+        engagement: {
+          upvotes: item.reactionsCount,
+          comment_count: item.commentsCount,
+        },
+        fetch_status: 'ok',
+        raw_metadata: { url, comments: item.comments },
       });
-    }
 
-    const firstItem = items[0];
-    if (firstItem === undefined) {
-      return FetchResultSchema.parse({
+      logger.info(
+        { url: url.slice(0, 60), title: titleSource.slice(0, 40) },
+        '[FacebookGroups] Fetch complete',
+      );
+
+      return result;
+    },
+
+    async extract(raw: FetchResult): Promise<ExtractedQuotes> {
+      const content = raw.markdown.length > 0 ? raw.markdown : raw.raw_content;
+      return extractQuotesWithGemini({
+        credentials,
         provider: 'facebook_groups',
-        url,
-        fetch_status: 'failed',
-        fetch_error: 'No items returned from Apify',
+        url: raw.url,
+        content,
+        mode: 'reddit', // closest equivalent — comment threads with engagement
       });
-    }
-
-    const parsed = FbPostItemSchema.safeParse(firstItem);
-    if (!parsed.success) {
-      return FetchResultSchema.parse({
-        provider: 'facebook_groups',
-        url,
-        fetch_status: 'failed',
-        fetch_error: `Invalid item shape: ${parsed.error.message.slice(0, 100)}`,
-      });
-    }
-
-    const item = parsed.data;
-    const snippetSource = item.text !== undefined ? item.text : '';
-    const titleSource = item.title !== undefined && item.title.length > 0
-      ? item.title
-      : snippetSource.slice(0, 80);
-
-    // Build markdown with post + comments
-    const lines: string[] = [
-      `# ${titleSource}`,
-      '',
-      `**Author:** ${extractAuthorName(item) !== undefined ? extractAuthorName(item) : 'Unknown'} | **Reactions:** ${item.reactionsCount !== undefined ? item.reactionsCount : 0} | **Comments:** ${item.commentsCount !== undefined ? item.commentsCount : 0}`,
-      '',
-    ];
-
-    if (snippetSource.length > 0) {
-      lines.push('## Post', '', snippetSource, '');
-    }
-
-    // Include raw comments if Apify returned them inline
-    const rawComments = item.comments;
-    if (rawComments !== undefined && Array.isArray(rawComments) && rawComments.length > 0) {
-      lines.push('## Comments', '');
-
-      const FbCommentSchema = z.object({
-        text: z.string().optional(),
-        author: z.union([z.string(), z.object({ name: z.string().optional() })]).optional(),
-        timestamp: z.string().optional(),
-        likesCount: z.number().optional(),
-      }).passthrough();
-
-      for (const rawComment of rawComments) {
-        const commentParsed = FbCommentSchema.safeParse(rawComment);
-        if (!commentParsed.success) continue;
-        const c = commentParsed.data;
-
-        let commentAuthor = 'Unknown';
-        if (typeof c.author === 'string' && c.author.length > 0) {
-          commentAuthor = c.author;
-        } else if (typeof c.author === 'object' && c.author !== null && c.author.name !== undefined && c.author.name.length > 0) {
-          commentAuthor = c.author.name;
-        }
-
-        const commentText = c.text !== undefined ? c.text : '';
-        if (commentText.length > 0) {
-          lines.push(`**${commentAuthor}** (${c.likesCount !== undefined ? c.likesCount : 0} likes)`);
-          lines.push('');
-          lines.push(commentText);
-          lines.push('');
-          lines.push('---');
-          lines.push('');
-        }
-      }
-    }
-
-    const markdown = lines.join('\n');
-    const publishedAt = item.timestamp !== undefined ? toIsoString(item.timestamp) : undefined;
-
-    const result = FetchResultSchema.parse({
-      provider: 'facebook_groups',
-      url,
-      canonical_id: item.id !== undefined && item.id.length > 0 ? item.id : undefined,
-      title: titleSource.slice(0, 200),
-      author: extractAuthorName(item),
-      published_at: publishedAt,
-      raw_content: snippetSource,
-      markdown,
-      engagement: {
-        upvotes: item.reactionsCount,
-        comment_count: item.commentsCount,
-      },
-      fetch_status: 'ok',
-      raw_metadata: { url, comments: item.comments },
-    });
-
-    logger.info(
-      { url: url.slice(0, 60), title: titleSource.slice(0, 40) },
-      '[FacebookGroups] Fetch complete',
-    );
-
-    return result;
-  },
-
-  async extract(raw: FetchResult): Promise<ExtractedQuotes> {
-    const content = raw.markdown.length > 0 ? raw.markdown : raw.raw_content;
-    return extractQuotesWithGemini({
-      provider: 'facebook_groups',
-      url: raw.url,
-      content,
-      mode: 'reddit', // closest equivalent — comment threads with engagement
-    });
-  },
-};
+    },
+  };
+}

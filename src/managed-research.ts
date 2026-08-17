@@ -15,7 +15,8 @@
 import { z } from 'zod';
 import { safeLogger } from './logger.js';
 import type { Logger } from './logger.js';
-import { PERPLEXITY_API_URL, getPerplexityApiKey } from './providers/perplexity.js';
+import { PERPLEXITY_API_URL, requirePerplexityApiKey } from './providers/perplexity.js';
+import type { ResearchCredentials } from './credentials.js';
 import { FinalReportSchema } from './types.js';
 import type { FinalReport } from './types.js';
 
@@ -72,6 +73,8 @@ function estimateCostUsd(usage: {
 // =============================================================================
 
 export interface RunManagedResearchInput {
+  /** Host-resolved credentials; the Perplexity key is required. */
+  credentials: ResearchCredentials;
   /** The research brief / question. */
   brief: string;
   /** Perplexity reasoning effort — maps to cost/depth. Default 'medium'. */
@@ -94,7 +97,7 @@ export async function runManagedResearch(
   input: RunManagedResearchInput,
 ): Promise<RunManagedResearchResult> {
   const log: Logger = safeLogger(input.logger);
-  const apiKey = getPerplexityApiKey();
+  const apiKey = requirePerplexityApiKey(input.credentials);
   const timeoutMs = input.timeoutMs !== undefined ? input.timeoutMs : 600_000;
 
   log.info(

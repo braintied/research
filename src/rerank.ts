@@ -4,7 +4,7 @@
  */
 
 import { z } from 'zod';
-import { getVoyageKey } from './pipeline-core.js';
+import { requireVoyageApiKey, type ResearchCredentials } from './credentials.js';
 import { logger } from './logger.js';
 import type { VerbatimQuote } from './types.js';
 
@@ -53,6 +53,8 @@ function emitGaugeFireAndForget(eventType: string, metadata: Record<string, unkn
 // =============================================================================
 
 export interface RerankQuotesInput {
+  /** Host-resolved credentials. Without a Voyage key rerank falls back to score order. */
+  credentials: ResearchCredentials;
   query: string;
   quotes: VerbatimQuote[];
   topK: number;
@@ -66,7 +68,7 @@ export interface RerankQuotesResult {
 }
 
 export async function rerankQuotes(input: RerankQuotesInput): Promise<RerankQuotesResult> {
-  const { query, quotes, topK } = input;
+  const { credentials, query, quotes, topK } = input;
 
   if (quotes.length === 0) {
     return { quotes: [], rerank_used: false };
@@ -76,7 +78,7 @@ export async function rerankQuotes(input: RerankQuotesInput): Promise<RerankQuot
 
   let voyageKey: string;
   try {
-    voyageKey = getVoyageKey();
+    voyageKey = requireVoyageApiKey(credentials);
   } catch {
     emitGaugeFireAndForget('deep_research.rerank.fallback', {
       reason: 'no_api_key',

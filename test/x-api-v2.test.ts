@@ -2,47 +2,25 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { xProvider } from '../src/providers/x.js';
+import { createXProvider } from '../src/providers/x.js';
+import type { ResearchCredentials } from '../src/credentials.js';
 
 const twitterApiAdvancedSearchFixture: unknown = JSON.parse(
   readFileSync(new URL('./fixtures/twitterapi-advanced-search.json', import.meta.url), 'utf8'),
 );
 
-const X_ENV_KEYS = [
-  'X_BEARER_TOKEN',
-  'X_APP_BEARER_TOKEN',
-  'TWITTER_BEARER_TOKEN',
-  'TWITTERAPI_IO_KEY',
-  'TWITTERAPI_KEY',
-  'APIFY_API_TOKEN',
-] as const;
-
-type XEnvKey = (typeof X_ENV_KEYS)[number];
-
-function preserveXEnvironment(): Record<XEnvKey, string | undefined> {
-  return Object.fromEntries(X_ENV_KEYS.map((key) => [key, process.env[key]])) as Record<
-    XEnvKey,
-    string | undefined
-  >;
-}
-
-function clearXEnvironment(): void {
-  for (const key of X_ENV_KEYS) delete process.env[key];
-}
-
-function restoreXEnvironment(original: Record<XEnvKey, string | undefined>): void {
-  for (const key of X_ENV_KEYS) {
-    const value = original[key];
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
-  }
+/**
+ * Each test states exactly which of the three transports it configures, so
+ * backend preference is asserted against a stated config rather than whatever
+ * X credentials happen to be in the ambient environment.
+ */
+function xCredentials(config: { bearerToken?: string; twitterapiKey?: string }): ResearchCredentials {
+  return { x: config };
 }
 
 test('official X recent search maps exact dates, Top/Latest sorts, pagination, and provenance', async () => {
   const originalFetch = globalThis.fetch;
-  const originalEnv = preserveXEnvironment();
-  clearXEnvironment();
-  process.env.X_BEARER_TOKEN = 'official-test-token';
+  const xProvider = createXProvider(xCredentials({ bearerToken: 'official-test-token' }));  // git-secret-allow: fake fixture value, never a live credential
 
   const end = new Date(Date.now() - 60_000);
   const start = new Date(end.getTime() - 2 * 86_400_000);
@@ -134,15 +112,12 @@ test('official X recent search maps exact dates, Top/Latest sorts, pagination, a
     assert.equal(results[1]?.raw_metadata['sort_order'], 'recency');
   } finally {
     globalThis.fetch = originalFetch;
-    restoreXEnvironment(originalEnv);
   }
 });
 
 test('official X fetch uses post lookup and best-effort conversation search', async () => {
   const originalFetch = globalThis.fetch;
-  const originalEnv = preserveXEnvironment();
-  clearXEnvironment();
-  process.env.TWITTER_BEARER_TOKEN = 'official-alias-token';
+  const xProvider = createXProvider(xCredentials({ bearerToken: 'official-alias-token' }));  // git-secret-allow: fake fixture value, never a live credential
   const calls: URL[] = [];
 
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -194,16 +169,15 @@ test('official X fetch uses post lookup and best-effort conversation search', as
     ]);
   } finally {
     globalThis.fetch = originalFetch;
-    restoreXEnvironment(originalEnv);
   }
 });
 
 test('twitterapi.io is preferred over official X when both are configured', async () => {
   const originalFetch = globalThis.fetch;
-  const originalEnv = preserveXEnvironment();
-  clearXEnvironment();
-  process.env.TWITTERAPI_IO_KEY = 'lower-cost-test-token';
-  process.env.X_BEARER_TOKEN = 'official-test-token';
+  const xProvider = createXProvider(xCredentials({
+    twitterapiKey: 'lower-cost-test-token',  // git-secret-allow: fake fixture value, never a live credential
+    bearerToken: 'official-test-token',  // git-secret-allow: fake fixture value, never a live credential
+  }));
   const calls: URL[] = [];
 
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -233,15 +207,12 @@ test('twitterapi.io is preferred over official X when both are configured', asyn
     assert.equal(results[0]?.raw_metadata['backend'], 'twitterapi_io');
   } finally {
     globalThis.fetch = originalFetch;
-    restoreXEnvironment(originalEnv);
   }
 });
 
 test('twitterapi.io accepts the current status-less cursor envelope and paginates', async () => {
   const originalFetch = globalThis.fetch;
-  const originalEnv = preserveXEnvironment();
-  clearXEnvironment();
-  process.env.TWITTERAPI_IO_KEY = 'current-envelope-test-token';
+  const xProvider = createXProvider(xCredentials({ twitterapiKey: 'current-envelope-test-token' }));  // git-secret-allow: fake fixture value, never a live credential
   const calls: URL[] = [];
 
   globalThis.fetch = (async (input: string | URL | Request) => {
@@ -282,16 +253,15 @@ test('twitterapi.io accepts the current status-less cursor envelope and paginate
     assert.equal(results[0]?.raw_metadata['query_type'], 'Latest');
   } finally {
     globalThis.fetch = originalFetch;
-    restoreXEnvironment(originalEnv);
   }
 });
 
 test('twitterapi.io fetch is preferred over official X when both are configured', async () => {
   const originalFetch = globalThis.fetch;
-  const originalEnv = preserveXEnvironment();
-  clearXEnvironment();
-  process.env.TWITTERAPI_IO_KEY = 'lower-cost-test-token';
-  process.env.X_BEARER_TOKEN = 'official-test-token';
+  const xProvider = createXProvider(xCredentials({
+    twitterapiKey: 'lower-cost-test-token',  // git-secret-allow: fake fixture value, never a live credential
+    bearerToken: 'official-test-token',  // git-secret-allow: fake fixture value, never a live credential
+  }));
   const calls: URL[] = [];
 
   globalThis.fetch = (async (input: string | URL | Request) => {
@@ -323,16 +293,15 @@ test('twitterapi.io fetch is preferred over official X when both are configured'
     ]);
   } finally {
     globalThis.fetch = originalFetch;
-    restoreXEnvironment(originalEnv);
   }
 });
 
 test('official recent search falls through instead of truncating a requested 90-day window', async () => {
   const originalFetch = globalThis.fetch;
-  const originalEnv = preserveXEnvironment();
-  clearXEnvironment();
-  process.env.X_BEARER_TOKEN = 'official-test-token';
-  process.env.TWITTERAPI_IO_KEY = 'historical-test-token';
+  const xProvider = createXProvider(xCredentials({
+    bearerToken: 'official-test-token',  // git-secret-allow: fake fixture value, never a live credential
+    twitterapiKey: 'historical-test-token',  // git-secret-allow: fake fixture value, never a live credential
+  }));
   const calls: URL[] = [];
 
   globalThis.fetch = (async (input: string | URL | Request) => {
@@ -362,6 +331,5 @@ test('official recent search falls through instead of truncating a requested 90-
     assert.equal(results[0]?.raw_metadata['backend'], 'twitterapi_io');
   } finally {
     globalThis.fetch = originalFetch;
-    restoreXEnvironment(originalEnv);
   }
 });

@@ -2,18 +2,28 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  githubProvider,
+  createGithubProvider,
   publicRepositoryApiUrl,
   resolveGitHubPublicAuthState,
   resolveGitHubSearchKinds,
 } from '../src/providers/github.js';
 import { getEnabledProviders } from '../src/providers/index.js';
+import type { GitHubPublicAuthConfig, ResearchCredentials } from '../src/credentials.js';
 
-const dedicatedToken = 'github_pat_dedicated_public_research_credential';
+const dedicatedToken = 'github_pat_dedicated_public_research_credential';  // git-secret-allow: fake fixture value, never a live credential
 
-function restoreEnvironment(name: string, value: string | undefined): void {
-  if (value === undefined) delete process.env[name];
-  else process.env[name] = value;
+/**
+ * The provider is built from an explicit config, so a test states its auth
+ * policy directly instead of mutating (and having to restore) the ambient
+ * environment.
+ */
+function githubCredentials(config: Partial<GitHubPublicAuthConfig> = {}): ResearchCredentials {
+  const github: GitHubPublicAuthConfig = {
+    requireAuth: false,
+    ambientCredentialsPresent: false,
+    ...config,
+  };
+  return { github };
 }
 
 function publicRepositoryResponse(overrides: Record<string, unknown> = {}): Response {
@@ -39,8 +49,8 @@ function publicRepositoryResponse(overrides: Record<string, unknown> = {}): Resp
 
 test('GitHub auth state is sanitized and ignores broad ambient credentials', () => {
   assert.deepEqual(resolveGitHubPublicAuthState({
-    GITHUB_TOKEN: 'ghp_broad_private_credential_must_be_ignored',
-    GH_TOKEN: 'gho_broad_cli_credential_must_be_ignored',
+    requireAuth: false,
+    ambientCredentialsPresent: true,
   }), {
     ready: true,
     authenticated: false,
@@ -50,9 +60,9 @@ test('GitHub auth state is sanitized and ignores broad ambient credentials', () 
   });
 
   assert.deepEqual(resolveGitHubPublicAuthState({
-    BRAINTIED_GITHUB_PUBLIC_TOKEN: dedicatedToken,
-    BRAINTIED_GITHUB_REQUIRE_AUTH: 'true',
-    GITHUB_TOKEN: 'must-not-win',
+    publicToken: dedicatedToken,
+    requireAuth: true,
+    ambientCredentialsPresent: true,
   }), {
     ready: true,
     authenticated: true,
@@ -81,15 +91,8 @@ test('repository verification URLs reject every credential-forwarding ambiguity'
 });
 
 test('ambient-only search never sends a bearer credential', async () => {
-  const previousPolicy = process.env.BRAINTIED_GITHUB_REQUIRE_AUTH;
-  const previousToken = process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN;
-  const previousBroad = process.env.GITHUB_TOKEN;
-  const previousCli = process.env.GH_TOKEN;
   const previousFetch = globalThis.fetch;
-  delete process.env.BRAINTIED_GITHUB_REQUIRE_AUTH;
-  delete process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN;
-  process.env.GITHUB_TOKEN = 'ghp_broad_private_credential_must_be_ignored';
-  process.env.GH_TOKEN = 'gho_broad_cli_credential_must_be_ignored';
+  const githubProvider = createGithubProvider(githubCredentials({ ambientCredentialsPresent: true }));
   let authorization: string | null = 'not-inspected';
   globalThis.fetch = async (_input, init) => {
     authorization = new Headers(init?.headers).get('authorization');
@@ -104,29 +107,21 @@ test('ambient-only search never sends a bearer credential', async () => {
     assert.equal(authorization, null);
   } finally {
     globalThis.fetch = previousFetch;
-    restoreEnvironment('BRAINTIED_GITHUB_REQUIRE_AUTH', previousPolicy);
-    restoreEnvironment('BRAINTIED_GITHUB_PUBLIC_TOKEN', previousToken);
-    restoreEnvironment('GITHUB_TOKEN', previousBroad);
-    restoreEnvironment('GH_TOKEN', previousCli);
   }
 });
 
 test('GitHub required-auth policy disables the provider before any request', async () => {
-  const previousPolicy = process.env.BRAINTIED_GITHUB_REQUIRE_AUTH;
-  const previousToken = process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN;
-  const previousBroad = process.env.GITHUB_TOKEN;
   const previousFetch = globalThis.fetch;
   let fetchCalls = 0;
-  process.env.BRAINTIED_GITHUB_REQUIRE_AUTH = 'true';
-  delete process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN;
-  process.env.GITHUB_TOKEN = 'ghp_broad_private_credential_must_be_ignored';
+  const credentials = githubCredentials({ requireAuth: true, ambientCredentialsPresent: true });
+  const githubProvider = createGithubProvider(credentials);
   globalThis.fetch = async () => {
     fetchCalls += 1;
     return Response.json({});
   };
   try {
     assert.equal(githubProvider.enabled, false);
-    assert.equal(getEnabledProviders().github, undefined);
+    assert.equal(getEnabledProviders(credentials).github, undefined);
     await assert.rejects(
       githubProvider.search('design system', {
         expected_source_types: ['repository'],
@@ -137,31 +132,32 @@ test('GitHub required-auth policy disables the provider before any request', asy
     assert.equal(fetchCalls, 0);
   } finally {
     globalThis.fetch = previousFetch;
-    restoreEnvironment('BRAINTIED_GITHUB_REQUIRE_AUTH', previousPolicy);
-    restoreEnvironment('BRAINTIED_GITHUB_PUBLIC_TOKEN', previousToken);
-    restoreEnvironment('GITHUB_TOKEN', previousBroad);
   }
 });
 
-test('GitHub auth reports invalid policy and credential states without returning secrets', () => {
-  assert.deepEqual(resolveGitHubPublicAuthState({
-    BRAINTIED_GITHUB_REQUIRE_AUTH: '1',
-  }).code, 'github_auth_policy_invalid');
-  assert.deepEqual(resolveGitHubPublicAuthState({
-    BRAINTIED_GITHUB_PUBLIC_TOKEN: 'line\nbreak',
+test('GitHub auth reports unconfigured and invalid credential states without returning secrets', () => {
+  assert.equal(resolveGitHubPublicAuthState(undefined).code, 'github_auth_unconfigured');
+  assert.equal(resolveGitHubPublicAuthState(undefined).ready, false);
+  assert.equal(resolveGitHubPublicAuthState({
+    publicToken: 'line\nbreak',
+    requireAuth: false,
+    ambientCredentialsPresent: false,
   }).code, 'github_auth_invalid');
   assert.equal(
-    'token' in resolveGitHubPublicAuthState({ BRAINTIED_GITHUB_PUBLIC_TOKEN: dedicatedToken }),
+    'token' in resolveGitHubPublicAuthState({
+      publicToken: dedicatedToken,
+      requireAuth: false,
+      ambientCredentialsPresent: false,
+    }),
     false,
   );
 });
 
 test('authenticated repository search forces and attests public-only results', async () => {
-  const previousPolicy = process.env.BRAINTIED_GITHUB_REQUIRE_AUTH;
-  const previousToken = process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN;
   const previousFetch = globalThis.fetch;
-  process.env.BRAINTIED_GITHUB_REQUIRE_AUTH = 'true';
-  process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN = dedicatedToken;
+  const githubProvider = createGithubProvider(
+    githubCredentials({ requireAuth: true, publicToken: dedicatedToken }),
+  );
   let requestUrl = '';
   let requestHeaders = new Headers();
   let redirect: RequestRedirect | undefined;
@@ -186,17 +182,14 @@ test('authenticated repository search forces and attests public-only results', a
     assert.equal(results[0]?.raw_metadata['visibility_attestation'], 'github-public-rest-v2');
   } finally {
     globalThis.fetch = previousFetch;
-    restoreEnvironment('BRAINTIED_GITHUB_REQUIRE_AUTH', previousPolicy);
-    restoreEnvironment('BRAINTIED_GITHUB_PUBLIC_TOKEN', previousToken);
   }
 });
 
 test('private or cross-bound repository results fail with a stable sanitized code', async () => {
-  const previousPolicy = process.env.BRAINTIED_GITHUB_REQUIRE_AUTH;
-  const previousToken = process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN;
   const previousFetch = globalThis.fetch;
-  process.env.BRAINTIED_GITHUB_REQUIRE_AUTH = 'true';
-  process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN = dedicatedToken;
+  const githubProvider = createGithubProvider(
+    githubCredentials({ requireAuth: true, publicToken: dedicatedToken }),
+  );
   const sensitive = `private-description-${dedicatedToken}`;
   globalThis.fetch = async () => publicRepositoryResponse({
     private: true,
@@ -231,17 +224,14 @@ test('private or cross-bound repository results fail with a stable sanitized cod
     );
   } finally {
     globalThis.fetch = previousFetch;
-    restoreEnvironment('BRAINTIED_GITHUB_REQUIRE_AUTH', previousPolicy);
-    restoreEnvironment('BRAINTIED_GITHUB_PUBLIC_TOKEN', previousToken);
   }
 });
 
 test('malformed and HTTP error bodies cannot reach exceptions', async () => {
-  const previousPolicy = process.env.BRAINTIED_GITHUB_REQUIRE_AUTH;
-  const previousToken = process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN;
   const previousFetch = globalThis.fetch;
-  process.env.BRAINTIED_GITHUB_REQUIRE_AUTH = 'true';
-  process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN = dedicatedToken;
+  const githubProvider = createGithubProvider(
+    githubCredentials({ requireAuth: true, publicToken: dedicatedToken }),
+  );
   let mode: 'malformed' | 'forbidden' | 'network' = 'malformed';
   globalThis.fetch = async () => {
     if (mode === 'network') throw new Error(`transport-${dedicatedToken}`);
@@ -272,17 +262,14 @@ test('malformed and HTTP error bodies cannot reach exceptions', async () => {
     );
   } finally {
     globalThis.fetch = previousFetch;
-    restoreEnvironment('BRAINTIED_GITHUB_REQUIRE_AUTH', previousPolicy);
-    restoreEnvironment('BRAINTIED_GITHUB_PUBLIC_TOKEN', previousToken);
   }
 });
 
 test('hostile issue repository identities never receive the bearer credential', async () => {
-  const previousPolicy = process.env.BRAINTIED_GITHUB_REQUIRE_AUTH;
-  const previousToken = process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN;
   const previousFetch = globalThis.fetch;
-  process.env.BRAINTIED_GITHUB_REQUIRE_AUTH = 'true';
-  process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN = dedicatedToken;
+  const githubProvider = createGithubProvider(
+    githubCredentials({ requireAuth: true, publicToken: dedicatedToken }),
+  );
   const requested: string[] = [];
   globalThis.fetch = async (input) => {
     requested.push(String(input));
@@ -308,17 +295,14 @@ test('hostile issue repository identities never receive the bearer credential', 
     assert.equal(new URL(requested[0] ?? '').origin, 'https://api.github.com');
   } finally {
     globalThis.fetch = previousFetch;
-    restoreEnvironment('BRAINTIED_GITHUB_REQUIRE_AUTH', previousPolicy);
-    restoreEnvironment('BRAINTIED_GITHUB_PUBLIC_TOKEN', previousToken);
   }
 });
 
 test('issue HTML identity is cross-bound to its attested public repository', async () => {
-  const previousPolicy = process.env.BRAINTIED_GITHUB_REQUIRE_AUTH;
-  const previousToken = process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN;
   const previousFetch = globalThis.fetch;
-  process.env.BRAINTIED_GITHUB_REQUIRE_AUTH = 'true';
-  process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN = dedicatedToken;
+  const githubProvider = createGithubProvider(
+    githubCredentials({ requireAuth: true, publicToken: dedicatedToken }),
+  );
   const requested: string[] = [];
   globalThis.fetch = async (input) => {
     const url = String(input);
@@ -350,17 +334,14 @@ test('issue HTML identity is cross-bound to its attested public repository', asy
     );
   } finally {
     globalThis.fetch = previousFetch;
-    restoreEnvironment('BRAINTIED_GITHUB_REQUIRE_AUTH', previousPolicy);
-    restoreEnvironment('BRAINTIED_GITHUB_PUBLIC_TOKEN', previousToken);
   }
 });
 
 test('concurrent repository and issue strategies share one serialized rate-limit queue', async () => {
-  const previousPolicy = process.env.BRAINTIED_GITHUB_REQUIRE_AUTH;
-  const previousToken = process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN;
   const previousFetch = globalThis.fetch;
-  process.env.BRAINTIED_GITHUB_REQUIRE_AUTH = 'true';
-  process.env.BRAINTIED_GITHUB_PUBLIC_TOKEN = dedicatedToken;
+  const githubProvider = createGithubProvider(
+    githubCredentials({ requireAuth: true, publicToken: dedicatedToken }),
+  );
   const requestTimes: number[] = [];
   globalThis.fetch = async (input) => {
     requestTimes.push(Date.now());
@@ -377,8 +358,6 @@ test('concurrent repository and issue strategies share one serialized rate-limit
     assert.ok(second - first >= 2_000, `requests were only ${second - first}ms apart`);
   } finally {
     globalThis.fetch = previousFetch;
-    restoreEnvironment('BRAINTIED_GITHUB_REQUIRE_AUTH', previousPolicy);
-    restoreEnvironment('BRAINTIED_GITHUB_PUBLIC_TOKEN', previousToken);
   }
 });
 

@@ -8,6 +8,7 @@
 
 import { createHash } from 'node:crypto';
 import { getEnabledSearchProviders } from './providers/index.js';
+import type { ResearchCredentials } from './credentials.js';
 import {
   ATOMIC_PUBLIC_SOURCE_MODES,
   expandSourceModes,
@@ -49,6 +50,11 @@ export type PublicSourceLaneStatus =
 export type PublicSourceHealthVerdict = 'healthy' | 'ready' | 'partial';
 
 export interface ProbePublicSourceHealthInput {
+  /**
+   * Host-resolved credentials. Used only to build the default no-billing
+   * registry; an explicit `dependencies.providerRegistry` bypasses it.
+   */
+  credentials: ResearchCredentials;
   /** Public-safe question used only to compile and execute deterministic searches. */
   question: string;
   modes: PublicSourceHealthMode[];
@@ -67,7 +73,7 @@ export interface PublicSourceHealthDependencies {
   /**
    * Explicit registry injection for offline tests or caller-approved free
    * adapters. When omitted, only the package's known no-billing providers are
-   * eligible, even if credentials for paid providers exist in the process.
+   * eligible, even if the credential record configures paid ones.
    */
   providerRegistry?: PublicSearchProviderRegistry;
   now?: () => number;
@@ -153,8 +159,8 @@ function boundedPositiveInteger(
   return Math.min(Math.floor(candidate), maximum);
 }
 
-function defaultProviderRegistry(): PublicSearchProviderRegistry {
-  const enabled = getEnabledSearchProviders();
+function defaultProviderRegistry(credentials: ResearchCredentials): PublicSearchProviderRegistry {
+  const enabled = getEnabledSearchProviders(credentials);
   const registry: PublicSearchProviderRegistry = {};
   for (const providerName of NO_BILLING_PROVIDER_NAMES) {
     const provider = enabled[providerName];
@@ -433,7 +439,7 @@ export async function probePublicSourceHealth(
     MAX_TIMEOUT_MS,
     'Source health timeout',
   );
-  const registry = dependencies.providerRegistry ?? defaultProviderRegistry();
+  const registry = dependencies.providerRegistry ?? defaultProviderRegistry(input.credentials);
   const now = dependencies.now ?? Date.now;
   const startedAt = now();
   const checkedAt = safeIso(startedAt);

@@ -2,12 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { critiqueDraft } from '../src/critique.js';
+import type { ResearchCredentials } from '../src/credentials.js';
 
 test('critique degrades safely when Anthropic is not configured', async () => {
-  const originalKey = process.env.ANTHROPIC_API_KEY;
-  delete process.env.ANTHROPIC_API_KEY;
-  try {
+  const credentials: ResearchCredentials = {};
+  {
     const result = await critiqueDraft({
+      credentials,
       promptMd: 'Research an example topic.',
       sections: [{
         section_path: 'A.1',
@@ -23,8 +24,5 @@ test('critique degrades safely when Anthropic is not configured', async () => {
     });
     assert.equal(result.meets_target, true);
     assert.deepEqual(result.gaps, []);
-  } finally {
-    if (originalKey === undefined) delete process.env.ANTHROPIC_API_KEY;
-    else process.env.ANTHROPIC_API_KEY = originalKey;
   }
 });

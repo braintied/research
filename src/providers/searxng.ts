@@ -13,6 +13,7 @@
 
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import type { ResearchCredentials } from '../credentials.js';
 import {
   SearchResultSchema,
   type SearchProvider,
@@ -84,13 +85,9 @@ export function recencyDaysToTimeRange(days: number | undefined): SearxngSearchO
 
 let rrCounter = 0;
 
-function getInstanceUrls(): string[] {
-  const raw = process.env.SEARXNG_URLS;
-  if (raw === undefined || raw === '') return [];
-  return raw
-    .split(',')
-    .map((s) => s.trim().replace(/\/+$/, ''))
-    .filter((s) => s.length > 0);
+function instanceUrls(credentials: ResearchCredentials): string[] {
+  if (credentials.searxngUrls === undefined) return [];
+  return credentials.searxngUrls.filter((url) => url.length > 0);
 }
 
 function pickPrimaryUrl(urls: string[]): string {
@@ -170,16 +167,17 @@ export interface SearxngSearchOutcome {
  * instance is rate-limited, so treating it as healthy prevents useful failover.
  */
 export async function searxngSearch(
+  credentials: ResearchCredentials,
   query: string,
   opts: SearxngSearchOpts = {},
 ): Promise<SearxngSearchOutcome> {
-  const urls = getInstanceUrls();
+  const urls = instanceUrls(credentials);
   if (urls.length === 0) {
     return {
       success: false,
       triedUrls: [],
       results: [],
-      error: 'SEARXNG_URLS environment variable not configured',
+      error: 'ResearchCredentials.searxngUrls is not configured',
     };
   }
 
@@ -227,59 +225,59 @@ function toIsoString(dateStr: string): string | undefined {
   }
 }
 
-export const searxngProvider: SearchProvider = {
-  name: 'searxng',
+export function createSearxngProvider(credentials: ResearchCredentials): SearchProvider {
+  return {
+    name: 'searxng',
 
-  capabilities: {
-    search: true,
-    fetch: false,
-    extract: false,
-    backends: ['searxng'],
-  },
+    capabilities: {
+      search: true,
+      fetch: false,
+      extract: false,
+      backends: ['searxng'],
+    },
 
-  get enabled(): boolean {
-    return getInstanceUrls().length > 0;
-  },
+    enabled: instanceUrls(credentials).length > 0,
 
-  async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
-    const outcome = await searxngSearch(query, {
-      limit: opts.limit,
-      timeRange: recencyDaysToTimeRange(opts.recency_days),
-    });
+    async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
+      const outcome = await searxngSearch(credentials, query, {
+        limit: opts.limit,
+        timeRange: recencyDaysToTimeRange(opts.recency_days),
+      });
 
-    if (!outcome.success) {
-      throw new Error(
-        outcome.error !== undefined ? outcome.error : 'SearXNG search failed on all instances',
-      );
-    }
-
-    const results: SearchResult[] = [];
-    for (const item of outcome.results) {
-      const publishedAt = item.published_at !== undefined ? toIsoString(item.published_at) : undefined;
-
-      const candidate = {
-        provider: 'searxng' as const,
-        url: item.url,
-        title: item.title,
-        snippet: item.snippet,
-        published_at: publishedAt,
-        engagement: {
-          score: item.score,
-        },
-        raw_metadata: { backend: 'searxng', ...(item.engine !== undefined ? { engine: item.engine } : {}) },
-      };
-
-      const validated = SearchResultSchema.safeParse(candidate);
-      if (validated.success) {
-        results.push(validated.data);
+      if (!outcome.success) {
+        throw new Error(
+          outcome.error !== undefined ? outcome.error : 'SearXNG search failed on all instances',
+        );
       }
-    }
 
-    logger.info(
-      { query: query.slice(0, 60), count: results.length },
-      '[SearXNG] Search complete',
-    );
+      const results: SearchResult[] = [];
+      for (const item of outcome.results) {
+        const publishedAt = item.published_at !== undefined ? toIsoString(item.published_at) : undefined;
 
-    return results;
-  },
-};
+        const candidate = {
+          provider: 'searxng' as const,
+          url: item.url,
+          title: item.title,
+          snippet: item.snippet,
+          published_at: publishedAt,
+          engagement: {
+            score: item.score,
+          },
+          raw_metadata: { backend: 'searxng', ...(item.engine !== undefined ? { engine: item.engine } : {}) },
+        };
+
+        const validated = SearchResultSchema.safeParse(candidate);
+        if (validated.success) {
+          results.push(validated.data);
+        }
+      }
+
+      logger.info(
+        { query: query.slice(0, 60), count: results.length },
+        '[SearXNG] Search complete',
+      );
+
+      return results;
+    },
+  };
+}

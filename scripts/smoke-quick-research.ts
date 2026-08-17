@@ -10,15 +10,24 @@
  * Usage: npx tsx scripts/smoke-quick-research.ts
  */
 
-import { runResearch, generateDocument, getEnabledProviders } from '../src/index.js';
+import {
+  runResearch,
+  generateDocument,
+  getEnabledProviders,
+  resolveResearchCredentials,
+} from '../src/index.js';
 
 async function main(): Promise<void> {
-  const enabled = Object.keys(getEnabledProviders());
+  // Process boundary: this script is the host, so it resolves env once here
+  // and hands the package an explicit credential record.
+  const credentials = resolveResearchCredentials(process.env);
+  const enabled = Object.keys(getEnabledProviders(credentials));
   console.log('[smoke] Enabled providers:', enabled.join(', '));
 
   const started = Date.now();
   const usageByCategory: Record<string, { events: number; costUsd: number }> = {};
   const research = await runResearch({
+    credentials,
     brief: 'What are the leading open-source web crawling tools for LLM/RAG pipelines in 2026, and how do Crawl4AI and Firecrawl compare on cost and capability?',
     kind: 'quick',
     onUsage: (e) => {
@@ -64,6 +73,7 @@ async function main(): Promise<void> {
   }
 
   const doc = await generateDocument({
+    credentials,
     docType: 'prd',
     brief: 'Add a self-hosted web-crawling fallback tier to our research pipeline so scraping keeps working when the primary crawler is down',
     research: { report: research.report, costUsd: research.costUsd },

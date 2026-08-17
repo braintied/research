@@ -11,6 +11,7 @@
 
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import type { GitHubPublicAuthConfig, ResearchCredentials } from '../credentials.js';
 import { sleep } from '../pipeline-core.js';
 import { GITHUB_PUBLIC_VISIBILITY_ATTESTATION } from '../search-cache.js';
 import {
@@ -30,7 +31,7 @@ export const GITHUB_PUBLIC_AUTH_CODES = [
   'ready_authenticated_ambient_ignored',
   'ready_anonymous',
   'ready_anonymous_ambient_ignored',
-  'github_auth_policy_invalid',
+  'github_auth_unconfigured',
   'github_auth_required',
   'github_auth_invalid',
 ] as const;
@@ -100,34 +101,25 @@ const IssueSearchResponseSchema = z.object({
 });
 
 function resolveGitHubPublicCredentials(
-  env: NodeJS.ProcessEnv = process.env,
+  config: GitHubPublicAuthConfig | undefined,
 ): GitHubPublicCredentials {
-  const ambientCredentialsIgnored = (
-    (env.GITHUB_TOKEN?.trim().length ?? 0) > 0
-    || (env.GH_TOKEN?.trim().length ?? 0) > 0
-  );
-  const rawPolicy = env.BRAINTIED_GITHUB_REQUIRE_AUTH;
-  const policy = rawPolicy === undefined || rawPolicy.trim() === ''
-    ? 'false'
-    : rawPolicy.trim();
-  if (policy !== 'true' && policy !== 'false') {
+  if (config === undefined) {
     return {
       token: null,
       state: {
         ready: false,
         authenticated: false,
         required: false,
-        ambientCredentialsIgnored,
-        code: 'github_auth_policy_invalid',
+        ambientCredentialsIgnored: false,
+        code: 'github_auth_unconfigured',
       },
     };
   }
 
-  const required = policy === 'true';
-  const rawToken = env.BRAINTIED_GITHUB_PUBLIC_TOKEN;
-  const token = rawToken === undefined || rawToken.trim() === ''
-    ? null
-    : rawToken.trim();
+  const ambientCredentialsIgnored = config.ambientCredentialsPresent;
+  const required = config.requireAuth;
+  const rawToken = config.publicToken;
+  const token = rawToken === undefined || rawToken.trim() === '' ? null : rawToken.trim();
   if (token !== null
       && (token.length < 20
         || token.length > 512
@@ -177,15 +169,17 @@ function resolveGitHubPublicCredentials(
 
 /** Metadata-only public health contract; the credential never leaves this module. */
 export function resolveGitHubPublicAuthState(
-  env: NodeJS.ProcessEnv = process.env,
+  config: GitHubPublicAuthConfig | undefined,
 ): GitHubPublicAuthState {
-  return resolveGitHubPublicCredentials(env).state;
+  return resolveGitHubPublicCredentials(config).state;
 }
 
-function requireGitHubPublicCredentials(): GitHubPublicCredentials {
-  const credentials = resolveGitHubPublicCredentials();
-  if (!credentials.state.ready) throw new GitHubPublicAuthError(credentials.state.code);
-  return credentials;
+function requireGitHubPublicCredentials(
+  credentials: ResearchCredentials,
+): GitHubPublicCredentials {
+  const resolved = resolveGitHubPublicCredentials(credentials.github);
+  if (!resolved.state.ready) throw new GitHubPublicAuthError(resolved.state.code);
+  return resolved;
 }
 
 async function rateLimit(auth: GitHubPublicCredentials): Promise<void> {
@@ -238,6 +232,32 @@ function scopedQuery(query: string, opts: SearchOpts, field: 'pushed' | 'updated
     if (orgs.length > 1) parts.push(`(${orgs.join(' OR ')})`);
   }
   return parts.join(' ');
+}
+
+/**
+ * GitHub search ANDs every free-text term against name/description/readme, so
+ * long natural-language queries match nothing: 200 with total_count 0. Tavily
+ * and SearXNG tolerate the same verbose text, which is why the planner and the
+ * profile packs hand one query shape to every engine — and why the github lane
+ * of every web-design-intelligence run returned zero results. Verified
+ * 2026-07-27 against the live API: the 13-term open-implementation-sources
+ * hint returns total_count 0 while "design system components" returns 8,102.
+ *
+ * When a verbose query comes back empty, retry with its leading salient terms
+ * (planner subqueries and pack hints front-load the important nouns) before
+ * declaring zero results. The ladder is the full query, then the first 6
+ * terms, then the first 3 — at most 3 calls, only on the empty path.
+ */
+const GITHUB_RELAXED_TERM_COUNTS = [6, 3] as const;
+
+/** @internal Exported for adversarial contract tests; not part of the root API. */
+export function queryTermLadder(query: string): string[] {
+  const terms = query.trim().split(/\s+/u).filter((term) => term.length > 0);
+  const ladder = [terms.join(' ')];
+  for (const keep of GITHUB_RELAXED_TERM_COUNTS) {
+    if (terms.length > keep) ladder.push(terms.slice(0, keep).join(' '));
+  }
+  return ladder;
 }
 
 function beforeBoundary(opts: SearchOpts): number | null {
@@ -379,68 +399,85 @@ async function searchRepositories(
   limit: number,
   auth: GitHubPublicCredentials,
 ): Promise<SearchResult[]> {
-  const params = new URLSearchParams({
-    q: `${scopedQuery(query, opts, 'pushed')} is:public`,
-    per_page: String(Math.min(limit, 100)),
-    page: '1',
-  });
-  const sort = repoSort(opts);
-  if (sort !== null) {
-    params.set('sort', sort);
-    params.set('order', 'desc');
-  }
-  const raw = await getJson(
-    `${GITHUB_API_BASE}/search/repositories?${params.toString()}`,
-    opts.signal,
-    auth,
-  );
-  const parsed = RepoSearchResponseSchema.safeParse(raw);
-  if (!parsed.success) throw new Error('github_public_repository_attestation_failed');
-  const results: SearchResult[] = [];
-  for (const repo of parsed.data.items) {
-    const timestamp = repo.pushed_at ?? repo.updated_at;
-    if (!withinUpperBound(timestamp, opts)) continue;
-    const fullNameParts = repo.full_name.split('/');
-    const ownerName = fullNameParts[0];
-    const repositoryName = fullNameParts[1];
-    if (
-      fullNameParts.length !== 2
-      || ownerName === undefined
-      || repositoryName === undefined
-      || !/^[A-Za-z0-9_.-]+$/u.test(ownerName)
-      || !/^[A-Za-z0-9_.-]+$/u.test(repositoryName)
-      || ownerName.toLowerCase() !== repo.owner.login.toLowerCase()
-    ) {
-      throw new Error('github_result_identity_invalid');
-    }
-    const publicUrl = exactPublicGitHubHtmlUrl(
-      repo.html_url,
-      `/${ownerName}/${repositoryName}`,
-    );
-    const candidate = SearchResultSchema.safeParse({
-      provider: 'github',
-      url: publicUrl,
-      canonical_id: String(repo.id),
-      title: repo.full_name,
-      snippet: repo.description ?? '',
-      author: repo.owner.login,
-      published_at: new Date(timestamp).toISOString(),
-      engagement: {
-        upvotes: repo.stargazers_count,
-        comment_count: repo.open_issues_count,
-        score: repo.stargazers_count + repo.forks_count,
-      },
-      raw_metadata: {
-        backend: 'github_rest_api',
-        visibility_attestation: GITHUB_PUBLIC_VISIBILITY_ATTESTATION,
-        result_kind: 'repository',
-        language: repo.language,
-        forks: repo.forks_count,
-      },
+  const ladder = queryTermLadder(query);
+  for (let attempt = 0; attempt < ladder.length; attempt += 1) {
+    const candidate = ladder[attempt];
+    if (candidate === undefined) break;
+    const params = new URLSearchParams({
+      q: `${scopedQuery(candidate, opts, 'pushed')} is:public`,
+      per_page: String(Math.min(limit, 100)),
+      page: '1',
     });
-    if (candidate.success) results.push(candidate.data);
+    const sort = repoSort(opts);
+    if (sort !== null) {
+      params.set('sort', sort);
+      params.set('order', 'desc');
+    }
+    const raw = await getJson(
+      `${GITHUB_API_BASE}/search/repositories?${params.toString()}`,
+      opts.signal,
+      auth,
+    );
+    const parsed = RepoSearchResponseSchema.safeParse(raw);
+    if (!parsed.success) throw new Error('github_public_repository_attestation_failed');
+    // Relaxation is decided on the API's own item count: a query that matched
+    // nothing gets a shorter variant. A query that matched but post-filters
+    // empty (date window, attestation) does not — the terms were not the
+    // problem.
+    if (parsed.data.items.length === 0 && attempt + 1 < ladder.length) continue;
+    if (attempt > 0) {
+      logger.info(
+        { provider: 'github', attempt, count: parsed.data.items.length },
+        '[GitHub] Relaxed repository query matched',
+      );
+    }
+    const results: SearchResult[] = [];
+    for (const repo of parsed.data.items) {
+      const timestamp = repo.pushed_at ?? repo.updated_at;
+      if (!withinUpperBound(timestamp, opts)) continue;
+      const fullNameParts = repo.full_name.split('/');
+      const ownerName = fullNameParts[0];
+      const repositoryName = fullNameParts[1];
+      if (
+        fullNameParts.length !== 2
+        || ownerName === undefined
+        || repositoryName === undefined
+        || !/^[A-Za-z0-9_.-]+$/u.test(ownerName)
+        || !/^[A-Za-z0-9_.-]+$/u.test(repositoryName)
+        || ownerName.toLowerCase() !== repo.owner.login.toLowerCase()
+      ) {
+        throw new Error('github_result_identity_invalid');
+      }
+      const publicUrl = exactPublicGitHubHtmlUrl(
+        repo.html_url,
+        `/${ownerName}/${repositoryName}`,
+      );
+      const candidate = SearchResultSchema.safeParse({
+        provider: 'github',
+        url: publicUrl,
+        canonical_id: String(repo.id),
+        title: repo.full_name,
+        snippet: repo.description ?? '',
+        author: repo.owner.login,
+        published_at: new Date(timestamp).toISOString(),
+        engagement: {
+          upvotes: repo.stargazers_count,
+          comment_count: repo.open_issues_count,
+          score: repo.stargazers_count + repo.forks_count,
+        },
+        raw_metadata: {
+          backend: 'github_rest_api',
+          visibility_attestation: GITHUB_PUBLIC_VISIBILITY_ATTESTATION,
+          result_kind: 'repository',
+          language: repo.language,
+          forks: repo.forks_count,
+        },
+      });
+      if (candidate.success) results.push(candidate.data);
+    }
+    return results;
   }
-  return results;
+  return [];
 }
 
 async function searchIssues(
@@ -449,61 +486,74 @@ async function searchIssues(
   limit: number,
   auth: GitHubPublicCredentials,
 ): Promise<SearchResult[]> {
-  const params = new URLSearchParams({
-    q: `${scopedQuery(query, opts, 'updated')} is:public`,
-    per_page: String(Math.min(limit, 100)),
-    page: '1',
-  });
-  const sort = issueSort(opts);
-  if (sort !== null) {
-    params.set('sort', sort);
-    params.set('order', 'desc');
-  }
-  const raw = await getJson(
-    `${GITHUB_API_BASE}/search/issues?${params.toString()}`,
-    opts.signal,
-    auth,
-  );
-  const parsed = IssueSearchResponseSchema.safeParse(raw);
-  if (!parsed.success) throw new Error('github_public_issue_attestation_failed');
-  const results: SearchResult[] = [];
-  const publicRepositories = new Set<string>();
-  for (const issue of parsed.data.items) {
-    const repositoryUrl = publicRepositoryApiUrl(issue.repository_url);
-    if (!publicRepositories.has(repositoryUrl)) {
-      const repository = PublicRepoSchema.safeParse(
-        await getJson(repositoryUrl, opts.signal, auth),
-      );
-      if (!repository.success) throw new Error('github_public_repository_attestation_failed');
-      publicRepositories.add(repositoryUrl);
-    }
-    if (!withinUpperBound(issue.updated_at, opts)) continue;
-    const repoName = new URL(repositoryUrl).pathname.split('/').slice(-2).join('/');
-    const resultKind = issue.pull_request === undefined ? 'issue' : 'pull_request';
-    const publicUrl = exactPublicGitHubHtmlUrl(
-      issue.html_url,
-      `/${repoName}/${resultKind === 'issue' ? 'issues' : 'pull'}/${issue.number}`,
-    );
-    const candidate = SearchResultSchema.safeParse({
-      provider: 'github',
-      url: publicUrl,
-      canonical_id: String(issue.id),
-      title: `${repoName} #${issue.number}: ${issue.title}`,
-      snippet: (issue.body ?? '').slice(0, 500),
-      author: issue.user.login,
-      published_at: new Date(issue.created_at).toISOString(),
-      engagement: { comment_count: issue.comments, score: issue.comments },
-      raw_metadata: {
-        backend: 'github_rest_api',
-        visibility_attestation: GITHUB_PUBLIC_VISIBILITY_ATTESTATION,
-        result_kind: resultKind,
-        repository: repoName,
-        updated_at: issue.updated_at,
-      },
+  const ladder = queryTermLadder(query);
+  for (let attempt = 0; attempt < ladder.length; attempt += 1) {
+    const candidate = ladder[attempt];
+    if (candidate === undefined) break;
+    const params = new URLSearchParams({
+      q: `${scopedQuery(candidate, opts, 'updated')} is:public`,
+      per_page: String(Math.min(limit, 100)),
+      page: '1',
     });
-    if (candidate.success) results.push(candidate.data);
+    const sort = issueSort(opts);
+    if (sort !== null) {
+      params.set('sort', sort);
+      params.set('order', 'desc');
+    }
+    const raw = await getJson(
+      `${GITHUB_API_BASE}/search/issues?${params.toString()}`,
+      opts.signal,
+      auth,
+    );
+    const parsed = IssueSearchResponseSchema.safeParse(raw);
+    if (!parsed.success) throw new Error('github_public_issue_attestation_failed');
+    if (parsed.data.items.length === 0 && attempt + 1 < ladder.length) continue;
+    if (attempt > 0) {
+      logger.info(
+        { provider: 'github', attempt, count: parsed.data.items.length },
+        '[GitHub] Relaxed issue query matched',
+      );
+    }
+    const results: SearchResult[] = [];
+    const publicRepositories = new Set<string>();
+    for (const issue of parsed.data.items) {
+      const repositoryUrl = publicRepositoryApiUrl(issue.repository_url);
+      if (!publicRepositories.has(repositoryUrl)) {
+        const repository = PublicRepoSchema.safeParse(
+          await getJson(repositoryUrl, opts.signal, auth),
+        );
+        if (!repository.success) throw new Error('github_public_repository_attestation_failed');
+        publicRepositories.add(repositoryUrl);
+      }
+      if (!withinUpperBound(issue.updated_at, opts)) continue;
+      const repoName = new URL(repositoryUrl).pathname.split('/').slice(-2).join('/');
+      const resultKind = issue.pull_request === undefined ? 'issue' : 'pull_request';
+      const publicUrl = exactPublicGitHubHtmlUrl(
+        issue.html_url,
+        `/${repoName}/${resultKind === 'issue' ? 'issues' : 'pull'}/${issue.number}`,
+      );
+      const candidate = SearchResultSchema.safeParse({
+        provider: 'github',
+        url: publicUrl,
+        canonical_id: String(issue.id),
+        title: `${repoName} #${issue.number}: ${issue.title}`,
+        snippet: (issue.body ?? '').slice(0, 500),
+        author: issue.user.login,
+        published_at: new Date(issue.created_at).toISOString(),
+        engagement: { comment_count: issue.comments, score: issue.comments },
+        raw_metadata: {
+          backend: 'github_rest_api',
+          visibility_attestation: GITHUB_PUBLIC_VISIBILITY_ATTESTATION,
+          result_kind: resultKind,
+          repository: repoName,
+          updated_at: issue.updated_at,
+        },
+      });
+      if (candidate.success) results.push(candidate.data);
+    }
+    return results;
   }
-  return results;
+  return [];
 }
 
 function interleave(groups: SearchResult[][], limit: number): SearchResult[] {
@@ -526,63 +576,63 @@ function interleave(groups: SearchResult[][], limit: number): SearchResult[] {
   return result;
 }
 
-export const githubProvider: SearchProvider = {
-  name: 'github',
+export function createGithubProvider(credentials: ResearchCredentials): SearchProvider {
+  return {
+    name: 'github',
 
-  // Anonymous search remains an explicit supported mode unless policy requires
-  // the dedicated public-research credential.
-  get enabled(): boolean {
-    return resolveGitHubPublicAuthState().ready;
-  },
+    // Anonymous search remains an explicit supported mode unless policy requires
+    // the dedicated public-research credential.
+    enabled: resolveGitHubPublicAuthState(credentials.github).ready,
 
-  capabilities: {
-    search: true,
-    fetch: false,
-    extract: false,
-    backends: ['github_rest_api', 'crawl4ai', 'jina', 'direct_fetch'],
-  },
+    capabilities: {
+      search: true,
+      fetch: false,
+      extract: false,
+      backends: ['github_rest_api', 'crawl4ai', 'direct_fetch'],
+    },
 
-  async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
-    const auth = requireGitHubPublicCredentials();
-    const limit = Math.max(1, Math.min(opts.limit ?? 20, 100));
-    const kinds = resolveGitHubSearchKinds(opts);
-    const strategies = opts.sort === 'mixed'
-      ? [
-          { ...opts, sort: 'latest' as const },
-          { ...opts, sort: 'top' as const },
-          { ...opts, sort: 'relevance' as const },
-        ]
-      : [opts];
+    async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
+      const auth = requireGitHubPublicCredentials(credentials);
+      const limit = Math.max(1, Math.min(opts.limit ?? 20, 100));
+      const kinds = resolveGitHubSearchKinds(opts);
+      const strategies = opts.sort === 'mixed'
+        ? [
+            { ...opts, sort: 'latest' as const },
+            { ...opts, sort: 'top' as const },
+            { ...opts, sort: 'relevance' as const },
+          ]
+        : [opts];
 
-    const groups: SearchResult[][] = [];
-    const failures: string[] = [];
-    const perStrategyLimit = Math.max(2, Math.ceil(limit / strategies.length));
-    for (const strategy of strategies) {
-      const searches: Array<Promise<SearchResult[]>> = [];
-      if (kinds.repositories) {
-        searches.push(searchRepositories(query, strategy, perStrategyLimit, auth));
+      const groups: SearchResult[][] = [];
+      const failures: string[] = [];
+      const perStrategyLimit = Math.max(2, Math.ceil(limit / strategies.length));
+      for (const strategy of strategies) {
+        const searches: Array<Promise<SearchResult[]>> = [];
+        if (kinds.repositories) {
+          searches.push(searchRepositories(query, strategy, perStrategyLimit, auth));
+        }
+        if (kinds.issues) searches.push(searchIssues(query, strategy, perStrategyLimit, auth));
+        const settled = await Promise.allSettled(searches);
+        for (const outcome of settled) {
+          if (outcome.status === 'fulfilled') groups.push(outcome.value);
+          else failures.push(outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason));
+        }
       }
-      if (kinds.issues) searches.push(searchIssues(query, strategy, perStrategyLimit, auth));
-      const settled = await Promise.allSettled(searches);
-      for (const outcome of settled) {
-        if (outcome.status === 'fulfilled') groups.push(outcome.value);
-        else failures.push(outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason));
-      }
-    }
 
-    if (groups.length === 0 && failures.length > 0) throw new Error(failures.join('; '));
-    const results = interleave(groups, limit);
-    logger.info(
-      {
-        query: query.slice(0, 60),
-        count: results.length,
-        failures: failures.length,
-        authenticated: auth.state.authenticated,
-        auth_code: auth.state.code,
-        kinds,
-      },
-      '[GitHub] Search complete',
-    );
-    return results;
-  },
-};
+      if (groups.length === 0 && failures.length > 0) throw new Error(failures.join('; '));
+      const results = interleave(groups, limit);
+      logger.info(
+        {
+          query: query.slice(0, 60),
+          count: results.length,
+          failures: failures.length,
+          authenticated: auth.state.authenticated,
+          auth_code: auth.state.code,
+          kinds,
+        },
+        '[GitHub] Search complete',
+      );
+      return results;
+    },
+  };
+}

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createEvidenceIdentity, EvidenceItemSchema } from '../src/evidence.js';
-import { providersForSubquery } from '../src/index.js';
+import { createProviderRegistry, providersForSubquery } from '../src/index.js';
 import { compileProfileExecution } from '../src/profiles/registry.js';
 import { runResearchProgram, SourcePlanUnavailableError } from '../src/research-program.js';
 import {
@@ -91,11 +91,15 @@ test('profile query hints merge into one stable synthesis section per source pac
   assert.deepEqual(implementation?.expected_source_types, ['repository', 'code']);
   const practitioner = compiled.seedSubqueries.find((subquery) =>
     subquery.source_pack_id === 'design-practitioner-signal');
+  // v1 profile is frozen: community-only providers.
   assert.deepEqual(practitioner?.providers, ['hn', 'rss', 'podcasts']);
   assert.ok(practitioner !== undefined);
-  assert.deepEqual(providersForSubquery(practitioner), ['hn', 'rss', 'podcasts']);
-  assert.equal(providersForSubquery(practitioner).includes('searxng'), false);
-  assert.deepEqual(providersForSubquery({
+  // An empty credential record still routes required/pack-scoped subqueries:
+  // the pack names its providers, and routing must not invent others.
+  const registry = createProviderRegistry({});
+  assert.deepEqual(providersForSubquery(registry, practitioner), ['hn', 'rss', 'podcasts']);
+  assert.equal(providersForSubquery(registry, practitioner).includes('searxng'), false);
+  assert.deepEqual(providersForSubquery(registry, {
     section_path: 'source.optional-community-pack',
     query: 'optional community design evidence',
     providers: ['hn'],
@@ -119,9 +123,28 @@ test('web-design v2 makes implementation evidence native-GitHub-only', () => {
   const implementationSeeds = compiled.seedSubqueries.filter((subquery) =>
     subquery.source_pack_id === 'open-implementation-sources');
   assert.deepEqual(compiled.requiredProviders, ['github']);
-  assert.equal(implementationSeeds.length, 2);
+  // 1.2.3: up to 4 pack query hints compile into seed subqueries.
+  assert.equal(implementationSeeds.length, 4);
   assert.ok(implementationSeeds.every((subquery) =>
     subquery.providers.length === 1 && subquery.providers[0] === 'github'));
+});
+
+test('web-design v2 expands practitioner packs with web recovery providers', () => {
+  const compiled = compileProfileExecution(
+    'web-design-intelligence@2',
+    {
+      question: 'Which resources should Parlor agents use to build exceptional websites?',
+      asOf: '2026-08-04',
+    },
+    [...coreProviders, 'searxng', 'rss', 'podcasts'],
+  );
+  const practitioner = compiled.seedSubqueries.find((subquery) =>
+    subquery.source_pack_id === 'design-practitioner-signal');
+  assert.deepEqual(practitioner?.providers, ['hn', 'rss', 'podcasts', 'tavily', 'searxng']);
+  assert.ok((practitioner?.search_options.include_domains ?? []).includes('smashingmagazine.com'));
+  const guidance = compiled.seedSubqueries.find((subquery) =>
+    subquery.source_pack_id === 'ai-design-guidance');
+  assert.ok((guidance?.search_options.include_domains ?? []).includes('docs.anthropic.com'));
 });
 
 test('web-design v2 fails before public research when GitHub is absent', async () => {
@@ -353,7 +376,10 @@ test('public program research cannot complete when grounding is missing', async 
   assert.equal(result.status, 'partial');
 });
 
-test('search discoveries cannot satisfy source coverage without validated fetched evidence', async () => {
+test('search discoveries cover source modes without requiring HTML extract', async () => {
+  // Source-mode coverage is discovery coverage. Provider-native modes
+  // (github/HN/RSS) and extract failures must not leave a mode "uncovered"
+  // when search returned eligible hits (2026-08-04 canary: community+github).
   const result = await runResearchProgram({
     brief: question,
     asOf: '2026-07-21',
@@ -362,9 +388,10 @@ test('search discoveries cannot satisfy source coverage without validated fetche
     publicRunner: async () => ({ ...mockPublicResult(), validatedEvidence: [] }),
   });
 
-  assert.equal(result.sourceCoverage.passed, false);
-  assert.deepEqual(result.sourceCoverage.missingModes, ['web']);
-  assert.equal(result.status, 'partial');
+  assert.equal(result.sourceCoverage.passed, true);
+  assert.deepEqual(result.sourceCoverage.missingModes, []);
+  const discoveryCount = result.sourceCoverage.entries[0]?.discoveryCount ?? 0;
+  assert.ok(discoveryCount > 0);
 });
 
 test('trusted adapters cannot cross-tag Cortex and Telegram evidence', async () => {

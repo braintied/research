@@ -15,18 +15,11 @@
 
 import { z } from 'zod';
 import { synthesisGenerate } from './synthesis.js';
+import type { ResearchCredentials } from './credentials.js';
 import { logger } from './logger.js';
 import { CritiqueSchema } from './types.js';
 import type { Critique, SectionDraft, ProviderName } from './types.js';
-
-// =============================================================================
-// Constants
-// =============================================================================
-
-// gemini-3.6-flash is the working default today; glm-5.2 (z.ai quota resets
-// 2026-07-25) and claude-sonnet-5 (Anthropic key) are premium overrides once
-// live. synthesisGenerate() prefix-routes all three.
-const CRITIQUE_MODEL = 'gemini-3.6-flash';
+import { resolveResearchCritiqueModel } from './model-policy.js';
 
 // =============================================================================
 // Permissive fallback critique (no gaps, never loop)
@@ -49,6 +42,8 @@ function buildPermissiveCritique(sections: SectionDraft[]): Critique {
 // =============================================================================
 
 export interface CritiqueDraftInput {
+  /** Host-resolved credentials, forwarded to the critique model call. */
+  credentials: ResearchCredentials;
   promptMd: string;
   sections: SectionDraft[];
   targetWordCount: { min: number; max: number };
@@ -56,7 +51,7 @@ export interface CritiqueDraftInput {
 }
 
 export async function critiqueDraft(input: CritiqueDraftInput): Promise<Critique> {
-  const { promptMd, sections, targetWordCount, providerCoverageBySection } = input;
+  const { credentials, promptMd, sections, targetWordCount, providerCoverageBySection } = input;
 
   const totalWords = sections.reduce((sum, s) => sum + s.word_count, 0);
   const perSectionTarget = Math.floor(
@@ -114,9 +109,10 @@ export async function critiqueDraft(input: CritiqueDraftInput): Promise<Critique
   let rawText = '';
   try {
     const result = await synthesisGenerate({
+      credentials,
       system: systemPrompt,
       user: userMessage,
-      model: CRITIQUE_MODEL,
+      model: resolveResearchCritiqueModel(),
       maxTokens: 4096,
     });
     rawText = result.text;

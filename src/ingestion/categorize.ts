@@ -3,15 +3,24 @@
  * a contractor-relevant `category`, `tags`, and a one-line `whyItMatters`.
  *
  * Reuses the package's Gemini client conventions (GEMINI_RESEARCH_KEY +
- * EXTRACTION_MODEL via pipeline-core). Output is Zod-validated; on ANY failure
- * the items are returned unchanged with their default category ('other'), so
- * the sweep never breaks on a categorizer hiccup.
+ * EXTRACTION_MODEL via pipeline-core). Output is Zod-validated; when the Gemini
+ * CALL fails or returns something unparseable, the items are returned unchanged
+ * with their default category, so the sweep never breaks on a categorizer
+ * hiccup.
+ *
+ * Two failures deliberately do NOT behave that way, because swallowing them
+ * hands back a knowledge base where every item is the fallback category with
+ * nothing anywhere saying why: a missing Gemini credential, and a taxonomy that
+ * cannot produce a coherent prompt. Both throw.
+ *
+ * The taxonomy is a PARAMETER — see CategorizeTaxonomy below for why.
  */
 
 import { z } from 'zod';
-import { getGeminiKey, fetchWithRetry, EXTRACTION_MODEL } from '../pipeline-core.js';
+import { fetchWithRetry, extractionModelId } from '../pipeline-core.js';
+import { requireGeminiApiKey, type ResearchCredentials } from '../credentials.js';
 import { logger } from '../logger.js';
-import { KNOWLEDGE_CATEGORIES, KnowledgeCategorySchema } from './types.js';
+import { KNOWLEDGE_CATEGORIES } from './types.js';
 import type { IngestedItem, KnowledgeCategory } from './types.js';
 
 // =============================================================================
@@ -57,10 +66,110 @@ const MIN_QUOTE_CHARS = 20;
 // Helpers
 // =============================================================================
 
-function coerceCategory(raw: string): KnowledgeCategory {
-  const parsed = KnowledgeCategorySchema.safeParse(raw.trim().toLowerCase());
-  if (parsed.success) return parsed.data;
-  return 'other';
+/**
+ * Everything the categorizer prompt needs to classify for ONE product's
+ * audience.
+ *
+ * Why this is a parameter and not a string literal: this prompt used to
+ * hardcode "curating a knowledge base FOR CONTRACTORS" with a
+ * tip|tool|news|win|pain_point|trend|competitor|other taxonomy — the most
+ * domain-coupled code in the least domain-coupled package. Any other domain run
+ * through it was classified against the wrong universe, so a silversmithing
+ * studio came back `competitor`. A taxonomy is a product's policy, and it
+ * belongs in a value the product passes.
+ *
+ * The category union `C` defaults to `string` so a consumer can write
+ * `CategorizeTaxonomy` bare and supply its own categories.
+ *
+ * Plain strings throughout, deliberately, matching `@braintied/knowledge`'s
+ * `Taxonomy`: a schema object built by this package's zod carries a brand
+ * another zod instance rejects, which is a documented failure in this fleet.
+ * The two are siblings by design — this one is prompt-side (it carries
+ * `quoteVoice`, which shapes what the model is asked for), and knowledge's is
+ * guard-side (it carries `quotePolicy`, which decides what survives).
+ */
+export interface CategorizeTaxonomy<C extends string = string> {
+  /** The closed category set. Order is preserved into the prompt. */
+  readonly categories: readonly C[];
+  /** The category assigned when a model returns something unrecognized. */
+  readonly fallback: C;
+  /** One or two sentences naming who this knowledge base is for. */
+  readonly audienceBrief: string;
+  /** Category -> what belongs in it. Every category needs an entry. */
+  readonly categoryDescriptions: Readonly<Record<string, string>>;
+  /** Instruction for the free-text "why this matters to that audience" field. */
+  readonly relevanceFieldPrompt: string;
+  /** Describes the voice a quotable sentence should be in. */
+  readonly quoteVoice: string;
+}
+
+/**
+ * The taxonomy this categorizer used before one could be injected. It stays the
+ * default so every existing caller keeps its exact behaviour and output.
+ */
+export const CONTRACTOR_TAXONOMY: CategorizeTaxonomy<KnowledgeCategory> = {
+  categories: KNOWLEDGE_CATEGORIES,
+  fallback: 'other',
+  audienceBrief:
+    'You are a research assistant curating a knowledge base FOR CONTRACTORS ' +
+    '(builders, remodelers, plumbers, electricians, HVAC, roofers, etc.).',
+  categoryDescriptions: {
+    tip: 'actionable how-to / advice a contractor can apply',
+    tool: 'software, equipment, or product relevant to running a trade business',
+    news: 'industry news / regulation / market event',
+    win: 'a success story or positive outcome',
+    pain_point: 'a problem, complaint, or frustration contractors voice',
+    trend: 'an emerging pattern or shift in the trades',
+    competitor: 'content from a competing SaaS / platform (ServiceTitan, Jobber, etc.)',
+    other: 'none of the above',
+  },
+  relevanceFieldPrompt: 'one short sentence on why a contractor should care',
+  quoteVoice:
+    'in REAL contractor voice (the kind of authentic, opinionated, specific line a ' +
+    'human wrote that AI could never fake)',
+};
+
+/**
+ * Throw unless every category has a description.
+ *
+ * A missing description would otherwise reach the model as an empty line, so
+ * the model would silently classify against a category it was never told the
+ * meaning of. Failing here names the category instead.
+ */
+function assertDescribed<C extends string>(taxonomy: CategorizeTaxonomy<C>): void {
+  if (taxonomy.categories.length === 0) {
+    throw new CategorizeTaxonomyError('a taxonomy needs at least one category');
+  }
+  const missing = taxonomy.categories.filter((category) => {
+    const description = taxonomy.categoryDescriptions[category];
+    return description === undefined || description.trim().length === 0;
+  });
+  if (missing.length > 0) {
+    throw new CategorizeTaxonomyError(
+      `categoryDescriptions is missing an entry for: ${missing.join(', ')}`,
+    );
+  }
+  if (!taxonomy.categories.includes(taxonomy.fallback)) {
+    throw new CategorizeTaxonomyError(
+      `fallback "${taxonomy.fallback}" is not one of the categories`,
+    );
+  }
+}
+
+/** A taxonomy that cannot produce a coherent prompt. */
+export class CategorizeTaxonomyError extends Error {
+  constructor(message: string) {
+    super(`[categorizeItems] invalid taxonomy: ${message}`);
+    this.name = 'CategorizeTaxonomyError';
+  }
+}
+
+function coerceCategory<C extends string>(raw: string, taxonomy: CategorizeTaxonomy<C>): C {
+  const needle = raw.trim().toLowerCase();
+  for (const category of taxonomy.categories) {
+    if (category.toLowerCase() === needle) return category;
+  }
+  return taxonomy.fallback;
 }
 
 // Collapse whitespace + lowercase so the verbatim check tolerates harmless
@@ -113,33 +222,30 @@ function parseJsonObject(rawText: string): unknown {
   }
 }
 
-function buildPrompt(batch: IngestedItem[]): string {
-  const catalog = KNOWLEDGE_CATEGORIES.join(' | ');
+function buildPrompt<C extends string>(
+  batch: IngestedItem<C>[],
+  taxonomy: CategorizeTaxonomy<C>,
+): string {
+  const catalog = taxonomy.categories.join(' | ');
+  const exampleCategory = taxonomy.categories[0];
   const lines: string[] = [
-    'You are a research assistant curating a knowledge base FOR CONTRACTORS',
-    '(builders, remodelers, plumbers, electricians, HVAC, roofers, etc.).',
-    'For each content item below, classify it for a contractor audience.',
+    taxonomy.audienceBrief,
+    'For each content item below, classify it for that audience.',
     '',
     `Allowed categories (pick exactly one): ${catalog}`,
-    '  - tip: actionable how-to / advice a contractor can apply',
-    '  - tool: software, equipment, or product relevant to running a trade business',
-    '  - news: industry news / regulation / market event',
-    '  - win: a success story or positive outcome',
-    '  - pain_point: a problem, complaint, or frustration contractors voice',
-    '  - trend: an emerging pattern or shift in the trades',
-    '  - competitor: content from a competing SaaS / platform (ServiceTitan, Jobber, etc.)',
-    '  - other: none of the above',
+    ...taxonomy.categories.map(
+      (category) => `  - ${category}: ${taxonomy.categoryDescriptions[category]}`,
+    ),
     '',
-    'Also extract 0–2 genuinely quotable sentences in REAL contractor voice from',
-    "each item's content (the kind of authentic, opinionated, specific line a human",
-    'wrote that AI could never fake). The quotes MUST be copied VERBATIM — character',
+    `Also extract 0–${MAX_QUOTES} genuinely quotable sentences ${taxonomy.quoteVoice} from`,
+    "each item's content. The quotes MUST be copied VERBATIM — character",
     "for character — from that item's content. NEVER invent, paraphrase, summarize,",
     'clean up, or combine sentences. If nothing is worth quoting, return an empty array.',
     '',
     'Return ONLY valid JSON — no prose, no markdown fences:',
-    '{ "items": [ { "index": 0, "category": "tip", "tags": ["pricing","estimating"], "why_it_matters": "one short sentence on why a contractor should care", "quotes": ["a verbatim sentence from the content"] } ] }',
+    `{ "items": [ { "index": 0, "category": "${exampleCategory}", "tags": ["one","two"], "why_it_matters": "${taxonomy.relevanceFieldPrompt}", "quotes": ["a verbatim sentence from the content"] } ] }`,
     '',
-    `Use up to ${MAX_TAGS} lowercase tags per item. Keep why_it_matters to one sentence.`,
+    `Use up to ${MAX_TAGS} lowercase tags per item. For why_it_matters: ${taxonomy.relevanceFieldPrompt}.`,
     `Include at most ${MAX_QUOTES} verbatim quotes per item; prefer fewer high-quality ones.`,
     '',
     'ITEMS:',
@@ -158,10 +264,14 @@ function buildPrompt(batch: IngestedItem[]): string {
   return lines.join('\n');
 }
 
-async function categorizeBatch(batch: IngestedItem[]): Promise<void> {
-  const geminiKey = getGeminiKey();
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${EXTRACTION_MODEL}:generateContent`;
-  const prompt = buildPrompt(batch);
+async function categorizeBatch<C extends string>(
+  credentials: ResearchCredentials,
+  batch: IngestedItem<C>[],
+  taxonomy: CategorizeTaxonomy<C>,
+): Promise<void> {
+  const geminiKey = requireGeminiApiKey(credentials);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${extractionModelId()}:generateContent`;
+  const prompt = buildPrompt(batch, taxonomy);
 
   let rawJson: unknown;
   try {
@@ -218,7 +328,7 @@ async function categorizeBatch(batch: IngestedItem[]): Promise<void> {
   for (const entry of result.data.items) {
     const target = batch[entry.index];
     if (target === undefined) continue;
-    target.category = coerceCategory(entry.category);
+    target.category = coerceCategory(entry.category, taxonomy);
     target.tags = entry.tags.slice(0, MAX_TAGS).map((t) => t.trim().toLowerCase()).filter((t) => t.length > 0);
     target.whyItMatters = entry.why_it_matters.trim().length > 0 ? entry.why_it_matters.trim() : null;
     // VERBATIM guard: only keep quotes that literally appear in the item's
@@ -232,12 +342,32 @@ async function categorizeBatch(batch: IngestedItem[]): Promise<void> {
 // categorizeItems — public entry. Mutates + returns the same array.
 // =============================================================================
 
-export async function categorizeItems(items: IngestedItem[]): Promise<IngestedItem[]> {
+export function categorizeItems(
+  credentials: ResearchCredentials,
+  items: IngestedItem[],
+): Promise<IngestedItem[]>;
+export function categorizeItems<C extends string>(
+  credentials: ResearchCredentials,
+  items: IngestedItem<C>[],
+  taxonomy: CategorizeTaxonomy<C>,
+): Promise<IngestedItem<C>[]>;
+// The implementation widens to `string` so the contractor default is assignable
+// without a type assertion; the overloads above are what a caller sees, and they
+// keep the category union exact in both directions.
+export async function categorizeItems(
+  credentials: ResearchCredentials,
+  items: IngestedItem<string>[],
+  taxonomy: CategorizeTaxonomy<string> = CONTRACTOR_TAXONOMY,
+): Promise<IngestedItem<string>[]> {
+  // Validated even on the empty-items fast path: a caller who passes a broken
+  // taxonomy should hear about it on the first call, not on the first call that
+  // happens to carry data.
+  assertDescribed(taxonomy);
   if (items.length === 0) return items;
 
   for (let start = 0; start < items.length; start += MAX_BATCH) {
     const batch = items.slice(start, start + MAX_BATCH);
-    await categorizeBatch(batch);
+    await categorizeBatch(credentials, batch, taxonomy);
   }
 
   logger.info({ count: items.length }, '[categorizeItems] categorization complete');

@@ -29,6 +29,8 @@ import type { Logger } from './logger.js';
 import type { FinalReport, ProviderName, VerbatimQuote } from './types.js';
 import type { SearchOpts, SearchResult, Subquery } from './types.js';
 import type { GroundingResult } from './grounding.js';
+import type { ResearchCredentials } from './credentials.js';
+import { resolveResearchSynthesisModel } from './model-policy.js';
 
 // =============================================================================
 // Kind definitions
@@ -44,42 +46,44 @@ export interface ResearchKindPreset {
   engine: 'pipeline' | 'perplexity' | 'answer';
   /** Depth mapping for pipeline runs. */
   depth?: ResearchDepth;
-  /** Provider allowlist for pipeline runs (intersected with env-enabled). */
+  /** Provider allowlist for pipeline runs (intersected with the configured set). */
   providers?: ProviderName[];
   /** Preamble appended to the brief to steer the planner. */
   briefPreamble?: string;
   /**
    * Default synthesis model for this kind (callers can still override via
-   * RunResearchInput.synthesisModelOverride). Unset -> glm-5.2.
+   * RunResearchInput.synthesisModelOverride). Unset → resolveResearchSynthesisModel(kind).
    */
   synthesisModelDefault?: string;
 }
 
+/**
+ * Kind presets. `synthesisModelDefault` is intentionally omitted — wire ids
+ * come from `@braintied/models` at run time via
+ * `resolveResearchSynthesisModel(kind)` so catalog refresh moves research
+ * without a code bump. Callers still override with `synthesisModelOverride`.
+ */
 export const RESEARCH_KIND_PRESETS: Record<ResearchKind, ResearchKindPreset> = {
   answer: {
     kind: 'answer',
     description: 'Perplexity-style cited quick answer — one search, one cheap synthesis (~5-15s, ~$0.002-0.01)',
     engine: 'answer',
-    synthesisModelDefault: 'gemini-3.6-flash',
   },
   quick: {
     kind: 'quick',
     description: 'Single-pass cheap research for fast context (~30-90s, ~$0.02-0.10)',
     engine: 'pipeline',
     depth: 'quick',
-    // ~90% of a quick-run's cost was hardcoded Sonnet synthesis (2026-07-09
-    // cost audit) — quick now defaults to the MICRO-tier Gemini flash.
-    synthesisModelDefault: 'gemini-3.6-flash',
   },
   standard: {
     kind: 'standard',
-    description: 'Grounded multi-provider research with critique loop (~2-5 min, ~$0.50-3)',
+    description: 'Grounded multi-provider research with critique loop (~2-5 min, ~$0.50-2)',
     engine: 'pipeline',
     depth: 'standard',
   },
   deep: {
     kind: 'deep',
-    description: 'High-stakes wide research — more subqueries, more critique passes (~8-15 min, ~$3-7)',
+    description: 'High-stakes wide research — more subqueries, more critique passes (~5-12 min, ~$2-6)',
     engine: 'pipeline',
     depth: 'wide',
   },
@@ -109,12 +113,12 @@ export const RESEARCH_KIND_PRESETS: Record<ResearchKind, ResearchKindPreset> = {
   },
 };
 
-/** Narrow an arbitrary string to a valid ResearchKind. Falls back to 'standard'. */
+/** Narrow an arbitrary string to a valid ResearchKind. Falls back to 'quick'. */
 export function coerceResearchKind(input: string | null | undefined): ResearchKind {
   for (const kind of RESEARCH_KINDS) {
     if (input === kind) return kind;
   }
-  return 'standard';
+  return 'quick';
 }
 
 // =============================================================================
@@ -122,6 +126,11 @@ export function coerceResearchKind(input: string | null | undefined): ResearchKi
 // =============================================================================
 
 export interface RunResearchInput {
+  /**
+   * Host-resolved credentials. Every engine and provider lane reads its keys
+   * from here; the package never touches the ambient environment.
+   */
+  credentials: ResearchCredentials;
   /** The research brief / question. */
   brief: string;
   /** Research kind — defaults to 'standard'. */
@@ -149,6 +158,12 @@ export interface RunResearchInput {
   seedSubqueries?: Subquery[];
   searchOptions?: Omit<SearchOpts, 'limit'>;
   providerSearchOptions?: Partial<Record<ProviderName, Omit<SearchOpts, 'limit'>>>;
+  /**
+   * Override the planner's subquery band for this run (runDeepResearch has
+   * accepted this since the fan-out ablation; runResearch silently dropped
+   * it, so callers could never widen retrieval without changing kind).
+   */
+  subqueryBandOverride?: { min: number; max: number };
   logger?: Logger;
 }
 
@@ -183,10 +198,13 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
   const preset = RESEARCH_KIND_PRESETS[kind];
   const synthesisModelOverride = input.synthesisModelOverride !== undefined
     ? input.synthesisModelOverride
-    : preset.synthesisModelDefault;
+    : (preset.synthesisModelDefault !== undefined
+      ? preset.synthesisModelDefault
+      : resolveResearchSynthesisModel(kind));
 
   if (preset.engine === 'answer') {
     const answer = await runAnswer({
+      credentials: input.credentials,
       query: input.brief,
       recencyDays: input.recencyDays,
       synthesisModelOverride,
@@ -206,6 +224,7 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
 
   if (preset.engine === 'perplexity') {
     const managed = await runManagedResearch({
+      credentials: input.credentials,
       brief: input.brief,
       logger: input.logger,
     });
@@ -226,6 +245,7 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
     : input.brief;
 
   const pipelineInput: RunDeepResearchInput = {
+    credentials: input.credentials,
     brief,
     depth: preset.depth,
     maxCostUsd: input.maxCostUsd,
@@ -242,6 +262,7 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
       ...(input.recencyDays !== undefined ? { recency_days: input.recencyDays } : {}),
     },
     providerSearchOptions: input.providerSearchOptions,
+    subqueryBandOverride: input.subqueryBandOverride,
   };
 
   const result = await runDeepResearch(pipelineInput);

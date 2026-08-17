@@ -12,7 +12,8 @@
 
 import { z } from 'zod';
 import { logger } from './logger.js';
-import { getVoyageKey, VOYAGE_MODEL, VOYAGE_API_URL } from './pipeline-core.js';
+import { VOYAGE_MODEL, VOYAGE_API_URL } from './pipeline-core.js';
+import { requireVoyageApiKey, type ResearchCredentials } from './credentials.js';
 
 // =============================================================================
 // Constants
@@ -48,12 +49,15 @@ async function sleep(ms: number): Promise<void> {
 // embedTexts
 // =============================================================================
 
-export async function embedTexts(texts: string[]): Promise<number[][]> {
+export async function embedTexts(
+  credentials: ResearchCredentials,
+  texts: string[],
+): Promise<number[][]> {
   if (texts.length === 0) {
     return [];
   }
 
-  const voyageKey = getVoyageKey();
+  const voyageKey = requireVoyageApiKey(credentials);
   const allEmbeddings: number[][] = [];
 
   for (let batchStart = 0; batchStart < texts.length; batchStart += EMBED_BATCH_SIZE) {

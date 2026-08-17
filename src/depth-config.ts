@@ -3,16 +3,14 @@
  *
  * The pipeline supports four modes:
  *
- *   - 'quick'    — single-pass cheap mode. ~30-90s per run, ~$0.05-0.50 cost.
- *                  No critique loop. Fast context grabs and pre-research.
- *   - 'blog'     — lightweight single-article mode. ~1-3 min per run, ~$0.5-2 cost.
+ *   - 'quick'    — single-pass cheap mode. ~30-90s per run, ~$0.02-0.15 cost.
+ *                  No critique loop. Default product path after 2026-08 cost cut.
+ *   - 'blog'     — lightweight single-article mode. ~1-3 min per run, ~$0.3-1.25.
  *                  Tuned for a single premium blog post: a handful of subqueries,
- *                  shallow per-subquery fetch, and a single critique pass. Keeps
- *                  the grounded/critique-refined quality of the heavier modes while
- *                  fitting inside a per-post budget (~$1.50).
- *   - 'standard' — legacy default. ~2-5 min per run, ~$0.50-3 cost.
+ *                  shallow per-subquery fetch, and a single critique pass.
+ *   - 'standard' — grounded default when quality > speed. ~2-5 min, ~$0.50-2.
  *                  Use for general research, brain enrichment, vibe-card backing.
- *   - 'wide'     — high-stakes mode. ~8-15 min per run, ~$3-7 cost.
+ *   - 'wide'     — high-stakes opt-in. ~5-12 min per run, ~$2-6 cost.
  *                  Use for M&A due diligence, market sizing, deep dives where
  *                  Claude.ai's hosted deep-research is the comparison point.
  *
@@ -50,47 +48,80 @@ export interface DepthTunables {
    */
   targetWordCountMin: number;
   targetWordCountMax: number;
+  /**
+   * Hard cap on Gemini extract calls for the ENTIRE run (main pass + every
+   * critique pass combined). One page = one generateContent. Without this,
+   * a standard/wide run × critique loop could mint hundreds of extract calls
+   * (Aug 2026: a single brief produced ~7k extract ledger rows in a day).
+   */
+  maxExtractPages: number;
+  /** Max concurrent Gemini extract calls inside one extractQuotes wave. */
+  extractConcurrency: number;
 }
 
 export const DEPTH_CONFIG: Record<ResearchDepth, DepthTunables> = {
   quick: {
-    // Single-pass cheap research (~30-90s, ~$0.05-0.50). No critique loop —
+    // Single-pass cheap research (~30-90s, ~$0.02-0.15). No critique loop —
     // mirrors Sentigen's composite Tavily→Crawl4AI→NANO pattern. For fast
     // context grabs, card backing, and pre-research before a deeper run.
+    // 2026-08-01 cost program: default product path after research project
+    // billed ~$393/30d (mostly per-page extract on gemini-3.1-flash-lite).
     subqueriesMin: 3,
-    subqueriesMax: 8,
+    subqueriesMax: 6,
     urlsPerSubquery: 3,
     critiqueMaxPasses: 0,
-    hardCapUsd: 0.75,
+    hardCapUsd: 0.50,
     targetWordCountMin: 400,
-    targetWordCountMax: 1500,
+    targetWordCountMax: 1200,
+    maxExtractPages: 10,
+    extractConcurrency: 3,
   },
   blog: {
-    subqueriesMin: 6,
-    subqueriesMax: 10,
+    subqueriesMin: 5,
+    subqueriesMax: 8,
+    urlsPerSubquery: 3,
+    critiqueMaxPasses: 1,
+    hardCapUsd: 1.25,
+    targetWordCountMin: 1000,
+    targetWordCountMax: 2200,
+    maxExtractPages: 16,
+    extractConcurrency: 3,
+  },
+  // Standard is no longer "spend freely." 2026-08 GCP: research-agents
+  // project ~$200/7d; extract volume dominated the bill. Caps cut theoretical
+  // fan-out (subqueriesMax × urlsPerSubquery) and hard extract pages ~2×
+  // without removing the critique loop.
+  standard: {
+    subqueriesMin: 8,
+    subqueriesMax: 16,
     urlsPerSubquery: 4,
     critiqueMaxPasses: 1,
-    hardCapUsd: 2.0,
-    targetWordCountMin: 1200,
-    targetWordCountMax: 2500,
-  },
-  standard: {
-    subqueriesMin: 15,
-    subqueriesMax: 35,
-    urlsPerSubquery: 7,
-    critiqueMaxPasses: 3,
-    hardCapUsd: 10,
+    hardCapUsd: 3.0,
     targetWordCountMin: 800,
-    targetWordCountMax: 8000,
+    targetWordCountMax: 5000,
+    maxExtractPages: 20,
+    extractConcurrency: 3,
   },
+  // Wide remains high-stakes but not "80 pages × 8 critique passes".
+  // Explicit opt-in only — never the tool default.
+  //
+  // 2026-08-02: maxExtractPages was 36 after the cost program. That is below
+  // the sum of web-design-intelligence@2 coverage floors (~41 minimum evidence
+  // items across public packs). Profile canaries then failed deterministically
+  // with profile_coverage_incomplete on award / implementation / guidance /
+  // practitioner packs while trusted cortex+telegram priors still passed.
+  // 64 keeps the cut vs the pre-program 80, and is enough for the release
+  // profile under maxCostUsd=$5.
   wide: {
-    subqueriesMin: 50,
-    subqueriesMax: 80,
-    urlsPerSubquery: 12,
-    critiqueMaxPasses: 8,
-    hardCapUsd: 15,
-    targetWordCountMin: 5000,
-    targetWordCountMax: 12000,
+    subqueriesMin: 16,
+    subqueriesMax: 32,
+    urlsPerSubquery: 6,
+    critiqueMaxPasses: 3,
+    hardCapUsd: 8.0,
+    targetWordCountMin: 3000,
+    targetWordCountMax: 10000,
+    maxExtractPages: 64,
+    extractConcurrency: 3,
   },
 };
 
@@ -141,11 +172,18 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
   // getModelPricing() at lookup time so cost projections after the cutoff
   // don't silently keep using the promo rate.
   'deepseek-v4-pro':                      { inputUsdPerM: 0.435, outputUsdPerM: 0.87, cacheHitInputUsdPerM: 0.003625, provider: 'deepseek' },
-  // Google Gemini
-  'gemini-2.5-flash':                     { inputUsdPerM: 0.30, outputUsdPerM: 2.50, provider: 'google' },
-  // Default synthesis model for the 'quick' and 'answer' kinds (2026-07-09) —
-  // MICRO tier in the Ora model registry, ~6× cheaper than Sonnet synthesis.
+  // Google Gemini — Cortex ora_models.model_catalog (verified 2026-07-29/30).
+  // Never invent rates: an unknown model must not ship as vendor_reported.
+  'gemini-2.5-flash-lite':                { inputUsdPerM: 0.10, outputUsdPerM: 0.40, cacheHitInputUsdPerM: 0.01, provider: 'google' },
+  'gemini-2.5-flash':                     { inputUsdPerM: 0.30, outputUsdPerM: 2.50, cacheHitInputUsdPerM: 0.03, provider: 'google' },
+  'gemini-3.1-flash-lite':                { inputUsdPerM: 0.25, outputUsdPerM: 1.50, cacheHitInputUsdPerM: 0.025, provider: 'google' },
+  'gemini-3.5-flash-lite':                { inputUsdPerM: 0.25, outputUsdPerM: 1.50, cacheHitInputUsdPerM: 0.025, provider: 'google' },
+  // Retired preview id (still appears in residual traffic / BQ SKUs).
+  'gemini-3.1-flash-lite-preview':        { inputUsdPerM: 0.25, outputUsdPerM: 1.50, cacheHitInputUsdPerM: 0.025, provider: 'google' },
+  'gemini-3.5-flash':                     { inputUsdPerM: 1.50, outputUsdPerM: 9.00, cacheHitInputUsdPerM: 0.15, provider: 'google' },
+  'gemini-3.6-flash':                     { inputUsdPerM: 1.50, outputUsdPerM: 7.50, cacheHitInputUsdPerM: 0.15, provider: 'google' },
   'gemini-3-flash-preview':               { inputUsdPerM: 0.50, outputUsdPerM: 3.00, provider: 'google' },
+  'claude-sonnet-5':                      { inputUsdPerM: 2,    outputUsdPerM: 10,   provider: 'anthropic' },
   // OpenRouter (US-resold open weights)
   'qwen/qwen3-235b-a22b-instruct-2507':   { inputUsdPerM: 0.071, outputUsdPerM: 0.10, provider: 'openrouter' },
 };
@@ -165,17 +203,60 @@ const DEEPSEEK_V4_PRO_FULL_PRICING: ModelPricing = {
   provider: 'deepseek',
 };
 
-/** Look up pricing for a synthesis model. Falls back to Sonnet rates for unknown models. */
-export function getModelPricing(model: string, asOf?: Date): ModelPricing {
+/**
+ * Look up a model's REAL published rates. Returns null when the model is not
+ * in the table — no guessing, no substitute rate.
+ *
+ * Use this wherever the resulting number leaves this package as a factual
+ * claim about spend: a ledger row, an invoice reconciliation, an alert. A
+ * guessed rate that escapes into a system of record is worse than no number,
+ * because downstream it is indistinguishable from a measured one.
+ *
+ * For local budget enforcement use `getModelPricing()`, which never returns
+ * null because a spend cap must still bound an unrecognized model.
+ */
+const MODEL_ID_ALIASES: Readonly<Record<string, string>> = {
+  'gemini-3.1-flash-lite-preview': 'gemini-3.5-flash-lite',
+  'gemini-3-flash-preview': 'gemini-3.6-flash',
+  'gemini-3-flash': 'gemini-3.6-flash',
+};
+
+export function tryGetModelPricing(model: string, asOf?: Date): ModelPricing | null {
   if (model === 'deepseek-v4-pro') {
     const now = asOf !== undefined ? asOf : new Date();
     if (now.getTime() >= DEEPSEEK_V4_PRO_PROMO_EXPIRY_AT.getTime()) {
       return DEEPSEEK_V4_PRO_FULL_PRICING;
     }
   }
-  const found = MODEL_PRICING[model];
-  if (found !== undefined) return found;
-  // Conservative fallback — preserves prior behavior so unknown models don't underbill.
+  const aliased = MODEL_ID_ALIASES[model];
+  const ids = aliased !== undefined ? [model, aliased] : [model];
+  for (const id of ids) {
+    const found = MODEL_PRICING[id];
+    if (found !== undefined) return found;
+
+    // Dated model IDs ('claude-haiku-4-5-20251001') match their undated alias.
+    const undated = id.replace(/-\d{8}$/, '');
+    if (undated !== id) {
+      const datedMatch = MODEL_PRICING[undated];
+      if (datedMatch !== undefined) return datedMatch;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Pricing for local budget enforcement. Unknown models get deliberately
+ * conservative rates so `CostTracker`'s hard cap still bounds them rather
+ * than letting an unrecognized model spend without limit.
+ *
+ * The returned rates for an unknown model are an UPPER BOUND, not a
+ * measurement — never forward them anywhere they would be read as actual
+ * spend. Use `tryGetModelPricing()` for that and handle the null.
+ */
+export function getModelPricing(model: string, asOf?: Date): ModelPricing {
+  const known = tryGetModelPricing(model, asOf);
+  if (known !== null) return known;
   return { inputUsdPerM: 3, outputUsdPerM: 15, provider: 'anthropic' };
 }
 

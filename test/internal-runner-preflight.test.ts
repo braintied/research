@@ -824,7 +824,20 @@ test('live internal runner preserves a sanitized transport diagnostic and reques
 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /submission timed out/);
-  assert.match(result.stderr, /request request-transport-1; last transport TypeError(?:\/[A-Z0-9_]+)?/);
+  // Any NAMED transport error, not TypeError specifically. The server destroys
+  // the socket, so two paths race: the hangup surfaces as TypeError, or the
+  // 5s `--timeout-seconds` fires first and surfaces as TimeoutError. Which one
+  // wins depends on machine load, and this test spends 5071ms of its own 5000ms
+  // budget on an idle machine — so under any real CI load the timeout wins and
+  // the assertion fails. Measured 2026-08-13: passes standalone, fails inside a
+  // full `.localci.sh` run, which blocked every push to this repo.
+  //
+  // The error CLASS was never what this test is for. Its name says diagnostic
+  // and request ID, and the three assertions around it check exactly that: the
+  // failure is reported, the request ID survives for `--request-id` resume, and
+  // the token does not leak. Both classes satisfy all three. Pinning the class
+  // asserted which of two racing timers won, which is not a property of the code.
+  assert.match(result.stderr, /request request-transport-1; last transport [A-Za-z]+Error(?:\/[A-Z0-9_]+)?/);
   assert.match(result.stderr, /--request-id request-transport-1/);
   assert.equal(result.stderr.includes('sat_transport_test'), false);
 });

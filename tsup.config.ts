@@ -9,5 +9,5 @@ export default defineConfig({
   splitting: false,
   sourcemap: true,
   clean: true,
-  external: ['@anthropic-ai/sdk', '@google/genai', 'openai', 'youtube-transcript', 'zod'],
+  external: ['@anthropic-ai/sdk', '@google/genai', 'openai', 'youtube-transcript', 'youtube-transcript-plus', 'youtubei.js', 'zod'],
 });

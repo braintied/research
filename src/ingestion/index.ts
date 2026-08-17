@@ -7,5 +7,10 @@
 
 export * from './types.js';
 export { ingestSource } from './ingest-source.js';
-export { categorizeItems } from './categorize.js';
+export {
+  categorizeItems,
+  CategorizeTaxonomyError,
+  CONTRACTOR_TAXONOMY,
+  type CategorizeTaxonomy,
+} from './categorize.js';
 export { embedItems } from './embed-items.js';

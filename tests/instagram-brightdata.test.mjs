@@ -2,18 +2,17 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { afterEach, test } from 'node:test';
 
-import { instagramProvider } from '../dist/index.mjs';
+import { createInstagramProvider } from '../dist/index.mjs';
 
 const originalFetch = globalThis.fetch;
-const originalBrightDataToken = process.env.BRIGHTDATA_API_TOKEN;
-const originalApifyToken = process.env.APIFY_API_TOKEN;
+
+// Configured explicitly per test: the provider is built from a credential
+// record, so "which token is present" is stated rather than inherited.
+const brightDataCredentials = { brightdata: { apiToken: 'test-brightdata-token' } };  // git-secret-allow: fake fixture value, never a live credential
+const instagramProvider = createInstagramProvider(brightDataCredentials);
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
-  if (originalBrightDataToken === undefined) delete process.env.BRIGHTDATA_API_TOKEN;
-  else process.env.BRIGHTDATA_API_TOKEN = originalBrightDataToken;
-  if (originalApifyToken === undefined) delete process.env.APIFY_API_TOKEN;
-  else process.env.APIFY_API_TOKEN = originalApifyToken;
 });
 
 function jsonResponse(value, status = 200) {
@@ -23,18 +22,15 @@ function jsonResponse(value, status = 200) {
   });
 }
 
-test('Instagram provider is enabled only by BRIGHTDATA_API_TOKEN', () => {
-  delete process.env.BRIGHTDATA_API_TOKEN;
-  process.env.APIFY_API_TOKEN = 'test-apify-token';
-  assert.equal(instagramProvider.enabled, false);
-
-  process.env.BRIGHTDATA_API_TOKEN = 'test-brightdata-token';
+test('Instagram provider is enabled by Bright Data or Apify credentials', () => {
+  const apifyOnly = createInstagramProvider({ apifyApiToken: 'test-apify-token' });  // git-secret-allow: fake fixture value, never a live credential
+  const neither = createInstagramProvider({});
+  assert.equal(apifyOnly.enabled, true);
+  assert.equal(neither.enabled, false);
   assert.equal(instagramProvider.enabled, true);
 });
 
 test('Bright Data hashtag discovery returns canonical, deduplicated Instagram results with provenance', async () => {
-  process.env.BRIGHTDATA_API_TOKEN = 'test-brightdata-token';
-  delete process.env.APIFY_API_TOKEN;
   const calls = [];
   let snapshot = 0;
 
@@ -83,20 +79,18 @@ test('Bright Data hashtag discovery returns canonical, deduplicated Instagram re
 });
 
 test('Instagram search fails immediately when Bright Data is missing or returns an error', async () => {
-  delete process.env.BRIGHTDATA_API_TOKEN;
-  process.env.APIFY_API_TOKEN = 'test-apify-token';
+  const apifyOnly = createInstagramProvider({ apifyApiToken: 'test-apify-token' });  // git-secret-allow: fake fixture value, never a live credential
   let calls = 0;
   globalThis.fetch = async () => {
     calls += 1;
     return jsonResponse({});
   };
   await assert.rejects(
-    instagramProvider.search('AI creators', { limit: 5 }),
-    /BRIGHTDATA_API_TOKEN/,
+    apifyOnly.search('AI creators', { limit: 5 }),
+    /brightdata/,
   );
   assert.equal(calls, 0);
 
-  process.env.BRIGHTDATA_API_TOKEN = 'test-brightdata-token';
   globalThis.fetch = async (input) => {
     calls += 1;
     assert.equal(new URL(String(input)).hostname, 'api.brightdata.com');
@@ -144,7 +138,6 @@ test('Instagram search fails immediately when Bright Data is missing or returns 
 });
 
 test('direct Instagram fetch uses Bright Data once and preserves the canonical source URL', async () => {
-  process.env.BRIGHTDATA_API_TOKEN = 'test-brightdata-token';
   const calls = [];
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input);
@@ -174,7 +167,6 @@ test('direct Instagram fetch uses Bright Data once and preserves the canonical s
 });
 
 test('direct Instagram fetch follows an asynchronous Bright Data scrape snapshot', async () => {
-  process.env.BRIGHTDATA_API_TOKEN = 'test-brightdata-token';
   const calls = [];
   globalThis.fetch = async (input) => {
     const url = String(input);
@@ -207,7 +199,6 @@ test('direct Instagram fetch follows an asynchronous Bright Data scrape snapshot
 });
 
 test('one-segment Instagram profiles use the Bright Data profiles dataset and require useful profile data', async () => {
-  process.env.BRIGHTDATA_API_TOKEN = 'test-brightdata-token';
   const calls = [];
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input);
@@ -249,7 +240,6 @@ test('one-segment Instagram profiles use the Bright Data profiles dataset and re
 });
 
 test('direct Instagram fetch fails closed for provider errors and unusable records', async () => {
-  process.env.BRIGHTDATA_API_TOKEN = 'test-brightdata-token';
   let calls = 0;
   globalThis.fetch = async () => {
     calls += 1;
@@ -272,15 +262,140 @@ test('direct Instagram fetch fails closed for provider errors and unusable recor
   assert.match(empty.fetch_error, /no usable matching content/);
   await assert.rejects(
     instagramProvider.extract(empty),
-    /failed or empty Bright Data fetch/,
+    /failed or empty Instagram fetch/,
   );
   assert.equal(calls, 2);
 });
 
-test('Instagram provider source enforces the Bright Data-only boundary', async () => {
+test('Instagram provider source keeps posts on Bright Data and stories on Apify only', async () => {
   const source = await readFile(new URL('../src/providers/instagram.ts', import.meta.url), 'utf8');
   assert.match(source, /gd_lk5ns7kz21pck8jpis/);
   assert.match(source, /gd_l1vikfch901nx3by4/);
-  assert.match(source, /BRIGHTDATA_API_TOKEN/);
-  assert.doesNotMatch(source, /APIFY|api\.apify|Crawl4AI|Jina|Playwright|Puppeteer/i);
+  assert.match(source, /credentials\.brightdata/);
+  assert.match(source, /datavoyantlab\/advanced-instagram-stories-scraper/);
+  assert.match(source, /api\.apify\.com/);
+  // Posts/profiles must not be recovered through generic crawl/browser stacks
+  // (allow the words only in ban-list comments if present).
+  const codeWithoutComments = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+  assert.doesNotMatch(codeWithoutComments, /Crawl4AI|Jina|Playwright|Puppeteer/i);
+  // Stories are the only Apify lane; post scrape must stay on Bright Data datasets.
+  assert.match(source, /scrapePost[\s\S]*?BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID/);
+  assert.match(source, /scrapeProfile[\s\S]*?BRIGHTDATA_INSTAGRAM_PROFILES_DATASET_ID/);
+  assert.match(source, /scrapeStories[\s\S]*?APIFY_INSTAGRAM_STORIES_ACTOR_ID|startApifyStoriesRun/);
+});
+
+test('Instagram stories fetch requires Apify and returns normalized active stories', async () => {
+  const provider = createInstagramProvider({
+    brightdata: { apiToken: 'test-brightdata-token' },  // git-secret-allow: fake fixture value, never a live credential
+    apifyApiToken: 'test-apify-token',  // git-secret-allow: fake fixture value, never a live credential
+  });
+  const calls = [];
+  let pollCount = 0;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    calls.push({ url, method: init.method ?? 'GET', body: init.body });
+
+    if (url.includes('api.apify.com') && url.includes('/acts/') && url.includes('/runs')) {
+      assert.equal(init.method, 'POST');
+      const payload = JSON.parse(init.body);
+      assert.deepEqual(payload.usernames, ['natgeo']);
+      return jsonResponse({
+        data: { id: 'run-stories-1', defaultDatasetId: 'dataset-stories-1', status: 'RUNNING' },
+      });
+    }
+    if (url.includes('api.apify.com') && url.includes('/actor-runs/run-stories-1')) {
+      pollCount += 1;
+      return jsonResponse({ data: { id: 'run-stories-1', status: 'SUCCEEDED' } });
+    }
+    if (url.includes('api.apify.com') && url.includes('/datasets/dataset-stories-1/items')) {
+      return jsonResponse([{
+        pk: 3586220921557665410,
+        id: '3586220921557665410_787132',
+        media_type: 1,
+        product_type: 'story',
+        taken_at: 1741730864,
+        expiring_at: 1741817264,
+        caption: null,
+        user: { username: 'natgeo', full_name: 'National Geographic' },
+        image_versions2: {
+          candidates: [{ width: 750, height: 1334, url: 'https://cdn.example.com/story-photo.jpg' }],
+        },
+        story_link_stickers: [{
+          story_link: {
+            url: 'https://l.instagram.com/?u=https%3A%2F%2Fwww.nationalgeographic.com%2Farticle',
+            display_url: 'nationalgeographic.com/article',
+          },
+        }],
+        story_hashtags: [{ hashtag: { name: 'wildlife' } }],
+      }]);
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  // Short-circuit poll sleep by making poll return SUCCEEDED on first check:
+  // pollApifyRunUntilDone sleeps first, then checks — still fine offline.
+  const result = await provider.fetch('https://instagram.com/stories/NatGeo/?utm=1');
+  assert.equal(result.fetch_status, 'ok');
+  assert.equal(result.url, 'https://www.instagram.com/stories/natgeo/');
+  assert.equal(result.author, '@natgeo');
+  assert.equal(result.engagement.instagram_provider, 'apify');
+  assert.equal(result.engagement.source_kind, 'stories');
+  assert.equal(result.engagement.story_count, 1);
+  assert.equal(result.engagement.apify_actor_id, 'datavoyantlab/advanced-instagram-stories-scraper');
+  assert.match(result.markdown, /Story 1/);
+  assert.match(result.markdown, /cdn\.example\.com\/story-photo\.jpg/);
+  assert.match(result.markdown, /wildlife/);
+  assert.equal(result.engagement.stories[0].story_id, '3586220921557665410');
+  assert.equal(result.engagement.stories[0].link_url, 'https://nationalgeographic.com/article');
+  assert.ok(calls.some(call => call.url.includes('api.apify.com')));
+  assert.ok(!calls.some(call => call.url.includes('api.brightdata.com')));
+  assert.ok(pollCount >= 1);
+});
+
+test('Instagram stories fetch fails closed without Apify and on empty rings', async () => {
+  const noApify = createInstagramProvider({
+    brightdata: { apiToken: 'test-brightdata-token' },  // git-secret-allow: fake fixture value, never a live credential
+  });
+  const missing = await noApify.fetch('https://www.instagram.com/stories/natgeo/');
+  assert.equal(missing.fetch_status, 'failed');
+  assert.match(missing.fetch_error, /apifyApiToken|required for Instagram stories/i);
+
+  const provider = createInstagramProvider({
+    apifyApiToken: 'test-apify-token',  // git-secret-allow: fake fixture value, never a live credential
+  });
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes('/acts/') && url.includes('/runs')) {
+      return jsonResponse({
+        data: { id: 'run-empty', defaultDatasetId: 'dataset-empty', status: 'RUNNING' },
+      });
+    }
+    if (url.includes('/actor-runs/run-empty')) {
+      return jsonResponse({ data: { id: 'run-empty', status: 'SUCCEEDED' } });
+    }
+    if (url.includes('/datasets/dataset-empty/items')) {
+      return jsonResponse([]);
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  const empty = await provider.fetch('https://www.instagram.com/stories/natgeo/');
+  assert.equal(empty.fetch_status, 'failed');
+  assert.match(empty.fetch_error, /no active stories/);
+});
+
+test('Instagram stories URL parser accepts watch and story permalinks', async () => {
+  const { parseInstagramStoriesUrl, canonicalizeInstagramStoriesUrl } = await import('../dist/index.mjs');
+  const watch = parseInstagramStoriesUrl('https://www.instagram.com/stories/NASA/');
+  assert.equal(watch.username, 'nasa');
+  assert.equal(watch.storyId, undefined);
+  assert.equal(watch.watchUrl, 'https://www.instagram.com/stories/nasa/');
+  assert.equal(
+    canonicalizeInstagramStoriesUrl('https://instagram.com/stories/nasa/12345/?igsh=1'),
+    'https://www.instagram.com/stories/nasa/12345/',
+  );
+  assert.equal(parseInstagramStoriesUrl('https://www.instagram.com/p/abc/'), null);
+  assert.equal(parseInstagramStoriesUrl('https://www.instagram.com/stories/'), null);
 });

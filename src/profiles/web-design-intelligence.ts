@@ -287,13 +287,95 @@ export const WEB_DESIGN_INTELLIGENCE_PROFILE_V1 = ResearchProfileSchema.parse({
  * The version-1 object remains byte-for-byte/hash compatible for pinned runs;
  * generic web search cannot stand in for implementation-repository evidence
  * in the latest profile.
+ *
+ * 2026-08-04 pack expansions (guidance/practitioner canary zeros) are v2-only
+ * so the v1 profileSha256 pin stays immutable. 1.2.3 re-tunes live canary
+ * under-fills (guidance still 0e; template 6e/10 floor; implementation 5e/8).
  */
 export const WEB_DESIGN_INTELLIGENCE_PROFILE = ResearchProfileSchema.parse({
   ...WEB_DESIGN_INTELLIGENCE_PROFILE_V1,
   version: 2,
   requiredProviders: ['github'],
-  sourcePacks: WEB_DESIGN_INTELLIGENCE_PROFILE_V1.sourcePacks.map((pack) =>
-    pack.id === 'open-implementation-sources'
-      ? { ...pack, providers: ['github'] }
-      : pack),
+  sourcePacks: WEB_DESIGN_INTELLIGENCE_PROFILE_V1.sourcePacks.map((pack) => {
+    if (pack.id === 'open-implementation-sources') {
+      return {
+        ...pack,
+        providers: ['github'] as const,
+        // Prefer high-recall repo queries first (only the first 4 hints run).
+        queryHints: [
+          'react component library design system typescript stars:>500 license',
+          'tailwind ui animation accessible frontend components maintained',
+          'website design system monorepo storybook tokens license release',
+          'AI frontend DESIGN.md visual design instructions agent skill',
+        ],
+        searchResultLimit: 36,
+        maxPages: 2,
+      };
+    }
+    if (pack.id === 'award-editorial-sources') {
+      return { ...pack, maxPages: 3, searchResultLimit: 28 };
+    }
+    if (pack.id === 'premium-template-authorities') {
+      return {
+        ...pack,
+        queryHints: [
+          'website template license commercial client work pricing terms',
+          'Framer Webflow Shopify theme marketplace pricing license redistribution',
+          'premium UI kit Figma Tailwind sections membership annual pricing',
+          'template builder commercial rights SaaS white label terms',
+        ],
+        maxPages: 4,
+        searchResultLimit: 36,
+      };
+    }
+    if (pack.id === 'ai-design-guidance') {
+      return {
+        ...pack,
+        // Drop github.com (implementation pack owns native github evidence).
+        // Prefer high-yield public doc hosts that Tavily returns under domain
+        // filters; apex AI blogs alone produced 0e on the 2026-08-04 canary.
+        includeDomains: [
+          'web.dev', 'developer.mozilla.org', 'mdn.io',
+          'w3.org', 'www.w3.org', 'w3c.github.io',
+          'webaim.org', 'www.a11yproject.com', 'a11yproject.com',
+          'nngroup.com', 'www.nngroup.com',
+          'playwright.dev', 'storybook.js.org',
+          'docs.anthropic.com', 'anthropic.com',
+          'platform.openai.com', 'developers.openai.com', 'openai.com',
+          'arxiv.org',
+        ],
+        queryHints: [
+          'accessible responsive website design best practices',
+          'WCAG accessibility evaluation website testing',
+          'Playwright visual regression testing Storybook a11y',
+          'frontend design system guidelines visual QA',
+        ],
+        maxPages: 4,
+        searchResultLimit: 32,
+      };
+    }
+    if (pack.id === 'design-practitioner-signal') {
+      return {
+        ...pack,
+        providers: ['hn', 'rss', 'podcasts', 'tavily', 'searxng'] as const,
+        expectedSourceTypes: ['forum', 'newsletter', 'podcast', 'longform'] as const,
+        includeDomains: [
+          'smashingmagazine.com', 'css-tricks.com', 'alistapart.com', 'web.dev',
+          'news.ycombinator.com',
+        ],
+        queryHints: [
+          'AI website design generic aesthetics',
+          'frontend design system visual QA',
+          'template library taste failure design systems',
+          'agent generated website quality critique',
+        ],
+        searchResultLimit: 18,
+      };
+    }
+    return pack;
+  }),
+  coverageRequirements: WEB_DESIGN_INTELLIGENCE_PROFILE_V1.coverageRequirements.map((requirement) =>
+    requirement.id === 'practitioner-counterevidence'
+      ? { ...requirement, allowUndated: true }
+      : requirement),
 });

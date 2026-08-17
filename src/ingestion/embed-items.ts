@@ -8,6 +8,7 @@
  */
 
 import { embedTexts } from '../embedder.js';
+import type { ResearchCredentials } from '../credentials.js';
 import { logger } from '../logger.js';
 import type { IngestedItem } from './types.js';
 
@@ -24,13 +25,16 @@ function buildEmbedInput(item: IngestedItem): string {
   return joined.length > 0 ? joined : item.url;
 }
 
-export async function embedItems(items: IngestedItem[]): Promise<IngestedItem[]> {
+export async function embedItems(
+  credentials: ResearchCredentials,
+  items: IngestedItem[],
+): Promise<IngestedItem[]> {
   if (items.length === 0) return items;
 
   const inputs = items.map(buildEmbedInput);
 
   try {
-    const embeddings = await embedTexts(inputs);
+    const embeddings = await embedTexts(credentials, inputs);
     if (embeddings.length !== items.length) {
       logger.warn(
         { expected: items.length, got: embeddings.length },

@@ -28,6 +28,10 @@
 
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import {
+  isApifyFallbackAllowed,
+  type ResearchCredentials,
+} from '../credentials.js';
 import { sleep } from '../pipeline-core.js';
 import {
   SearchResultSchema,
@@ -42,6 +46,8 @@ import { extractQuotesWithGemini } from './gemini-extractor.js';
 
 type XBackend = 'x_api_v2' | 'twitterapi_io' | 'apify';
 
+// Apify is last-resort only — imported gate lives in credentials.
+
 // =============================================================================
 // Official X API v2 transport (secondary backend)
 // =============================================================================
@@ -53,14 +59,16 @@ const X_RECENT_WINDOW_MS = 7 * 86_400_000;
 // boundary 30 seconds behind now avoids transient "end_time too recent" errors.
 const X_RECENT_SAFETY_LAG_MS = 30_000;
 
-function getOfficialXBearerToken(): string | null {
-  const token = process.env.X_BEARER_TOKEN;
-  if (token !== undefined && token.trim() !== '') return token.trim();
-  const deployedAlias = process.env.X_APP_BEARER_TOKEN;
-  if (deployedAlias !== undefined && deployedAlias.trim() !== '') return deployedAlias.trim();
-  const legacy = process.env.TWITTER_BEARER_TOKEN;
-  if (legacy !== undefined && legacy.trim() !== '') return legacy.trim();
-  return null;
+/**
+ * The three transports are independent: each returns null when the host did
+ * not configure it, and the provider degrades to whichever remain. Alias
+ * resolution (X_BEARER_TOKEN / X_APP_BEARER_TOKEN / TWITTER_BEARER_TOKEN,
+ * TWITTERAPI_IO_KEY / TWITTERAPI_KEY) happens once, in the credential
+ * resolver, so this module sees one field per transport.
+ */
+function officialXBearerToken(credentials: ResearchCredentials): string | null {
+  if (credentials.x === undefined || credentials.x.bearerToken === undefined) return null;
+  return credentials.x.bearerToken;
 }
 
 const OfficialXPublicMetricsSchema = z.object({
@@ -177,12 +185,9 @@ async function twitterApiRateLimit(): Promise<void> {
 const TWITTERAPI_BASE_URL = 'https://api.twitterapi.io';
 const TWITTERAPI_TIMEOUT_MS = 30_000;
 
-function getTwitterApiKey(): string | null {
-  const key = process.env.TWITTERAPI_IO_KEY;
-  if (key !== undefined && key !== '') return key;
-  const legacy = process.env.TWITTERAPI_KEY;
-  if (legacy !== undefined && legacy !== '') return legacy;
-  return null;
+function twitterApiKeyOf(credentials: ResearchCredentials): string | null {
+  if (credentials.x === undefined || credentials.x.twitterapiKey === undefined) return null;
+  return credentials.x.twitterapiKey;
 }
 
 // Fetch envelopes vary by endpoint: /twitter/tweets returns the array under
@@ -320,16 +325,17 @@ const ACTOR_ID = 'apidojo/tweet-scraper';
 const POLL_INTERVAL_MS = 5_000;
 const MAX_WAIT_MS = 5 * 60 * 1_000;
 
-function getApifyToken(): string | null {
-  const token = process.env.APIFY_API_TOKEN;
-  if (token !== undefined && token !== '') return token;
-  return null;
+function apifyTokenOf(credentials: ResearchCredentials): string | null {
+  if (credentials.apifyApiToken === undefined) return null;
+  return credentials.apifyApiToken;
 }
 
-function isEnabled(): boolean {
-  return getOfficialXBearerToken() !== null
-    || getTwitterApiKey() !== null
-    || getApifyToken() !== null;
+function hasAnyBackend(credentials: ResearchCredentials): boolean {
+  return (
+    officialXBearerToken(credentials) !== null ||
+    twitterApiKeyOf(credentials) !== null ||
+    isApifyFallbackAllowed(credentials)
+  );
 }
 
 interface ApifyRunData {
@@ -1167,163 +1173,164 @@ async function fetchViaApify(
 // Provider
 // =============================================================================
 
-export const xProvider: SearchProvider = {
-  name: 'x',
+export function createXProvider(credentials: ResearchCredentials): SearchProvider {
+  return {
+    name: 'x',
 
-  capabilities: {
-    search: true,
-    fetch: true,
-    extract: true,
-    backends: ['twitterapi_io', 'x_api_v2', 'apify'],
-  },
+    capabilities: {
+      search: true,
+      fetch: true,
+      extract: true,
+      backends: ['twitterapi_io', 'x_api_v2', 'apify'],
+    },
 
-  get enabled(): boolean {
-    return isEnabled();
-  },
+    enabled: hasAnyBackend(credentials),
 
-  async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
-    const officialBearerToken = getOfficialXBearerToken();
-    const twitterApiKey = getTwitterApiKey();
-    const apifyToken = getApifyToken();
+    async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
+      const officialBearerToken = officialXBearerToken(credentials);
+      const twitterApiKey = twitterApiKeyOf(credentials);
+      const apifyToken = apifyTokenOf(credentials);
 
-    if (twitterApiKey !== null) {
+      if (twitterApiKey !== null) {
+        try {
+          const results = await searchViaTwitterApi(query, opts, twitterApiKey);
+          logger.info(
+            { query: query.slice(0, 60), count: results.length, backend: 'twitterapi_io' },
+            '[X] Search complete',
+          );
+          return results;
+        } catch (err) {
+          if (opts.signal?.aborted === true) throw err;
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn(
+            { query: query.slice(0, 60), error: msg.slice(0, 120) },
+            '[X] twitterapi.io search failed — falling back',
+          );
+        }
+      }
+
+      if (officialBearerToken !== null) {
+        try {
+          const results = await searchViaOfficialX(query, opts, officialBearerToken);
+          logger.info(
+            { query: query.slice(0, 60), count: results.length, backend: 'x_api_v2' },
+            '[X] Search complete',
+          );
+          return results;
+        } catch (err) {
+          if (opts.signal?.aborted === true) throw err;
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn(
+            { query: query.slice(0, 60), error: msg.slice(0, 120) },
+            '[X] Official API search failed — falling back',
+          );
+        }
+      }
+
+      if (!isApifyFallbackAllowed(credentials) || apifyToken === null) {
+        throw new Error(
+          'No usable X backend (twitterapi.io and official X API failed or unset; Apify fallback disabled unless APIFY_ALLOW_FALLBACK=1)',
+        );
+      }
+
       try {
-        const results = await searchViaTwitterApi(query, opts, twitterApiKey);
+        const results = await searchViaApify(query, opts, apifyToken);
         logger.info(
-          { query: query.slice(0, 60), count: results.length, backend: 'twitterapi_io' },
+          { query: query.slice(0, 60), count: results.length, backend: 'apify' },
           '[X] Search complete',
         );
         return results;
       } catch (err) {
-        if (opts.signal?.aborted === true) throw err;
         const msg = err instanceof Error ? err.message : String(err);
-        logger.warn(
-          { query: query.slice(0, 60), error: msg.slice(0, 120) },
-          '[X] twitterapi.io search failed — falling back',
-        );
+        logger.warn({ query: query.slice(0, 60), error: msg }, '[X] Search failed');
+        throw err;
       }
-    }
+    },
 
-    if (officialBearerToken !== null) {
-      try {
-        const results = await searchViaOfficialX(query, opts, officialBearerToken);
-        logger.info(
-          { query: query.slice(0, 60), count: results.length, backend: 'x_api_v2' },
-          '[X] Search complete',
-        );
-        return results;
-      } catch (err) {
-        if (opts.signal?.aborted === true) throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn(
-          { query: query.slice(0, 60), error: msg.slice(0, 120) },
-          '[X] Official API search failed — falling back',
-        );
-      }
-    }
+    async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
+      const tweetIdMatch = /\/status\/(\d+)/.exec(url);
+      const tweetIdValue = tweetIdMatch !== null ? tweetIdMatch[1] : null;
 
-    if (apifyToken === null) {
-      throw new Error(
-        'No usable X backend (twitterapi.io and official X API failed or unset; no APIFY_API_TOKEN)',
-      );
-    }
+      const officialBearerToken = officialXBearerToken(credentials);
+      const twitterApiKey = twitterApiKeyOf(credentials);
+      const apifyToken = apifyTokenOf(credentials);
 
-    try {
-      const results = await searchViaApify(query, opts, apifyToken);
-      logger.info(
-        { query: query.slice(0, 60), count: results.length, backend: 'apify' },
-        '[X] Search complete',
-      );
-      return results;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn({ query: query.slice(0, 60), error: msg }, '[X] Search failed');
-      throw err;
-    }
-  },
-
-  async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
-    const tweetIdMatch = /\/status\/(\d+)/.exec(url);
-    const tweetIdValue = tweetIdMatch !== null ? tweetIdMatch[1] : null;
-
-    const officialBearerToken = getOfficialXBearerToken();
-    const twitterApiKey = getTwitterApiKey();
-    const apifyToken = getApifyToken();
-
-    if (twitterApiKey !== null && tweetIdValue !== null) {
-      try {
-        const result = await fetchViaTwitterApi(url, tweetIdValue, twitterApiKey);
-        if (result !== null) {
-          logger.info({ url: url.slice(0, 60), backend: 'twitterapi_io' }, '[X] Fetch complete');
-          return result;
+      if (twitterApiKey !== null && tweetIdValue !== null) {
+        try {
+          const result = await fetchViaTwitterApi(url, tweetIdValue, twitterApiKey);
+          if (result !== null) {
+            logger.info({ url: url.slice(0, 60), backend: 'twitterapi_io' }, '[X] Fetch complete');
+            return result;
+          }
+          logger.warn(
+            { url: url.slice(0, 60) },
+            '[X] twitterapi.io returned no tweet for id — falling back',
+          );
+        } catch (err) {
+          if (signal?.aborted === true) throw err;
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn(
+            { url: url.slice(0, 60), error: msg.slice(0, 120) },
+            '[X] twitterapi.io fetch failed — falling back',
+          );
         }
-        logger.warn(
-          { url: url.slice(0, 60) },
-          '[X] twitterapi.io returned no tweet for id — falling back',
-        );
-      } catch (err) {
-        if (signal?.aborted === true) throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn(
-          { url: url.slice(0, 60), error: msg.slice(0, 120) },
-          '[X] twitterapi.io fetch failed — falling back',
-        );
       }
-    }
 
-    if (officialBearerToken !== null && tweetIdValue !== null) {
-      try {
-        const result = await fetchViaOfficialX(url, tweetIdValue, officialBearerToken, signal);
-        if (result !== null) {
-          logger.info({ url: url.slice(0, 60), backend: 'x_api_v2' }, '[X] Fetch complete');
-          return result;
+      if (officialBearerToken !== null && tweetIdValue !== null) {
+        try {
+          const result = await fetchViaOfficialX(url, tweetIdValue, officialBearerToken, signal);
+          if (result !== null) {
+            logger.info({ url: url.slice(0, 60), backend: 'x_api_v2' }, '[X] Fetch complete');
+            return result;
+          }
+          logger.warn(
+            { url: url.slice(0, 60) },
+            '[X] Official API returned no post for id — falling back',
+          );
+        } catch (err) {
+          if (signal?.aborted === true) throw err;
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn(
+            { url: url.slice(0, 60), error: msg.slice(0, 120) },
+            '[X] Official API fetch failed — falling back to Apify',
+          );
         }
-        logger.warn(
-          { url: url.slice(0, 60) },
-          '[X] Official API returned no post for id — falling back',
-        );
-      } catch (err) {
-        if (signal?.aborted === true) throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn(
-          { url: url.slice(0, 60), error: msg.slice(0, 120) },
-          '[X] Official API fetch failed — falling back to Apify',
-        );
       }
-    }
 
-    if (apifyToken === null) {
-      return FetchResultSchema.parse({
+      if (!isApifyFallbackAllowed(credentials) || apifyToken === null) {
+        return FetchResultSchema.parse({
+          provider: 'x',
+          url,
+          fetch_status: 'failed',
+          fetch_error:
+            'No usable X backend (twitterapi.io and official X API failed or unset; Apify fallback disabled unless APIFY_ALLOW_FALLBACK=1)',
+        });
+      }
+
+      try {
+        const result = await fetchViaApify(url, tweetIdValue, apifyToken);
+        logger.info({ url: url.slice(0, 60), backend: 'apify' }, '[X] Fetch complete');
+        return result;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return FetchResultSchema.parse({
+          provider: 'x',
+          url,
+          fetch_status: 'failed',
+          fetch_error: `X fetch failed: ${msg.slice(0, 200)}`,
+        });
+      }
+    },
+
+    async extract(raw: FetchResult): Promise<ExtractedQuotes> {
+      const content = raw.markdown.length > 0 ? raw.markdown : raw.raw_content;
+      return extractQuotesWithGemini({
+        credentials,
         provider: 'x',
-        url,
-        fetch_status: 'failed',
-        fetch_error:
-          'No usable X backend (twitterapi.io and official X API failed or unset; no APIFY_API_TOKEN)',
+        url: raw.url,
+        content,
+        mode: 'reddit', // closest equivalent — threaded replies with engagement
       });
-    }
-
-    try {
-      const result = await fetchViaApify(url, tweetIdValue, apifyToken);
-      logger.info({ url: url.slice(0, 60), backend: 'apify' }, '[X] Fetch complete');
-      return result;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return FetchResultSchema.parse({
-        provider: 'x',
-        url,
-        fetch_status: 'failed',
-        fetch_error: `X fetch failed: ${msg.slice(0, 200)}`,
-      });
-    }
-  },
-
-  async extract(raw: FetchResult): Promise<ExtractedQuotes> {
-    const content = raw.markdown.length > 0 ? raw.markdown : raw.raw_content;
-    return extractQuotesWithGemini({
-      provider: 'x',
-      url: raw.url,
-      content,
-      mode: 'reddit', // closest equivalent — threaded replies with engagement
-    });
-  },
-};
+    },
+  };
+}

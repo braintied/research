@@ -9,6 +9,7 @@
  * writes. Report indexing is optional and injected via `indexSink`.
  */
 
+import { vendorUnitCostUsd } from '@braintied/cost';
 import { z } from 'zod';
 import {
   hashUrl,
@@ -16,7 +17,12 @@ import {
   resolveSameSourceCitationUrl,
   SearchResultSchema,
   SubquerySchema,
+  ExtractedQuotesSchema,
 } from './types.js';
+import {
+  extractCacheKey,
+  EXTRACT_CACHE_TTL_SECONDS,
+} from './extract-cache.js';
 import {
   isKeyClaimSupportedBySource,
   isVerbatimQuoteSupportedBySource,
@@ -37,19 +43,28 @@ import { DEPTH_CONFIG, getModelPricing } from './depth-config.js';
 import type { ResearchDepth } from './depth-config.js';
 import { CostTracker } from './cost-tracker.js';
 import {
-  EXTRACTION_MODEL,
+  researchModelRates,
+  resolveResearchCritiqueModel,
+} from './model-policy.js';
+import {
+  extractionModelId,
   GEMINI_MAX_CONTENT_CHARS,
   CHARS_PER_TOKEN,
   mapWithConcurrency,
 } from './pipeline-core.js';
 import { planSubqueries } from './planner.js';
 import type { PlannerUsage } from './planner.js';
+import { splitDecisionBriefQuestions } from './decision-brief.js';
+import { allocateExtractBudgetFairShare } from './extract-budget.js';
 import {
+  createProviderRegistry,
   getEnabledProviders,
   getEnabledSearchProviders,
   routeProvidersForSourceTypes,
   extractQuotesWithGemini,
 } from './providers/index.js';
+import type { ProviderRegistry } from './providers/index.js';
+import type { ResearchCredentials } from './credentials.js';
 import { rerankQuotes } from './rerank.js';
 import {
   synthesizeAllSections,
@@ -77,6 +92,7 @@ export {
   coerceDepth,
   getDepthConfig,
   getModelPricing,
+  tryGetModelPricing,
   deepResearchSynthesisCostUsd,
   MODEL_PRICING,
   DEEPSEEK_V4_PRO_PROMO_EXPIRY_AT,
@@ -86,46 +102,97 @@ export { CostTracker } from './cost-tracker.js';
 export { logger } from './logger.js';
 export type { Logger } from './logger.js';
 
+// The package's entire configuration surface. Hosts resolve env at their own
+// process boundary and pass the record in; src/ never reads process.env.
+export {
+  resolveResearchCredentials,
+  isApifyFallbackAllowed,
+  resolveGeminiApiKey,
+  requireGeminiApiKey,
+  requireVoyageApiKey,
+  requireAnthropicApiKey,
+  MissingCredentialError,
+  RESEARCH_ENV_NAMES,
+  GEMINI_KEY_ENV_NAMES,
+  GEMINI_KEY_NAME_ENV,
+  CRAWL4AI_ALLOWED_DOMAINS_ENV,
+  CRAWL4AI_NETWORK_GUARD_ENV,
+  CRAWL4AI_NETWORK_GUARD_VALUE,
+} from './credentials.js';
+export type {
+  ResearchCredentials,
+  ResearchEnvironment,
+  RedditCredentials,
+  XCredentials,
+  BrightDataCredentials,
+  GitHubPublicAuthConfig,
+  Crawl4AiConfig,
+} from './credentials.js';
+
 // Stage-level building blocks (so consumers can compose their own pipelines)
 export { planSubqueries, summarizePromptBrief } from './planner.js';
 export type { PlanSubqueriesInput, PlannerUsage } from './planner.js';
+export { splitDecisionBriefQuestions, questionHeadingFor, SHARED_CONTEXT_MAX_CHARS } from './decision-brief.js';
+export type { DecisionBriefSplit } from './decision-brief.js';
+export { allocateExtractBudgetFairShare } from './extract-budget.js';
 export {
+  createProviderRegistry,
   getAllProviders,
   getEnabledProviders,
   getEnabledSearchProviders,
   routeProvidersForSourceTypes,
   extractQuotesWithGemini,
-  tavilyProvider,
-  exaProvider,
-  serpapiProvider,
-  serperProvider,
-  searxngProvider,
-  perplexityProvider,
-  redditProvider,
-  youtubeProvider,
-  hnProvider,
+  createTavilyProvider,
+  tavilyAnswer,
+  createExaProvider,
+  createSerpapiProvider,
+  createSerperProvider,
+  createSearxngProvider,
+  createPerplexityProvider,
+  perplexityAnswer,
+  PerplexityApiError,
+  createRedditProvider,
+  createYoutubeProvider,
+  createHnProvider,
   rssProvider,
-  crawl4aiProvider,
-  facebookGroupsProvider,
-  tiktokProvider,
-  instagramProvider,
-  xProvider,
-  podcastsProvider,
-  githubProvider,
+  createCrawl4aiProvider,
+  createFacebookGroupsProvider,
+  createTiktokProvider,
+  createInstagramProvider,
+  BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID,
+  BRIGHTDATA_INSTAGRAM_PROFILES_DATASET_ID,
+  APIFY_INSTAGRAM_STORIES_ACTOR_ID,
+  canonicalizeInstagramPostUrl,
+  canonicalizeInstagramProfileUrl,
+  canonicalizeInstagramStoriesUrl,
+  parseInstagramStoriesUrl,
+  createXProvider,
+  createPodcastsProvider,
+  createGithubProvider,
   resolveGitHubPublicAuthState,
   triggerCollection,
   pollSnapshot,
   downloadSnapshot,
   scrapeDataset,
+  unlockUrl,
   fetchLinkedInPostsBrightData,
   fetchFacebookGroupPostsBrightData,
 } from './providers/index.js';
 export type {
+  InstagramStoriesTarget,
+  ProviderRegistry,
   PollSnapshotOptions,
   ScrapeDatasetOptions,
   BrightDataRecord,
+  UnlockUrlOptions,
+  UnlockedPage,
   GitHubPublicAuthCode,
   GitHubPublicAuthState,
+  PerplexityAnswerModel,
+  PerplexityAnswerOptions,
+  PerplexityAnswerResult,
+  TavilyAnswerOptions,
+  TavilyAnswerResult,
 } from './providers/index.js';
 export { rerankQuotes } from './rerank.js';
 export {
@@ -170,14 +237,31 @@ export * from './research-program.js';
 // Knowledge-ingestion core (continuous internet-knowledge ingestion).
 export * from './ingestion/index.js';
 
-// Standalone scrape primitives — the Crawl4AI → Jina Reader → direct-fetch
-// chain, usable outside the research pipeline (e.g. Sentigen WebResearch).
+// Standalone scrape primitives — the Crawl4AI → direct-fetch chain, usable
+// outside the research pipeline (e.g. Sentigen WebResearch).
 export {
   crawlUrl,
+  crawlUrlDetailed,
   crawlWithCrawl4AI,
-  jinaReaderFetch,
   directFetchAsText,
+  EXTRACTION_MODEL,
+  extractionModelId,
+  resolveGeminiRequestModel,
 } from './pipeline-core.js';
+export type {
+  Crawl4AIDeclineReason,
+  CrawlMethod,
+  CrawlUrlDetailedResult,
+} from './pipeline-core.js';
+
+export {
+  resolveResearchExtractionModel,
+  resolveResearchSynthesisModel,
+  resolveResearchCritiqueModel,
+  resolveResearchAssemblyModel,
+  researchModelRates,
+  researchStageCostFields,
+} from './model-policy.js';
 
 // Research kinds — semantic presets (quick/standard/deep/managed/social).
 export {
@@ -199,13 +283,55 @@ export type { RunManagedResearchInput, RunManagedResearchResult } from './manage
 // Document layer — research → typed structured documents (PRD, briefs, specs).
 export * from './documents/index.js';
 
+// YouTube channel ingestion — Data API v3 channel catalog, playlists,
+// metadata, and comment trees. All keys are function arguments.
+export {
+  listChannelVideos,
+  getChannelPlaylists,
+  getPlaylistVideoIds,
+  buildPlaylistMembership,
+  getVideoMetadata,
+  getVideoComments,
+} from './youtube/index.js';
+export type {
+  ChannelVideoRef,
+  ChannelPlaylist,
+  YoutubeVideoMetadata,
+  YoutubeComment,
+} from './youtube/index.js';
+
+// Unified YouTube transcript stack — captions → Groq Whisper → Deepgram.
+export { extractTranscriptWithFallback, TranscriptUnavailableError } from './transcript/index.js';
+export type {
+  TranscriptResult,
+  TranscriptSegmentWindow,
+  TranscriptTier,
+  TranscriptUsage,
+} from './transcript/index.js';
+
+// YC portfolio provider (public yc-oss API).
+export { fetchYcPortfolio } from './providers/yc-portfolio.js';
+export type { YcCompany } from './providers/yc-portfolio.js';
+
 // =============================================================================
 // Constants — mirror the original runner's budget knobs
 // =============================================================================
 
 const SEARCH_RESULT_LIMIT = 8;
+/** Fetch ceiling (crawl). Extract has a separate, tighter run budget. */
 const CUMULATIVE_URL_CEILING = 400;
 const RERANK_TOP_K = 40;
+
+/**
+ * Mutable run-level extract budget. Shared across the main extract pass and
+ * every critique re-extract so the whole run cannot exceed maxExtractPages.
+ */
+interface ExtractBudget {
+  remaining: number;
+  concurrency: number;
+  /** URLs already extracted this run — skip re-paying Gemini for them. */
+  doneUrls: Set<string>;
+}
 
 // =============================================================================
 // runDeepResearch — the main orchestrator
@@ -221,6 +347,13 @@ export type IndexSink = (chunks: ReportChunkInput[]) => Promise<void>;
  */
 export interface PipelineUsageEvent {
   provider: string;
+  /**
+   * Canonical vendor name for search/scrape rows (`tavily`, `serper`,
+   * `brightdata`). Same as `provider` today; hosts must copy it onto
+   * `AiUsageInput.vendor` or the ledger column stays NULL (measured
+   * 2026-08-16: 1,720/1,720 Tavily rows).
+   */
+  vendor?: string;
   category: 'search' | 'fetch' | 'extract' | 'embed' | 'synth' | 'critique' | 'plan' | 'transcribe';
   model?: string;
   units: number;
@@ -237,6 +370,7 @@ const SAFE_USAGE_OPERATIONS = new Set([
   'extract-input',
   'extract-input-estimated',
   'extract-output',
+  'extract-cache-hit',
   'plan-input',
   'plan-output',
   'rerank-2',
@@ -258,7 +392,14 @@ const SAFE_USAGE_MODELS = new Set([
   'deepseek-v4-flash',
   'deepseek-v4-pro',
   'gemini-2.5-flash',
-  'gemini-3-flash-preview',
+  // EXTRACTION_MODEL. Must be listed here or `sanitizeUsageValue` drops the
+  // model name from usage telemetry entirely (returns undefined for an
+  // unlisted value), which silently destroys per-model cost attribution.
+  // Any change to EXTRACTION_MODEL must add the new id to this set.
+  'gemini-2.5-flash-lite',
+  'gemini-3.6-flash',
+  'gemini-3.1-flash-lite',
+  'gemini-3.5-flash-lite',
   'gemini-3.5-flash-lite',
   'gemini-3.6-flash',
   'glm-5.2',
@@ -322,6 +463,7 @@ class NotifyingCostTracker extends CostTracker {
         : undefined;
       const event: PipelineUsageEvent = {
         provider: entry.provider,
+        vendor: entry.category === 'search' ? entry.provider : undefined,
         category: entry.category,
         model: safeModel,
         units: entry.units,
@@ -342,20 +484,35 @@ class NotifyingCostTracker extends CostTracker {
   }
 }
 
-// Per-call search cost estimates (USD) — audit M2. Free providers are $0;
-// paid providers use list-price estimates so the cap sees search spend.
-const SEARCH_COST_PER_CALL_USD: Partial<Record<ProviderName, number>> = {
-  tavily: 0.008,
-  exa: 0.007,
-  serpapi: 0.015,
-  serper: 0.001,
+// Per-call search cost estimates (USD) — audit M2. Catalog vendors come from
+// `@braintied/cost` (one table). These two are not in that catalog yet.
+const LOCAL_SEARCH_COST_PER_CALL_USD: Partial<Record<ProviderName, number>> = {
   perplexity: 0.005,
   podcasts: 0.002,
 };
 
-// Gemini flash-lite extraction pricing (USD per 1M tokens).
-const EXTRACTION_INPUT_USD_PER_M = 0.10;
-const EXTRACTION_OUTPUT_USD_PER_M = 0.40;
+function searchCostPerCallUsd(provider: ProviderName): number | undefined {
+  // Provider name `x` is three backends (twitterapi.io / official X / Apify)
+  // with different unit prices. Do not apply the official-X catalog rate to
+  // every X search — that would over-count the fleet primary ~33×.
+  if (provider === 'x') {
+    return undefined;
+  }
+  const catalog = vendorUnitCostUsd(provider);
+  if (catalog !== undefined) {
+    return catalog;
+  }
+  return LOCAL_SEARCH_COST_PER_CALL_USD[provider];
+}
+
+// Extraction pricing comes from @braintied/models for the live extract wire id.
+function extractionRates(): { inputUsdPerM: number; outputUsdPerM: number } {
+  try {
+    return researchModelRates(extractionModelId());
+  } catch {
+    return { inputUsdPerM: 0.25, outputUsdPerM: 1.5 };
+  }
+}
 // Voyage rerank-2 (USD per 1M tokens).
 const VOYAGE_RERANK_USD_PER_M = 0.05;
 
@@ -400,6 +557,8 @@ const SEARCH_CACHE_TTL_SECONDS: Partial<Record<ProviderName, number>> = {
 const DEFAULT_SEARCH_CACHE_TTL_SECONDS = 14 * 86_400;
 const FETCH_CACHE_TTL_SECONDS = 30 * 86_400;
 
+export { extractCacheKey, EXTRACT_CACHE_TTL_SECONDS, EXTRACT_CACHE_KEY_PREFIX } from './extract-cache.js';
+
 function searchCacheTtl(provider: ProviderName, opts: SearchOpts): number {
   const configured = SEARCH_CACHE_TTL_SECONDS[provider] ?? DEFAULT_SEARCH_CACHE_TTL_SECONDS;
   if (opts.recency_days !== undefined && opts.recency_days <= 7) return Math.min(configured, 3_600);
@@ -435,6 +594,11 @@ async function cacheSet(
 }
 
 export interface RunDeepResearchInput {
+  /**
+   * Host-resolved credentials. Every provider lane, model call, and crawler
+   * endpoint comes from this record; the package reads no ambient state.
+   */
+  credentials: ResearchCredentials;
   /** The research brief / prompt to investigate. */
   brief: string;
   /** Depth mode — 'standard' (default) or 'wide'. */
@@ -452,7 +616,7 @@ export interface RunDeepResearchInput {
   indexSink?: IndexSink;
   /**
    * Optional provider allowlist. When provided, only these providers (further
-   * intersected with the env-enabled set) participate in search/fetch — used
+   * intersected with the configured set) participate in search/fetch — used
    * by research kinds (e.g. 'social' restricts to community providers).
    */
   providers?: ProviderName[];
@@ -481,7 +645,7 @@ export interface RunDeepResearchInput {
    * accepted prefixes). The stage APIs accepted this since Phase 1 Experiment 1
    * but the top-level entrypoints never forwarded it — synthesis was
    * effectively hardcoded to claude-sonnet-4-6, which is ~90% of a quick-run's
-   * cost. The 'quick' kind now defaults this to gemini-3.6-flash.
+   * cost. The 'quick' kind now defaults this via resolveResearchSynthesisModel('quick').
    */
   synthesisModelOverride?: string;
   /**
@@ -564,7 +728,8 @@ export async function runDeepResearch(
     '[runDeepResearch] Pipeline configured',
   );
 
-  let enabledProviders = getEnabledProviders();
+  const providerRegistry = createProviderRegistry(input.credentials);
+  let enabledProviders = getEnabledProviders(input.credentials);
   if (input.providers !== undefined && input.providers.length > 0) {
     const allowlist = new Set<string>(input.providers);
     // crawl4ai is the shared fetch backbone — always keep it available.
@@ -588,7 +753,7 @@ export async function runDeepResearch(
   }
   // Keep fetch-capable providers (notably Crawl4AI) available for acquisition,
   // but expose only real search providers to the planner and search fan-out.
-  const globallySearchable = getEnabledSearchProviders();
+  const globallySearchable = getEnabledSearchProviders(input.credentials);
   const searchProviders: typeof enabledProviders = {};
   for (const [name, provider] of Object.entries(enabledProviders)) {
     if (globallySearchable[name as ProviderName] !== undefined) {
@@ -605,8 +770,9 @@ export async function runDeepResearch(
   // recorded, so the hard cap under-counted by every plan + re-plan call).
   const plannerUsageSink = (usage: PlannerUsage): void => {
     const isGemini = usage.model.startsWith('gemini-');
+    const extractRates = extractionRates();
     const pricing = isGemini
-      ? { inputUsdPerM: EXTRACTION_INPUT_USD_PER_M, outputUsdPerM: EXTRACTION_OUTPUT_USD_PER_M, provider: 'google' }
+      ? { inputUsdPerM: extractRates.inputUsdPerM, outputUsdPerM: extractRates.outputUsdPerM, provider: 'google' }
       : (() => {
           const p = getModelPricing(usage.model);
           return { inputUsdPerM: p.inputUsdPerM, outputUsdPerM: p.outputUsdPerM, provider: p.provider };
@@ -629,15 +795,76 @@ export async function runDeepResearch(
 
   // ---------------------------------------------------------------------------
   // Step 1: plan subqueries (restricted to providers enabled for this run)
+  //
+  // Decision briefs plan per question. A multi-question brief planned as one
+  // blob gives the planner no per-question budget — measured 2026-08-15, an
+  // 8-question brief planned at standard depth yielded subqueries for the
+  // first few questions only, and every later section assembled as an
+  // evidence gap. Each question gets its own share of the band and its
+  // section paths are namespaced q{n}.* so extract-budget allocation and
+  // report headings align with the caller's questions.
   // ---------------------------------------------------------------------------
-  const plannedSubqueries: Subquery[] = await planSubqueries({
-    promptMd: input.brief,
-    targetWordCount,
-    subqueriesMin,
-    subqueriesMax,
-    availableProviders: availableProviderNames,
-    usageSink: plannerUsageSink,
-  });
+  const decisionSplit = splitDecisionBriefQuestions(input.brief);
+  let plannedSubqueries: Subquery[];
+  let sectionTitles: Record<string, string> | undefined;
+  if (decisionSplit === null) {
+    plannedSubqueries = await planSubqueries({
+      credentials: input.credentials,
+      promptMd: input.brief,
+      targetWordCount,
+      subqueriesMin,
+      subqueriesMax,
+      availableProviders: availableProviderNames,
+      usageSink: plannerUsageSink,
+    });
+  } else {
+    const questionCount = decisionSplit.questions.length;
+    const perQuestionMin = Math.max(2, Math.floor(subqueriesMin / questionCount));
+    const perQuestionMax = Math.max(3, Math.ceil(subqueriesMax / questionCount));
+    const titles: Record<string, string> = {};
+    decisionSplit.questions.forEach((question, index) => {
+      titles[`q${index + 1}`] = question;
+    });
+    sectionTitles = titles;
+    log.info(
+      { questionCount, perQuestionMin, perQuestionMax },
+      '[runDeepResearch] Decision brief detected — planning per question',
+    );
+    const perQuestionPlans = await mapWithConcurrency(
+      decisionSplit.questions,
+      2,
+      async (question, index) => {
+        const questionNumber = index + 1;
+        try {
+          const planned = await planSubqueries({
+            credentials: input.credentials,
+            promptMd: `${decisionSplit.sharedContext}\n\nResearch question:\n${question}`,
+            targetWordCount,
+            subqueriesMin: perQuestionMin,
+            subqueriesMax: perQuestionMax,
+            availableProviders: availableProviderNames,
+            usageSink: plannerUsageSink,
+          });
+          return planned.map((subquery) => ({
+            ...subquery,
+            section_path: `q${questionNumber}.${subquery.section_path}`,
+          }));
+        } catch (error) {
+          // One question's plan failing must not kill the other questions'
+          // research; the run only aborts when EVERY plan came back empty.
+          log.warn(
+            {
+              questionNumber,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            '[runDeepResearch] Per-question plan failed — continuing without it',
+          );
+          return [];
+        }
+      },
+    );
+    plannedSubqueries = perQuestionPlans.flat();
+  }
 
   const seededSubqueries = (input.seedSubqueries ?? []).map((subquery) => SubquerySchema.parse(subquery));
   let subqueries: Subquery[] = [...seededSubqueries, ...plannedSubqueries];
@@ -650,6 +877,7 @@ export async function runDeepResearch(
   // Step 2: search (route providers per subquery, run in parallel, dedup)
   // ---------------------------------------------------------------------------
   const allSearchResults = await runSearch(
+    providerRegistry,
     subqueries, searchProviders, costTracker, log, input.cache, minFreeResults,
     input.searchOptions, input.providerSearchOptions,
   );
@@ -682,12 +910,21 @@ export async function runDeepResearch(
   // ---------------------------------------------------------------------------
   // Step 3: fetch content
   // ---------------------------------------------------------------------------
-  const markdownByUrl = await fetchContent(urlsToFetch, enabledProviders, log, input.cache);
+  const markdownByUrl = await fetchContent(input.credentials, urlsToFetch, enabledProviders, log, input.cache);
 
   // ---------------------------------------------------------------------------
   // Step 4: extract quotes → per-section maps
   // ---------------------------------------------------------------------------
+  // Run-level budget (main + critique). Prevents one brief from minting
+  // thousands of Gemini extract calls (Aug 2026 GCP incident class).
+  const extractBudget: ExtractBudget = {
+    remaining: depthConfig.maxExtractPages,
+    concurrency: depthConfig.extractConcurrency,
+    doneUrls: new Set<string>(),
+  };
+
   const extraction = await extractQuotes(
+    input.credentials,
     subqueries,
     allSearchResults,
     markdownByUrl,
@@ -695,6 +932,8 @@ export async function runDeepResearch(
     depthConfig.urlsPerSubquery,
     costTracker,
     log,
+    extractBudget,
+    input.cache,
   );
 
   let { quotesBySection } = extraction;
@@ -704,6 +943,7 @@ export async function runDeepResearch(
   // Step 5: section synthesis (rerank per section, then synthesize)
   // ---------------------------------------------------------------------------
   let sections = await synthesizeSections(
+    input.credentials,
     subqueries,
     quotesBySection,
     claimsBySection,
@@ -711,6 +951,7 @@ export async function runDeepResearch(
     costTracker,
     log,
     input.synthesisModelOverride,
+    sectionTitles,
   );
 
   // ---------------------------------------------------------------------------
@@ -720,19 +961,34 @@ export async function runDeepResearch(
   let critiquePass = 0;
   while (critiquePass < depthConfig.critiqueMaxPasses) {
     const critique = await critiqueDraft({
+      credentials: input.credentials,
       promptMd: input.brief,
       sections,
       targetWordCount,
       providerCoverageBySection,
     });
 
-    // Critique cost (matches runner's flat 2000-token estimate at Sonnet rate).
+    // Critique cost — real model + catalog rates (same path as synth).
+    // Prior: hard-coded provider 'anthropic' + Sonnet rate with no model in
+    // metadata. Critique has used resolveResearchCritiqueModel() (Gemini cheap
+    // tier by default) since the model-policy rewrite, so the ledger stored
+    // synthetic model `anthropic:deep-research` and landed priced_by=unpriced
+    // (78 rows / 7d measured 2026-08-04). Stamp the real model so ingest can
+    // catalog-price tokens; flat 2000-token estimate kept until critiqueDraft
+    // returns usage (token accounting is a separate step).
+    const critiqueModel = resolveResearchCritiqueModel();
+    const critiquePricing = getModelPricing(critiqueModel);
     costTracker.record({
-      provider: 'anthropic',
+      provider: critiquePricing.provider,
       category: 'critique',
       units: 2000,
-      unit_cost_usd: 3 / 1_000_000,
-      metadata: { pass: critiquePass, gaps: critique.gaps.length },
+      unit_cost_usd: critiquePricing.inputUsdPerM / 1_000_000,
+      metadata: {
+        pass: critiquePass,
+        gaps: critique.gaps.length,
+        model: critiqueModel,
+        operation: 'critique-input-estimated',
+      },
     });
 
     finalGaps.length = 0;
@@ -759,6 +1015,7 @@ export async function runDeepResearch(
 
     const refinementHint = serializeCritiqueHint(critique);
     const additionalSubqueries = await planSubqueries({
+    credentials: input.credentials,
       promptMd: input.brief,
       targetWordCount,
       refinementHint,
@@ -776,15 +1033,17 @@ export async function runDeepResearch(
 
     // Extra search for the refinement subqueries only.
     const extraResults = await runSearch(
+    providerRegistry,
       additionalSubqueries, searchProviders, costTracker, log, input.cache, minFreeResults,
       input.searchOptions, input.providerSearchOptions,
     );
     mergeDiscoveryResults(allDiscoveries, extraResults);
     recordSourceMeta(extraResults);
     const extraToFetch = extraResults.slice(0, Math.min(extraResults.length, CUMULATIVE_URL_CEILING));
-    const extraMarkdown = await fetchContent(extraToFetch, enabledProviders, log, input.cache);
+    const extraMarkdown = await fetchContent(input.credentials, extraToFetch, enabledProviders, log, input.cache);
 
     const extraExtraction = await extractQuotes(
+      input.credentials,
       additionalSubqueries,
       extraResults,
       extraMarkdown,
@@ -792,6 +1051,8 @@ export async function runDeepResearch(
       depthConfig.urlsPerSubquery,
       costTracker,
       log,
+      extractBudget,
+      input.cache,
     );
 
     // Merge new evidence into the running maps.
@@ -827,6 +1088,7 @@ export async function runDeepResearch(
 
     // Re-synthesize with the enriched evidence.
     sections = await synthesizeSections(
+    input.credentials,
       subqueries,
       quotesBySection,
       claimsBySection,
@@ -834,6 +1096,7 @@ export async function runDeepResearch(
       costTracker,
       log,
       input.synthesisModelOverride,
+      sectionTitles,
     );
 
     critiquePass++;
@@ -848,6 +1111,7 @@ export async function runDeepResearch(
     gaps: finalGaps,
     sourceMeta: sourceMetaByUrl,
     synthesisModelOverride: input.synthesisModelOverride,
+    sectionTitles,
   });
   recordSynthCost(costTracker, assembly.model, assembly.inputTokens, assembly.cachedReadTokens, assembly.outputTokens, 'assembly');
   const report = assembly.report;
@@ -945,10 +1209,13 @@ type EnabledProviders = ReturnType<typeof getEnabledProviders>;
  * provider into a source pack that explicitly requires HN/RSS/podcasts (or
  * any other specialist lane).
  */
-export function providersForSubquery(subquery: Subquery): ProviderName[] {
+export function providersForSubquery(
+  registry: ProviderRegistry,
+  subquery: Subquery,
+): ProviderName[] {
   const providerNames = new Set<ProviderName>(subquery.providers);
   if (!subquery.required && subquery.source_pack_id === undefined) {
-    for (const providerName of routeProvidersForSourceTypes(subquery.expected_source_types)) {
+    for (const providerName of routeProvidersForSourceTypes(registry, subquery.expected_source_types)) {
       providerNames.add(providerName);
     }
   }
@@ -1006,7 +1273,7 @@ async function searchOneProvider(
   try {
     const providerResults = await provider.search(subquery.query, effectiveOptions);
     const results = filterSearchResults(providerResults, effectiveOptions);
-    const perCall = SEARCH_COST_PER_CALL_USD[providerName];
+    const perCall = searchCostPerCallUsd(providerName);
     if (perCall !== undefined && perCall > 0) {
       costTracker.record({
         provider: providerName,
@@ -1078,6 +1345,7 @@ function filterSearchResults(results: SearchResult[], opts: SearchOpts): SearchR
  * fewer than `minFreeResults` unique results for the subquery.
  */
 async function runSearch(
+  registry: ProviderRegistry,
   subqueries: Subquery[],
   enabledProviders: EnabledProviders,
   costTracker: CostTracker,
@@ -1094,7 +1362,7 @@ async function runSearch(
     subqueries,
     4,
     async (subquery): Promise<SearchResult[]> => {
-      const providerNames = providersForSubquery(subquery);
+      const providerNames = providersForSubquery(registry, subquery);
 
       interface TierEntry {
         name: ProviderName;
@@ -1225,6 +1493,7 @@ function mergeDiscoveryResults(target: SearchResult[], additions: SearchResult[]
 
 /** Fetch markdown content for a set of results — provider.fetch, else crawl4ai. */
 async function fetchContent(
+  credentials: ResearchCredentials,
   results: SearchResult[],
   enabledProviders: EnabledProviders,
   log: Logger,
@@ -1296,6 +1565,7 @@ interface ExtractionMaps {
 
 /** Extract verbatim quotes from fetched content and bucket them by section. */
 async function extractQuotes(
+  credentials: ResearchCredentials,
   subqueries: Subquery[],
   allSearchResults: SearchResult[],
   markdownByUrl: Record<string, string>,
@@ -1303,6 +1573,8 @@ async function extractQuotes(
   urlsPerSubquery: number,
   costTracker: CostTracker,
   log: Logger,
+  extractBudget: ExtractBudget,
+  cache?: ResearchCacheAdapter,
 ): Promise<ExtractionMaps> {
   // Map each section to the URLs its OWN subqueries actually retrieved
   // (audit F1). The old mapping bucketed by provider identity over the global
@@ -1355,76 +1627,154 @@ async function extractQuotes(
     (r) => markdownByUrl[r.url] !== undefined && markdownByUrl[r.url].length > 0,
   );
 
+  // Dedup by URL, skip already-extracted, then hard-cap to remaining budget.
+  const seen = new Set<string>();
+  const candidates: typeof resultsWithContent = [];
+  for (const result of resultsWithContent) {
+    if (seen.has(result.url) || extractBudget.doneUrls.has(result.url)) {
+      continue;
+    }
+    seen.add(result.url);
+    candidates.push(result);
+  }
+
+  // Fair-share, not FIFO: the prefix slice preserved subquery order, so the
+  // first few subqueries consumed the whole run budget and every later
+  // section extracted zero pages (measured 2026-08-15: standard runs on
+  // multi-question briefs emitted evidence gaps for every section after the
+  // first ~5 subqueries). Round-robin by section guarantees each section
+  // floor(budget / sections) pages before any section takes extras.
+  const allowed = allocateExtractBudgetFairShare(
+    candidates,
+    (result) => {
+      const firstSection = result.retrieved_for[0];
+      return firstSection === undefined ? '(unsectioned)' : firstSection;
+    },
+    Math.max(0, extractBudget.remaining),
+  );
+  const skippedForBudget = candidates.length - allowed.length;
+  extractBudget.remaining -= allowed.length;
+  for (const result of allowed) {
+    extractBudget.doneUrls.add(result.url);
+  }
+
+  if (skippedForBudget > 0 || candidates.length < resultsWithContent.length) {
+    log.info(
+      {
+        candidates: candidates.length,
+        extracting: allowed.length,
+        skippedForBudget,
+        alreadyDone: extractBudget.doneUrls.size - allowed.length,
+        remainingBudget: extractBudget.remaining,
+        concurrency: extractBudget.concurrency,
+      },
+      '[runDeepResearch] Extract budget applied',
+    );
+  }
+
   // Bounded fan-out (audit F7): extraction is one Gemini call per source —
   // unbounded Promise.all hammered the API with every source at once.
+  // Concurrency is depth-tunable (default 4); never unbounded.
   await mapWithConcurrency(
-    resultsWithContent,
-    8,
+    allowed,
+    extractBudget.concurrency,
     async (result) => {
       const markdown = markdownByUrl[result.url];
       const providerName = result.provider;
       const provider = enabledProviders[providerName];
+      const modelId = extractionModelId();
+      const cacheKey = extractCacheKey(result.url, markdown, modelId);
 
-      let extracted: ExtractedQuotes;
-      if (provider !== undefined && provider.extract !== undefined) {
+      let extracted: ExtractedQuotes | null = null;
+      let cacheHit = false;
+      const cachedRaw = await cacheGet(cache, cacheKey, log);
+      if (cachedRaw !== null) {
         try {
-          extracted = await provider.extract({
-            provider: providerName,
-            url: result.url,
-            raw_content: markdown,
-            markdown,
-            title: '',
-            engagement: {},
-            raw_metadata: {},
-            fetch_status: 'ok',
-          });
-        } catch (err: unknown) {
-          log.warn(
-            { url: result.url.slice(0, 80), error: errMsg(err).slice(0, 120) },
-            '[runDeepResearch] Provider extract() failed, falling back to Gemini',
-          );
+          const parsed = ExtractedQuotesSchema.safeParse(JSON.parse(cachedRaw));
+          if (parsed.success) {
+            extracted = parsed.data;
+            cacheHit = true;
+          }
+        } catch {
+          // corrupt cache entry — fall through to live extract
+        }
+      }
+
+      if (extracted === null) {
+        if (provider !== undefined && provider.extract !== undefined) {
+          try {
+            extracted = await provider.extract({
+              provider: providerName,
+              url: result.url,
+              raw_content: markdown,
+              markdown,
+              title: '',
+              engagement: {},
+              raw_metadata: {},
+              fetch_status: 'ok',
+            });
+          } catch (err: unknown) {
+            log.warn(
+              { url: result.url.slice(0, 80), error: errMsg(err).slice(0, 120) },
+              '[runDeepResearch] Provider extract() failed, falling back to Gemini',
+            );
+            extracted = await extractQuotesWithGemini({
+              credentials,
+              provider: providerName,
+              url: result.url,
+              content: markdown,
+              mode: 'longform',
+            });
+          }
+        } else {
           extracted = await extractQuotesWithGemini({
+            credentials,
             provider: providerName,
             url: result.url,
             content: markdown,
-            mode: 'longform',
+            mode: extractionModeFor(providerName),
           });
         }
-      } else {
-        extracted = await extractQuotesWithGemini({
-          provider: providerName,
-          url: result.url,
-          content: markdown,
-          mode: extractionModeFor(providerName),
-        });
+        await cacheSet(cache, cacheKey, JSON.stringify(extracted), EXTRACT_CACHE_TTL_SECONDS, log);
       }
 
       // Extraction cost (audit M2) — real Gemini tokens when the extractor
       // reported them, else a conservative estimate from content length so
       // the cap still sees extraction spend from provider-native extractors.
-      if (extracted.usage !== undefined) {
+      // Cache hits do not re-bill the LLM (record $0 with operation tag).
+      if (cacheHit) {
+        costTracker.record({
+          provider: 'google',
+          category: 'extract',
+          units: 0,
+          unit_cost_usd: 0,
+          metadata: { model: modelId, operation: 'extract-cache-hit' },
+        });
+      } else if (extracted.usage !== undefined) {
+        const rates = extractionRates();
         costTracker.record({
           provider: 'google',
           category: 'extract',
           units: extracted.usage.prompt_tokens,
-          unit_cost_usd: EXTRACTION_INPUT_USD_PER_M / 1_000_000,
-          metadata: { model: EXTRACTION_MODEL, operation: 'extract-input' },
+          unit_cost_usd: rates.inputUsdPerM / 1_000_000,
+          metadata: { model: modelId, operation: 'extract-input' },
         });
         costTracker.record({
           provider: 'google',
           category: 'extract',
           units: extracted.usage.candidate_tokens,
-          unit_cost_usd: EXTRACTION_OUTPUT_USD_PER_M / 1_000_000,
-          metadata: { model: EXTRACTION_MODEL, operation: 'extract-output' },
+          unit_cost_usd: rates.outputUsdPerM / 1_000_000,
+          metadata: { model: modelId, operation: 'extract-output' },
         });
       } else {
+        const rates = extractionRates();
         const estimatedInputTokens = Math.ceil(Math.min(markdown.length, GEMINI_MAX_CONTENT_CHARS) / CHARS_PER_TOKEN);
         costTracker.record({
           provider: 'google',
           category: 'extract',
           units: estimatedInputTokens,
-          unit_cost_usd: EXTRACTION_INPUT_USD_PER_M / 1_000_000,
-          metadata: { model: EXTRACTION_MODEL, operation: 'extract-input-estimated' },
+          unit_cost_usd: rates.inputUsdPerM / 1_000_000,
+          metadata: { model: modelId, operation: 'extract-input-estimated' },
         });
       }
 
@@ -1491,6 +1841,7 @@ async function extractQuotes(
 
 /** Build section specs, rerank per-section quote pools, then synthesize. */
 async function synthesizeSections(
+  credentials: ResearchCredentials,
   subqueries: Subquery[],
   quotesBySection: Record<string, VerbatimQuote[]>,
   claimsBySection: Record<string, { claim: string; source_url: string; provider: ProviderName }[]>,
@@ -1498,6 +1849,7 @@ async function synthesizeSections(
   costTracker: CostTracker,
   log: Logger,
   synthesisModelOverride?: string,
+  sectionTitles?: Record<string, string>,
 ): Promise<SectionDraft[]> {
   const sectionPathsSeen = new Set<string>();
   const sectionGoals: Record<string, string[]> = {};
@@ -1537,7 +1889,12 @@ async function synthesizeSections(
       rerankedQuotesByPath[spec.section_path] = [];
       continue;
     }
-    const rerankResult = await rerankQuotes({ query: spec.goal, quotes: raw, topK: RERANK_TOP_K });
+    const rerankResult = await rerankQuotes({
+      credentials,
+      query: spec.goal,
+      quotes: raw,
+      topK: RERANK_TOP_K,
+    });
     rerankedQuotesByPath[spec.section_path] = rerankResult.quotes;
     if (rerankResult.total_tokens !== undefined && rerankResult.total_tokens > 0) {
       rerankActualTokens += rerankResult.total_tokens;
@@ -1563,10 +1920,12 @@ async function synthesizeSections(
   }
 
   const synthesized = await synthesizeAllSections({
+    credentials,
     sectionsToWrite,
     quotesByPath: rerankedQuotesByPath,
     claimsByPath: claimsBySection,
     synthesisModelOverride,
+    sectionTitles,
   });
   recordSynthCost(
     costTracker,

@@ -204,7 +204,12 @@ export function compileProfileExecution(
       provider !== 'crawl4ai' && available.has(provider));
     if (selectedProviders.length === 0) continue;
     const providers = selectedProviders;
-    const hints = pack.queryHints.length > 0 ? pack.queryHints.slice(0, 2) : [rawInput.question];
+    // Cap at 4 so coverage-critical packs can ship more than two seed queries
+    // without unbounded fan-out (2026-08 canary: guidance 0e with only 2 of 3
+    // expanded hints executing; template/implementation under-filled thresholds).
+    const hints = pack.queryHints.length > 0
+      ? pack.queryHints.slice(0, 4)
+      : [rawInput.question];
     for (let index = 0; index < hints.length; index++) {
       const hint = hints[index];
       if (hint === undefined) continue;

@@ -3,7 +3,9 @@ import test from 'node:test';
 
 import { compileProfileExecution } from '../src/profiles/registry.js';
 import { SourcePackSchema } from '../src/profiles/types.js';
-import { hnProvider, searchResultFromHnHit } from '../src/providers/hn.js';
+import { createHnProvider, searchResultFromHnHit } from '../src/providers/hn.js';
+
+const hnProvider = createHnProvider({});
 import {
   rssFeedUrlsFromSearchOptions,
   rssItemMatchesQuery,
@@ -96,7 +98,7 @@ test('RSS-enabled source packs fail closed without valid explicit feed URLs', ()
 });
 
 test('profiles compile verified feed endpoints into every RSS-backed seeded search', () => {
-  const webDesign = compileProfileExecution(
+  const webDesignV1 = compileProfileExecution(
     'web-design-intelligence@1',
     {
       question: 'Which resources help agents build exceptional websites?',
@@ -104,17 +106,36 @@ test('profiles compile verified feed endpoints into every RSS-backed seeded sear
     },
     [...availableProviders],
   );
-  const practitionerSeeds = webDesign.seedSubqueries.filter((subquery) =>
+  const v1Seeds = webDesignV1.seedSubqueries.filter((subquery) =>
     subquery.source_pack_id === 'design-practitioner-signal');
-  assert.equal(practitionerSeeds.length, 2);
-  assert.ok(practitionerSeeds.every((subquery) =>
+  assert.equal(v1Seeds.length, 2);
+  // v1 is frozen: feed-only community pack, no include_domains.
+  assert.ok(v1Seeds.every((subquery) =>
     subquery.search_options.include_domains === undefined));
+  assert.ok(v1Seeds.every((subquery) =>
+    subquery.search_options.feed_urls?.includes('https://www.smashingmagazine.com/feed/')));
+  assert.ok(v1Seeds.every((subquery) =>
+    subquery.search_options.feed_urls?.includes('https://web.dev/static/blog/feed.xml')));
+  assert.ok(v1Seeds.every((subquery) =>
+    subquery.search_options.feed_urls?.includes('https://alistapart.com/main/feed/')));
+
+  const webDesignV2 = compileProfileExecution(
+    'web-design-intelligence@2',
+    {
+      question: 'Which resources help agents build exceptional websites?',
+      asOf: '2026-08-04',
+    },
+    [...availableProviders],
+  );
+  const practitionerSeeds = webDesignV2.seedSubqueries.filter((subquery) =>
+    subquery.source_pack_id === 'design-practitioner-signal');
+  // 1.2.3: compileProfileExecution fans out up to 4 pack query hints.
+  assert.equal(practitionerSeeds.length, 4);
+  // v2: publisher domains for tavily/searxng recovery; feeds remain RSS surface.
+  assert.ok(practitionerSeeds.every((subquery) =>
+    (subquery.search_options.include_domains ?? []).includes('smashingmagazine.com')));
   assert.ok(practitionerSeeds.every((subquery) =>
     subquery.search_options.feed_urls?.includes('https://www.smashingmagazine.com/feed/')));
-  assert.ok(practitionerSeeds.every((subquery) =>
-    subquery.search_options.feed_urls?.includes('https://web.dev/static/blog/feed.xml')));
-  assert.ok(practitionerSeeds.every((subquery) =>
-    subquery.search_options.feed_urls?.includes('https://alistapart.com/main/feed/')));
 
   const ora = compileProfileExecution(
     'ora-agent-runtime@1',

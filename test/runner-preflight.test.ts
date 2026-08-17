@@ -51,7 +51,7 @@ test('web-design v2 preflight fails closed when dedicated GitHub auth is absent'
     '--check',
     '--kind', 'standard',
     '--max-cost-usd', '1',
-    '--synthesis-model', 'gemini-3-flash-preview',
+    '--synthesis-model', 'gemini-3.6-flash',
     '--profile', 'web-design-intelligence@2',
     '--as-of', '2026-07-22',
   ], { cwd: packageRoot, env, encoding: 'utf8' });
@@ -97,7 +97,7 @@ test('web-design v2 preflight exposes sanitized authenticated health only', () =
     '--check',
     '--kind', 'standard',
     '--max-cost-usd', '1',
-    '--synthesis-model', 'gemini-3-flash-preview',
+    '--synthesis-model', 'gemini-3.6-flash',
     '--sources', 'web,github',
     '--profile', 'web-design-intelligence@2',
     '--as-of', '2026-07-22',
@@ -154,7 +154,7 @@ test('Gemini-backed standard research does not require Anthropic or Voyage', () 
     '--check',
     '--kind', 'standard',
     '--max-cost-usd', '1',
-    '--synthesis-model', 'gemini-3-flash-preview',
+    '--synthesis-model', 'gemini-3.6-flash',
   ], { cwd: packageRoot, env, encoding: 'utf8' });
 
   assert.equal(result.status, 0, result.stderr);
@@ -188,7 +188,7 @@ test('secure env file overrides stale inherited research settings and ignores un
       '--check',
       '--kind', 'standard',
       '--max-cost-usd', '1',
-      '--synthesis-model', 'gemini-3-flash-preview',
+      '--synthesis-model', 'gemini-3.6-flash',
       '--sources', 'web',
       '--require-providers', 'tavily',
       '--as-of', '2026-07-23',
@@ -242,7 +242,7 @@ test('BRAINTIED_RESEARCH_ENV_FILE makes the secure allowlisted source portable a
       '--check',
       '--kind', 'quick',
       '--max-cost-usd', '1',
-      '--synthesis-model', 'gemini-3-flash-preview',
+      '--synthesis-model', 'gemini-3.6-flash',
     ], { cwd: packageRoot, env, encoding: 'utf8' });
 
     assert.equal(result.status, 0, result.stderr);

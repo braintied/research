@@ -5,22 +5,23 @@
  * (searches by query string, returns videos with inline comments when
  * `shouldDownloadComments: true`).
  *
- * Preferred URL fetch: Bright Data Web Scraper API (TikTok posts dataset
- * `gd_lu702nij2f790tmv9h` — the same dataset the Swishh scrape stack and the
- * cortex-worker enrichment fleet run in production). The adapter accepts both
- * immediate records and asynchronous snapshots, ~$0.0015/record, and is NOT
- * gated by the Apify account cap. Returns
- * caption + stats (no comments — the comments live in a separate dataset), so
- * Apify remains the keyword-discovery and comment-rich fallback until a
- * Bright Data keyword-discovery contract is configured.
+ * Preferred path (Bright Data, same datasets as Swishh production):
+ *   - keyword discovery: discover_new + discover_by=keyword on posts dataset
+ *     `gd_lu702nij2f790tmv9h`
+ *   - URL fetch: synchronous scrape on the same posts dataset
  *
- * Rate limit: 5-second queue between Apify calls.
- * Env: APIFY_API_TOKEN and/or BRIGHTDATA_API_TOKEN — the provider is enabled
- * when either is configured (search requires the Apify token for now).
+ * Apify (`clockworks/free-tiktok-scraper`) is last-resort only and requires
+ * both APIFY_API_TOKEN and APIFY_ALLOW_FALLBACK=1.
+ *
+ * Env: BRIGHTDATA_API_TOKEN (primary). Optional APIFY_* for explicit fallback.
  */
 
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import {
+  isApifyFallbackAllowed,
+  type ResearchCredentials,
+} from '../credentials.js';
 import { sleep } from '../pipeline-core.js';
 import {
   SearchResultSchema,
@@ -32,7 +33,7 @@ import {
   type SearchOpts,
 } from '../types.js';
 import { extractQuotesWithGemini } from './gemini-extractor.js';
-import { scrapeDataset } from './brightdata.js';
+import { discoverAndDownload, scrapeDataset } from './brightdata.js';
 
 // =============================================================================
 // Rate limiter — 5-second queue between Apify calls
@@ -59,20 +60,20 @@ const ACTOR_ID = 'clockworks/free-tiktok-scraper';
 const POLL_INTERVAL_MS = 5_000;
 const MAX_WAIT_MS = 5 * 60 * 1_000;
 
-function getApifyToken(): string | null {
-  const token = process.env.APIFY_API_TOKEN;
-  if (token !== undefined && token !== '') return token;
-  return null;
+function apifyTokenOf(credentials: ResearchCredentials): string | null {
+  if (credentials.apifyApiToken === undefined) return null;
+  return credentials.apifyApiToken;
 }
 
-function getBrightDataToken(): string | null {
-  const token = process.env.BRIGHTDATA_API_TOKEN;
-  if (token !== undefined && token !== '') return token;
-  return null;
+function brightDataTokenOf(credentials: ResearchCredentials): string | null {
+  if (credentials.brightdata === undefined) return null;
+  return credentials.brightdata.apiToken;
 }
 
-function isEnabled(): boolean {
-  return getApifyToken() !== null || getBrightDataToken() !== null;
+function hasAnyBackend(credentials: ResearchCredentials): boolean {
+  return (
+    brightDataTokenOf(credentials) !== null || isApifyFallbackAllowed(credentials)
+  );
 }
 
 interface ApifyRunData {
@@ -222,10 +223,13 @@ function bdPublishedAt(record: BrightDataTikTokRecord): string | undefined {
  * Fetch a single TikTok video via Bright Data's immediate-or-snapshot scrape.
  * Returns null on any failure so the caller can report the combined error.
  */
-async function fetchViaBrightData(url: string, _token: string): Promise<FetchResult | null> {
+async function fetchViaBrightData(
+  credentials: ResearchCredentials,
+  url: string,
+): Promise<FetchResult | null> {
   let records: unknown;
   try {
-    records = await scrapeDataset(BRIGHTDATA_TIKTOK_POSTS_DATASET, [{ url }], {
+    records = await scrapeDataset(credentials, BRIGHTDATA_TIKTOK_POSTS_DATASET, [{ url }], {
       maxWaitMs: 180_000,
     });
   } catch (err) {
@@ -375,250 +379,336 @@ function extractPublishedAt(item: z.infer<typeof TikTokItemSchema>): string | un
 // Provider
 // =============================================================================
 
-export const tiktokProvider: SearchProvider = {
-  name: 'tiktok',
+export function createTiktokProvider(credentials: ResearchCredentials): SearchProvider {
+  return {
+    name: 'tiktok',
 
-  capabilities: {
-    search: true,
-    fetch: true,
-    extract: true,
-    backends: ['brightdata', 'apify'],
-  },
+    capabilities: {
+      search: true,
+      fetch: true,
+      extract: true,
+      backends: ['brightdata', 'apify'],
+    },
 
-  get enabled(): boolean {
-    return isEnabled();
-  },
+    enabled: hasAnyBackend(credentials),
 
-  async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
-    const token = getApifyToken();
-    if (token === null) {
-      logger.warn(
-        { query: query.slice(0, 60) },
-        '[TikTok] Search requires APIFY_API_TOKEN (Bright Data keyword discovery is fetch-only for now)',
-      );
-      return [];
-    }
-    await rateLimit();
+    async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
+      const limit = opts.limit !== undefined ? Math.min(opts.limit, 25) : 15;
 
-    const limit = opts.limit !== undefined ? Math.min(opts.limit, 25) : 15;
-
-    const input: Record<string, unknown> = {
-      searchQueries: [query],
-      resultsPerPage: limit,
-      shouldDownloadComments: true,
-      shouldDownloadCommentReplies: false,
-    };
-
-    let items: unknown[] = [];
-
-    try {
-      const { runId, datasetId } = await startApifyRun(ACTOR_ID, input, token);
-      await pollRunUntilDone(runId, token);
-      items = await fetchDatasetItems(datasetId, token);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn({ query: query.slice(0, 60), error: msg }, '[TikTok] Search failed');
-      return [];
-    }
-
-    const results: SearchResult[] = [];
-
-    for (const rawItem of items) {
-      const parsed = TikTokItemSchema.safeParse(rawItem);
-      if (!parsed.success) continue;
-
-      const item = parsed.data;
-      const videoUrl = extractVideoUrl(item);
-      if (videoUrl === null) continue;
-
-      const caption = item.text !== undefined ? item.text : '';
-
-      const candidate = {
-        provider: 'tiktok' as const,
-        url: videoUrl,
-        canonical_id: item.id !== undefined && item.id.length > 0 ? item.id : undefined,
-        title: caption.slice(0, 200),
-        snippet: caption.slice(0, 300),
-        author: extractAuthor(item),
-        published_at: extractPublishedAt(item),
-        engagement: {
-          view_count: item.playCount,
-          like_count: item.diggCount,
-          comment_count: item.commentCount,
-        },
-        raw_metadata: {
-          backend: 'apify',
-          share_count: item.shareCount,
-          comments: item.comments !== undefined ? item.comments.slice(0, 50) : [],
-        },
-      };
-
-      const validated = SearchResultSchema.safeParse(candidate);
-      if (validated.success) {
-        results.push(validated.data);
-      }
-    }
-
-    logger.info(
-      { query: query.slice(0, 60), count: results.length },
-      '[TikTok] Search complete',
-    );
-
-    return results;
-  },
-
-  async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
-    // signal reserved for future cancellation support
-    void signal;
-
-    const apifyToken = getApifyToken();
-    const brightDataToken = getBrightDataToken();
-
-    // Braintied policy: prefer Bright Data for supported URL acquisition;
-    // Apify is the comment-rich backup and current keyword-discovery path.
-    if (brightDataToken !== null) {
-      const bdResult = await fetchViaBrightData(url, brightDataToken);
-      if (bdResult !== null) {
-        logger.info({ url: url.slice(0, 60), backend: 'brightdata' }, '[TikTok] Fetch complete');
-        return bdResult;
-      }
-      logger.warn({ url: url.slice(0, 60) }, '[TikTok] Bright Data fetch failed — trying Apify fallback');
-    }
-
-    // Extract video ID from URL for targeted fetch
-    const videoIdMatch = /\/video\/(\d+)/.exec(url);
-    const videoId = videoIdMatch !== null ? videoIdMatch[1] : null;
-
-    let apifyError = 'APIFY_API_TOKEN not configured';
-
-    if (apifyToken !== null) {
-      await rateLimit();
-
-      const input: Record<string, unknown> = videoId !== null
-        ? {
-            videoUrls: [url],
-            commentsPerPage: 100,
-            shouldDownloadComments: true,
-            shouldDownloadCommentReplies: false,
-          }
-        : {
-            searchQueries: [url],
-            resultsPerPage: 1,
-            shouldDownloadComments: true,
-            shouldDownloadCommentReplies: false,
-          };
-
-      try {
-        const { runId, datasetId } = await startApifyRun(ACTOR_ID, input, apifyToken);
-        await pollRunUntilDone(runId, apifyToken);
-        const items = await fetchDatasetItems(datasetId, apifyToken);
-        const firstItem = items[0];
-
-        if (firstItem === undefined) {
-          apifyError = 'No items returned from Apify';
-        } else {
-          const parsed = TikTokItemSchema.safeParse(firstItem);
-          if (!parsed.success) {
-            apifyError = `Invalid item shape: ${parsed.error.message.slice(0, 100)}`;
-          } else {
+      // Primary: Bright Data keyword discovery (same path as Swishh production).
+      if (brightDataTokenOf(credentials) !== null) {
+        try {
+          const records = await discoverAndDownload(
+            credentials,
+            BRIGHTDATA_TIKTOK_POSTS_DATASET,
+            'keyword',
+            { keyword: query, num_of_posts: limit },
+          );
+          const results: SearchResult[] = [];
+          for (const record of records) {
+            const parsed = BrightDataTikTokRecordSchema.safeParse(record);
+            if (!parsed.success) continue;
             const item = parsed.data;
-            const caption = item.text !== undefined ? item.text : '';
-            const author = extractAuthor(item);
-
-            // Build markdown with caption + top comments
-            const lines: string[] = [
-              `# TikTok: ${caption.slice(0, 100)}`,
-              '',
-              `**Creator:** ${author !== undefined ? author : 'Unknown'} | **Views:** ${item.playCount !== undefined ? item.playCount : 0} | **Likes:** ${item.diggCount !== undefined ? item.diggCount : 0}`,
-              '',
-              '## Caption',
-              '',
-              caption,
-              '',
-            ];
-
-            const comments = item.comments;
-            if (comments !== undefined && Array.isArray(comments) && comments.length > 0) {
-              lines.push('## Top Comments', '');
-
-              // Sort by diggCount desc
-              const sortedComments = [...comments]
-                .map(c => TikTokCommentSchema.safeParse(c))
-                .filter(r => r.success)
-                .map(r => r.data)
-                .sort((a, b) => (b.diggCount !== undefined ? b.diggCount : 0) - (a.diggCount !== undefined ? a.diggCount : 0))
-                .slice(0, 100);
-
-              for (const comment of sortedComments) {
-                const commentText = comment.text !== undefined ? comment.text : '';
-                if (commentText.length === 0) continue;
-                const commentAuthor = comment.uniqueId !== undefined ? `@${comment.uniqueId}` : 'Unknown';
-                lines.push(`**${commentAuthor}** (${comment.diggCount !== undefined ? comment.diggCount : 0} likes)`);
-                lines.push('');
-                lines.push(commentText);
-                lines.push('');
-                lines.push('---');
-                lines.push('');
-              }
-            }
-
-            const markdown = lines.join('\n');
-
-            const result = FetchResultSchema.parse({
-              provider: 'tiktok',
-              url,
-              canonical_id: item.id !== undefined && item.id.length > 0 ? item.id : undefined,
+            if (item.error !== undefined && item.error.length > 0) continue;
+            const videoUrl =
+              item.url !== undefined && item.url.length > 0 ? item.url : null;
+            if (videoUrl === null) continue;
+            const caption = bdCaption(item);
+            const candidate = {
+              provider: 'tiktok' as const,
+              url: videoUrl,
+              canonical_id:
+                item.id !== undefined && item.id.length > 0
+                  ? item.id
+                  : item.post_id !== undefined && item.post_id.length > 0
+                    ? item.post_id
+                    : undefined,
               title: caption.slice(0, 200),
-              author,
-              published_at: extractPublishedAt(item),
-              raw_content: caption,
-              markdown,
+              snippet: caption.slice(0, 300),
+              author: bdAuthor(item),
+              published_at: bdPublishedAt(item),
               engagement: {
-                view_count: item.playCount,
-                like_count: item.diggCount,
-                comment_count: item.commentCount,
+                view_count: bdCount(item.play_count, item.playcount),
+                like_count: bdCount(item.digg_count, item.diggcount),
+                comment_count: bdCount(item.comment_count, item.commentcount),
               },
-              fetch_status: 'ok',
               raw_metadata: {
-                share_count: item.shareCount,
-                comments: item.comments !== undefined ? item.comments.slice(0, 100) : [],
-                backend: 'apify',
+                backend: 'brightdata',
+                dataset_id: BRIGHTDATA_TIKTOK_POSTS_DATASET,
               },
-            });
-
-            logger.info(
-              { url: url.slice(0, 60), comments: comments !== undefined ? comments.length : 0, backend: 'apify' },
-              '[TikTok] Fetch complete',
-            );
-
-            return result;
+            };
+            const validated = SearchResultSchema.safeParse(candidate);
+            if (validated.success) results.push(validated.data);
+          }
+          logger.info(
+            { query: query.slice(0, 60), count: results.length, backend: 'brightdata' },
+            '[TikTok] Search complete',
+          );
+          if (results.length > 0 || !isApifyFallbackAllowed(credentials)) {
+            return results;
+          }
+          logger.warn(
+            { query: query.slice(0, 60) },
+            '[TikTok] Bright Data keyword discovery empty — trying Apify fallback',
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn(
+            { query: query.slice(0, 60), error: msg.slice(0, 120) },
+            '[TikTok] Bright Data keyword discovery failed',
+          );
+          if (!isApifyFallbackAllowed(credentials)) {
+            return [];
           }
         }
-      } catch (err) {
-        apifyError = err instanceof Error ? err.message : String(err);
       }
 
-      logger.warn(
-        { url: url.slice(0, 60), error: apifyError.slice(0, 100) },
-        '[TikTok] Apify fallback fetch failed',
+      if (!isApifyFallbackAllowed(credentials)) {
+        logger.warn(
+          { query: query.slice(0, 60) },
+          '[TikTok] No Bright Data path and APIFY_ALLOW_FALLBACK is not set — search disabled',
+        );
+        return [];
+      }
+
+      const token = apifyTokenOf(credentials);
+      if (token === null) {
+        return [];
+      }
+      await rateLimit();
+
+      const input: Record<string, unknown> = {
+        searchQueries: [query],
+        resultsPerPage: limit,
+        shouldDownloadComments: true,
+        shouldDownloadCommentReplies: false,
+      };
+
+      let items: unknown[] = [];
+
+      try {
+        const { runId, datasetId } = await startApifyRun(ACTOR_ID, input, token);
+        await pollRunUntilDone(runId, token);
+        items = await fetchDatasetItems(datasetId, token);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn({ query: query.slice(0, 60), error: msg }, '[TikTok] Apify search failed');
+        return [];
+      }
+
+      const results: SearchResult[] = [];
+
+      for (const rawItem of items) {
+        const parsed = TikTokItemSchema.safeParse(rawItem);
+        if (!parsed.success) continue;
+
+        const item = parsed.data;
+        const videoUrl = extractVideoUrl(item);
+        if (videoUrl === null) continue;
+
+        const caption = item.text !== undefined ? item.text : '';
+
+        const candidate = {
+          provider: 'tiktok' as const,
+          url: videoUrl,
+          canonical_id: item.id !== undefined && item.id.length > 0 ? item.id : undefined,
+          title: caption.slice(0, 200),
+          snippet: caption.slice(0, 300),
+          author: extractAuthor(item),
+          published_at: extractPublishedAt(item),
+          engagement: {
+            view_count: item.playCount,
+            like_count: item.diggCount,
+            comment_count: item.commentCount,
+          },
+          raw_metadata: {
+            backend: 'apify',
+            share_count: item.shareCount,
+            comments: item.comments !== undefined ? item.comments.slice(0, 50) : [],
+          },
+        };
+
+        const validated = SearchResultSchema.safeParse(candidate);
+        if (validated.success) {
+          results.push(validated.data);
+        }
+      }
+
+      logger.info(
+        { query: query.slice(0, 60), count: results.length, backend: 'apify' },
+        '[TikTok] Search complete',
       );
-    }
 
-    return FetchResultSchema.parse({
-      provider: 'tiktok',
-      url,
-      fetch_status: 'failed',
-      fetch_error: `TikTok fetch failed: ${apifyError.slice(0, 150)}`,
-    });
-  },
+      return results;
+    },
 
-  async extract(raw: FetchResult): Promise<ExtractedQuotes> {
-    const content = raw.markdown.length > 0 ? raw.markdown : raw.raw_content;
-    return extractQuotesWithGemini({
-      provider: 'tiktok',
-      url: raw.url,
-      content,
-      mode: 'reddit', // closest equivalent — comment threads with engagement
-    });
-  },
-};
+    async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
+      // signal reserved for future cancellation support
+      void signal;
+
+      const apifyToken = apifyTokenOf(credentials);
+      const brightDataToken = brightDataTokenOf(credentials);
+
+      // Braintied policy: prefer Bright Data for URL acquisition.
+      // Apify is last-resort only (APIFY_ALLOW_FALLBACK=1).
+      if (brightDataToken !== null) {
+        const bdResult = await fetchViaBrightData(credentials, url);
+        if (bdResult !== null) {
+          logger.info({ url: url.slice(0, 60), backend: 'brightdata' }, '[TikTok] Fetch complete');
+          return bdResult;
+        }
+        if (!isApifyFallbackAllowed(credentials)) {
+          return FetchResultSchema.parse({
+            provider: 'tiktok',
+            url,
+            fetch_status: 'failed',
+            fetch_error: 'Bright Data fetch failed and APIFY_ALLOW_FALLBACK is not set',
+          });
+        }
+        logger.warn(
+          { url: url.slice(0, 60) },
+          '[TikTok] Bright Data fetch failed — trying Apify fallback',
+        );
+      }
+
+      // Extract video ID from URL for targeted fetch
+      const videoIdMatch = /\/video\/(\d+)/.exec(url);
+      const videoId = videoIdMatch !== null ? videoIdMatch[1] : null;
+
+      let apifyError = isApifyFallbackAllowed(credentials)
+        ? 'APIFY_API_TOKEN not configured'
+        : 'APIFY_ALLOW_FALLBACK is not set (Bright Data is the primary path)';
+
+      if (isApifyFallbackAllowed(credentials) && apifyToken !== null) {
+        await rateLimit();
+
+        const input: Record<string, unknown> = videoId !== null
+          ? {
+              videoUrls: [url],
+              commentsPerPage: 100,
+              shouldDownloadComments: true,
+              shouldDownloadCommentReplies: false,
+            }
+          : {
+              searchQueries: [url],
+              resultsPerPage: 1,
+              shouldDownloadComments: true,
+              shouldDownloadCommentReplies: false,
+            };
+
+        try {
+          const { runId, datasetId } = await startApifyRun(ACTOR_ID, input, apifyToken);
+          await pollRunUntilDone(runId, apifyToken);
+          const items = await fetchDatasetItems(datasetId, apifyToken);
+          const firstItem = items[0];
+
+          if (firstItem === undefined) {
+            apifyError = 'No items returned from Apify';
+          } else {
+            const parsed = TikTokItemSchema.safeParse(firstItem);
+            if (!parsed.success) {
+              apifyError = `Invalid item shape: ${parsed.error.message.slice(0, 100)}`;
+            } else {
+              const item = parsed.data;
+              const caption = item.text !== undefined ? item.text : '';
+              const author = extractAuthor(item);
+
+              // Build markdown with caption + top comments
+              const lines: string[] = [
+                `# TikTok: ${caption.slice(0, 100)}`,
+                '',
+                `**Creator:** ${author !== undefined ? author : 'Unknown'} | **Views:** ${item.playCount !== undefined ? item.playCount : 0} | **Likes:** ${item.diggCount !== undefined ? item.diggCount : 0}`,
+                '',
+                '## Caption',
+                '',
+                caption,
+                '',
+              ];
+
+              const comments = item.comments;
+              if (comments !== undefined && Array.isArray(comments) && comments.length > 0) {
+                lines.push('## Top Comments', '');
+
+                // Sort by diggCount desc
+                const sortedComments = [...comments]
+                  .map(c => TikTokCommentSchema.safeParse(c))
+                  .filter(r => r.success)
+                  .map(r => r.data)
+                  .sort((a, b) => (b.diggCount !== undefined ? b.diggCount : 0) - (a.diggCount !== undefined ? a.diggCount : 0))
+                  .slice(0, 100);
+
+                for (const comment of sortedComments) {
+                  const commentText = comment.text !== undefined ? comment.text : '';
+                  if (commentText.length === 0) continue;
+                  const commentAuthor = comment.uniqueId !== undefined ? `@${comment.uniqueId}` : 'Unknown';
+                  lines.push(`**${commentAuthor}** (${comment.diggCount !== undefined ? comment.diggCount : 0} likes)`);
+                  lines.push('');
+                  lines.push(commentText);
+                  lines.push('');
+                  lines.push('---');
+                  lines.push('');
+                }
+              }
+
+              const markdown = lines.join('\n');
+
+              const result = FetchResultSchema.parse({
+                provider: 'tiktok',
+                url,
+                canonical_id: item.id !== undefined && item.id.length > 0 ? item.id : undefined,
+                title: caption.slice(0, 200),
+                author,
+                published_at: extractPublishedAt(item),
+                raw_content: caption,
+                markdown,
+                engagement: {
+                  view_count: item.playCount,
+                  like_count: item.diggCount,
+                  comment_count: item.commentCount,
+                },
+                fetch_status: 'ok',
+                raw_metadata: {
+                  share_count: item.shareCount,
+                  comments: item.comments !== undefined ? item.comments.slice(0, 100) : [],
+                  backend: 'apify',
+                },
+              });
+
+              logger.info(
+                { url: url.slice(0, 60), comments: comments !== undefined ? comments.length : 0, backend: 'apify' },
+                '[TikTok] Fetch complete',
+              );
+
+              return result;
+            }
+          }
+        } catch (err) {
+          apifyError = err instanceof Error ? err.message : String(err);
+        }
+
+        logger.warn(
+          { url: url.slice(0, 60), error: apifyError.slice(0, 100) },
+          '[TikTok] Apify fallback fetch failed',
+        );
+      }
+
+      return FetchResultSchema.parse({
+        provider: 'tiktok',
+        url,
+        fetch_status: 'failed',
+        fetch_error: `TikTok fetch failed: ${apifyError.slice(0, 150)}`,
+      });
+    },
+
+    async extract(raw: FetchResult): Promise<ExtractedQuotes> {
+      const content = raw.markdown.length > 0 ? raw.markdown : raw.raw_content;
+      return extractQuotesWithGemini({
+        credentials,
+        provider: 'tiktok',
+        url: raw.url,
+        content,
+        mode: 'reddit', // closest equivalent — comment threads with engagement
+      });
+    },
+  };
+}

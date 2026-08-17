@@ -24,6 +24,7 @@ import { z } from 'zod';
 import { hashUrl, canonicalizeUrl } from '../types.js';
 import { sleep } from '../pipeline-core.js';
 import { logger } from '../logger.js';
+import { MissingCredentialError, type ResearchCredentials } from '../credentials.js';
 import type { IngestedItem, IngestEngagement } from '../ingestion/types.js';
 
 // =============================================================================
@@ -31,6 +32,8 @@ import type { IngestedItem, IngestEngagement } from '../ingestion/types.js';
 // =============================================================================
 
 const BRIGHTDATA_BASE_URL = 'https://api.brightdata.com/datasets/v3';
+const BRIGHTDATA_UNLOCK_URL = 'https://api.brightdata.com/request';
+const UNLOCK_TIMEOUT_MS = 90_000;
 const TRIGGER_TIMEOUT_MS = 30_000;
 const PROGRESS_TIMEOUT_MS = 15_000;
 const DOWNLOAD_TIMEOUT_MS = 60_000;
@@ -48,28 +51,28 @@ const MIN_CONTENT_CHARS = 80;
 // Credentials & dataset-id resolution
 // =============================================================================
 
-function getBrightDataToken(): string {
-  const token = process.env.BRIGHTDATA_API_TOKEN;
-  if (token === undefined || token === '') {
-    throw new Error('BRIGHTDATA_API_TOKEN environment variable is not configured');
+function requireBrightDataToken(credentials: ResearchCredentials): string {
+  if (credentials.brightdata === undefined) {
+    throw new MissingCredentialError('brightdata', 'required for Bright Data collection');
   }
-  return token;
+  return credentials.brightdata.apiToken;
 }
 
-function getLinkedInDatasetId(): string | null {
-  const id = process.env.BRIGHTDATA_LINKEDIN_DATASET_ID;
-  if (id === undefined || id === '') {
-    return null;
-  }
-  return id;
+/**
+ * Dataset ids are per-collector. A configured token with no dataset id means
+ * the host bought the account but not this collector: that lane returns empty
+ * with a warning rather than failing the whole sweep.
+ */
+function linkedInDatasetId(credentials: ResearchCredentials): string | null {
+  if (credentials.brightdata === undefined) return null;
+  if (credentials.brightdata.linkedinDatasetId === undefined) return null;
+  return credentials.brightdata.linkedinDatasetId;
 }
 
-function getFacebookGroupsDatasetId(): string | null {
-  const id = process.env.BRIGHTDATA_FB_GROUPS_DATASET_ID;
-  if (id === undefined || id === '') {
-    return null;
-  }
-  return id;
+function facebookGroupsDatasetId(credentials: ResearchCredentials): string | null {
+  if (credentials.brightdata === undefined) return null;
+  if (credentials.brightdata.facebookGroupsDatasetId === undefined) return null;
+  return credentials.brightdata.facebookGroupsDatasetId;
 }
 
 // =============================================================================
@@ -131,10 +134,11 @@ export interface ScrapeDatasetOptions extends PollSnapshotOptions {
  * snapshot id for polling.
  */
 export async function triggerCollection(
+  credentials: ResearchCredentials,
   datasetId: string,
   inputs: Array<Record<string, unknown>>,
 ): Promise<string> {
-  const token = getBrightDataToken();
+  const token = requireBrightDataToken(credentials);
   const url = `${BRIGHTDATA_BASE_URL}/trigger?dataset_id=${encodeURIComponent(datasetId)}`;
 
   const response = await fetch(url, {
@@ -159,14 +163,59 @@ export async function triggerCollection(
 }
 
 /**
+ * Kick off a Bright Data discovery crawl (keyword or URL seed), then poll and
+ * download the snapshot. This is the preferred replacement for Apify keyword
+ * scrapers when a dataset supports `type=discover_new`.
+ *
+ * Matches the Swishh production boundary:
+ *   POST /datasets/v3/trigger?dataset_id=…&type=discover_new&discover_by=keyword|url
+ */
+export async function discoverAndDownload(
+  credentials: ResearchCredentials,
+  datasetId: string,
+  discoverBy: 'keyword' | 'url',
+  input: Record<string, unknown>,
+  opts: PollSnapshotOptions = {},
+): Promise<BrightDataRecord[]> {
+  const token = requireBrightDataToken(credentials);
+  const url =
+    `${BRIGHTDATA_BASE_URL}/trigger` +
+    `?dataset_id=${encodeURIComponent(datasetId)}` +
+    `&type=discover_new` +
+    `&discover_by=${encodeURIComponent(discoverBy)}`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify([input]),
+    signal: AbortSignal.timeout(TRIGGER_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(
+      `Bright Data discover error (${datasetId}/${discoverBy}): HTTP ${response.status} ${body.slice(0, 200)}`,
+    );
+  }
+
+  const parsed = TriggerResponseSchema.parse(await response.json());
+  await pollSnapshot(credentials, parsed.snapshot_id, opts);
+  return downloadSnapshot(credentials, parsed.snapshot_id);
+}
+
+/**
  * Poll a snapshot until it reports `ready`. Returns when ready; throws a
  * tolerated error string on `failed` or when the wait cap is exceeded.
  */
 export async function pollSnapshot(
+  credentials: ResearchCredentials,
   snapshotId: string,
   opts: PollSnapshotOptions = {},
 ): Promise<void> {
-  const token = getBrightDataToken();
+  const token = requireBrightDataToken(credentials);
   const maxWaitMs = opts.maxWaitMs !== undefined ? opts.maxWaitMs : POLL_MAX_WAIT_MS;
   const initialIntervalMs =
     opts.initialIntervalMs !== undefined ? opts.initialIntervalMs : POLL_INITIAL_INTERVAL_MS;
@@ -217,8 +266,11 @@ export async function pollSnapshot(
 /**
  * Download a ready snapshot as JSON and Zod-validate each record.
  */
-export async function downloadSnapshot(snapshotId: string): Promise<BrightDataRecord[]> {
-  const token = getBrightDataToken();
+export async function downloadSnapshot(
+  credentials: ResearchCredentials,
+  snapshotId: string,
+): Promise<BrightDataRecord[]> {
+  const token = requireBrightDataToken(credentials);
   const url = `${BRIGHTDATA_BASE_URL}/snapshot/${encodeURIComponent(snapshotId)}?format=json`;
 
   const response = await fetch(url, {
@@ -249,6 +301,89 @@ export async function downloadSnapshot(snapshotId: string): Promise<BrightDataRe
   return records;
 }
 
+export type UnlockUrlOptions = {
+  render?: boolean;
+  country?: string;
+  signal?: AbortSignal;
+};
+
+export type UnlockedPage = {
+  url: string;
+  html: string;
+  fetchedAt: string;
+};
+
+const UnlockErrorSchema = z.object({
+  error: z.string().min(1),
+});
+
+/**
+ * Web Unlocker (`POST /request`) for a single public URL.
+ *
+ * Social `scrapeDataset` collectors cannot fetch New Yorker / Aeon /
+ * Consequence. This is the news-page path. Requires `unlockerZone` — a
+ * token alone is not enough, and this function never guesses a zone name.
+ * Spends per request. Do not call without an approved budget.
+ */
+export async function unlockUrl(
+  credentials: ResearchCredentials,
+  url: string,
+  opts: UnlockUrlOptions = {},
+): Promise<UnlockedPage> {
+  const token = requireBrightDataToken(credentials);
+  if (credentials.brightdata === undefined || credentials.brightdata.unlockerZone === undefined) {
+    throw new MissingCredentialError(
+      'brightdata.unlockerZone',
+      'required for Web Unlocker page fetch (BRIGHTDATA_UNLOCKER_ZONE)',
+    );
+  }
+  const zone = credentials.brightdata.unlockerZone;
+  const country = opts.country !== undefined ? opts.country : 'us';
+  const payload: Record<string, string> = {
+    zone,
+    url,
+    format: 'raw',
+    country,
+  };
+  if (opts.render === true) {
+    payload.render = 'true';
+  }
+
+  const response = await fetch(BRIGHTDATA_UNLOCK_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+    signal: opts.signal !== undefined ? opts.signal : AbortSignal.timeout(UNLOCK_TIMEOUT_MS),
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    const parsed = UnlockErrorSchema.safeParse(safeJson(text));
+    const detail = parsed.success ? parsed.data.error : text.slice(0, 200);
+    throw new Error(`Bright Data unlocker error: HTTP ${String(response.status)} ${detail}`);
+  }
+  if (text.trim().length < 40) {
+    throw new Error('Bright Data unlocker returned an empty page');
+  }
+
+  return {
+    url,
+    html: text,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+function safeJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Run Bright Data's nominally synchronous scrape endpoint. The API may return
  * records immediately or accept the request as an asynchronous snapshot (HTTP
@@ -256,11 +391,12 @@ export async function downloadSnapshot(snapshotId: string): Promise<BrightDataRe
  * empty result.
  */
 export async function scrapeDataset(
+  credentials: ResearchCredentials,
   datasetId: string,
   inputs: Array<Record<string, unknown>>,
   opts: ScrapeDatasetOptions = {},
 ): Promise<BrightDataRecord[]> {
-  const token = getBrightDataToken();
+  const token = requireBrightDataToken(credentials);
   const endpoint = `${BRIGHTDATA_BASE_URL}/scrape`
     + `?dataset_id=${encodeURIComponent(datasetId)}`
     + '&format=json&include_errors=true';
@@ -290,8 +426,8 @@ export async function scrapeDataset(
 
   const accepted = TriggerResponseSchema.safeParse(raw);
   if (accepted.success) {
-    await pollSnapshot(accepted.data.snapshot_id, opts);
-    return downloadSnapshot(accepted.data.snapshot_id);
+    await pollSnapshot(credentials, accepted.data.snapshot_id, opts);
+    return downloadSnapshot(credentials, accepted.data.snapshot_id);
   }
 
   const single = BrightDataRecordSchema.safeParse(raw);
@@ -384,14 +520,15 @@ function recordToItem(
 // =============================================================================
 
 async function collectViaBrightData(
+  credentials: ResearchCredentials,
   datasetId: string,
   inputs: Array<Record<string, unknown>>,
   sourceType: 'linkedin' | 'facebook',
   maxItems: number,
 ): Promise<IngestedItem[]> {
-  const snapshotId = await triggerCollection(datasetId, inputs);
-  await pollSnapshot(snapshotId);
-  const records = await downloadSnapshot(snapshotId);
+  const snapshotId = await triggerCollection(credentials, datasetId, inputs);
+  await pollSnapshot(credentials, snapshotId);
+  const records = await downloadSnapshot(credentials, snapshotId);
 
   const items: IngestedItem[] = [];
   for (const record of records) {
@@ -411,20 +548,21 @@ async function collectViaBrightData(
  * `identifier` is the LinkedIn profile or company URL.
  */
 export async function fetchLinkedInPostsBrightData(
+  credentials: ResearchCredentials,
   identifier: string,
   maxItems: number,
 ): Promise<IngestedItem[]> {
-  const datasetId = getLinkedInDatasetId();
+  const datasetId = linkedInDatasetId(credentials);
   if (datasetId === null) {
     logger.warn(
       { identifier: identifier.slice(0, 60) },
-      '[BrightData] BRIGHTDATA_LINKEDIN_DATASET_ID not set — returning empty (tolerated)',
+      '[BrightData] brightdata.linkedinDatasetId not configured — returning empty (tolerated)',
     );
     return [];
   }
 
   const inputs: Array<Record<string, unknown>> = [{ url: identifier }];
-  return collectViaBrightData(datasetId, inputs, 'linkedin', maxItems);
+  return collectViaBrightData(credentials, datasetId, inputs, 'linkedin', maxItems);
 }
 
 /**
@@ -432,18 +570,19 @@ export async function fetchLinkedInPostsBrightData(
  * `identifier` is the Facebook group URL.
  */
 export async function fetchFacebookGroupPostsBrightData(
+  credentials: ResearchCredentials,
   identifier: string,
   maxItems: number,
 ): Promise<IngestedItem[]> {
-  const datasetId = getFacebookGroupsDatasetId();
+  const datasetId = facebookGroupsDatasetId(credentials);
   if (datasetId === null) {
     logger.warn(
       { identifier: identifier.slice(0, 60) },
-      '[BrightData] BRIGHTDATA_FB_GROUPS_DATASET_ID not set — returning empty (tolerated)',
+      '[BrightData] brightdata.facebookGroupsDatasetId not configured — returning empty (tolerated)',
     );
     return [];
   }
 
   const inputs: Array<Record<string, unknown>> = [{ url: identifier }];
-  return collectViaBrightData(datasetId, inputs, 'facebook', maxItems);
+  return collectViaBrightData(credentials, datasetId, inputs, 'facebook', maxItems);
 }

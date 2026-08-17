@@ -8,11 +8,16 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import { GoogleGenAI } from '@google/genai';
 import OpenAI from 'openai';
 import { logger } from './logger.js';
-import { getGeminiKey } from './pipeline-core.js';
+import {
+  requireAnthropicApiKey,
+  requireGeminiApiKey,
+  MissingCredentialError,
+  type ResearchCredentials,
+} from './credentials.js';
 import { recordGeminiUsage } from './cache-hit-measurement.js';
+import { questionHeadingFor } from './decision-brief.js';
 import {
   canonicalizeUrl,
   SectionDraftSchema,
@@ -25,16 +30,25 @@ import type {
   VerbatimQuote,
   ProviderName,
 } from './types.js';
+import {
+  resolveResearchAssemblyModel,
+  resolveResearchSynthesisModel,
+} from './model-policy.js';
 
 // =============================================================================
-// Constants
+// Defaults — wire ids from @braintied/models (see model-policy.ts)
 // =============================================================================
 
-// gemini-3.6-flash is the working default today; glm-5.2 (z.ai quota resets
-// 2026-07-25) and claude-sonnet-5 (Anthropic key) are premium overrides once
-// live, selected via synthesis_model_override.
-const SYNTH_MODEL_DEFAULT = 'gemini-3.6-flash';
-const ASSEMBLY_MODEL_DEFAULT = 'gemini-3.6-flash';
+function synthModelDefault(
+  kind?: 'answer' | 'quick' | 'standard' | 'deep' | 'social' | 'managed',
+): string {
+  const resolvedKind = kind !== undefined ? kind : 'standard';
+  return resolveResearchSynthesisModel(resolvedKind);
+}
+
+function assemblyModelDefault(): string {
+  return resolveResearchAssemblyModel();
+}
 
 /**
  * Keep synthesized claims mechanically auditable against their evidence.
@@ -112,7 +126,13 @@ function citeExactEvidence(text: string, anchor: string): string {
   return `${prefix} ${anchor}${terminal[1]}${terminal[2]}`;
 }
 
-function codeOwnedSectionHeading(sectionOrdinal: number): string {
+function codeOwnedSectionHeading(sectionOrdinal: number, questionTitle?: string): string {
+  // The heading stays code-owned either way: questionTitle comes from
+  // questionHeadingFor(), which derives it from the CALLER's own decision
+  // brief captured at plan time — never from model output.
+  if (questionTitle !== undefined) {
+    return questionTitle;
+  }
   const ordinal = Number.isSafeInteger(sectionOrdinal) && sectionOrdinal > 0
     ? sectionOrdinal
     : 1;
@@ -230,6 +250,27 @@ const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
  */
 export const SYNTHESIS_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 
+/** Thrown when gemini-* synthesis is requested but the host did not install the optional peer. */
+export class GeminiSdkMissingError extends Error {
+  constructor() {
+    super(
+      '@google/genai is required for gemini-* synthesis. Add it to the host package (it is an optional peer of @braintied/research so Watchtower and other non-Gemini hosts do not pull it into their image).',
+    );
+    this.name = 'GeminiSdkMissingError';
+  }
+}
+
+async function loadGoogleGenAI(): Promise<typeof import('@google/genai').GoogleGenAI> {
+  try {
+    const loaded = await import('@google/genai');
+    return loaded.GoogleGenAI;
+  } catch (cause) {
+    const error = new GeminiSdkMissingError();
+    error.cause = cause;
+    throw error;
+  }
+}
+
 /** Thrown when a provider synthesis call exceeds SYNTHESIS_REQUEST_TIMEOUT_MS. */
 export class SynthesisTimeoutError extends Error {
   constructor(
@@ -293,6 +334,8 @@ export interface SynthesisCallResult {
 }
 
 export async function synthesisGenerate(args: {
+  /** Host-resolved credentials; which key is required follows from `model`. */
+  credentials: ResearchCredentials;
   system: string;
   user: string;
   model: string;
@@ -300,10 +343,11 @@ export async function synthesisGenerate(args: {
   /** Phase 1 Experiment 3 — when set, Gemini calls log cache-hit measurements. */
   telemetry?: { functionName: string; organizationId?: string; promptRunId?: string };
 }): Promise<SynthesisCallResult> {
-  const { system, user, model, maxTokens, telemetry } = args;
+  const { credentials, system, user, model, maxTokens, telemetry } = args;
 
   if (model.startsWith('gemini-')) {
-    const apiKey = getGeminiKey();
+    const apiKey = requireGeminiApiKey(credentials);
+    const GoogleGenAI = await loadGoogleGenAI();
     const ai = new GoogleGenAI({ apiKey });
     const response = await withTimeout(
       ai.models.generateContent({
@@ -325,7 +369,13 @@ export async function synthesisGenerate(args: {
     const totalPromptTokens = usage?.promptTokenCount !== undefined ? usage.promptTokenCount : 0;
     const cachedTokens = usage?.cachedContentTokenCount !== undefined ? usage.cachedContentTokenCount : 0;
     const uncachedInputTokens = Math.max(0, totalPromptTokens - cachedTokens);
-    const outputTokens = usage?.candidatesTokenCount !== undefined ? usage.candidatesTokenCount : 0;
+    // Thinking tokens are DISJOINT from candidates and Google bills them as
+    // output, so billable output is candidates + thoughts. Counting candidates
+    // alone under-books every thinking-enabled call. Same semantics as
+    // `@braintied/cost` extractGeminiUsage.
+    const candidateTokens = usage?.candidatesTokenCount !== undefined ? usage.candidatesTokenCount : 0;
+    const thoughtsTokens = usage?.thoughtsTokenCount !== undefined ? usage.thoughtsTokenCount : 0;
+    const outputTokens = candidateTokens + thoughtsTokens;
 
     if (telemetry !== undefined) {
       await recordGeminiUsage({
@@ -348,13 +398,10 @@ export async function synthesisGenerate(args: {
   }
 
   if (model.startsWith('qwen')) {
-    const apiKey = process.env.OPENROUTER_API_KEY;
-    if (apiKey === undefined || apiKey === '') {
-      throw new Error(
-        'OPENROUTER_API_KEY environment variable is not configured — required for qwen-* models. '
-          + 'Set it on the cortex-worker Fly.io app.',
-      );
+    if (credentials.openrouterApiKey === undefined) {
+      throw new MissingCredentialError('openrouterApiKey', 'required for qwen-* synthesis models');
     }
+    const apiKey = credentials.openrouterApiKey;
     const openai = new OpenAI({ apiKey, baseURL: OPENROUTER_BASE_URL, timeout: SYNTHESIS_REQUEST_TIMEOUT_MS });
     const response = await withTimeout(
       openai.chat.completions.create({
@@ -381,29 +428,23 @@ export async function synthesisGenerate(args: {
   let apiKey: string | undefined;
   let baseURL: string | undefined;
   if (model.startsWith('deepseek-')) {
-    apiKey = process.env.DEEPSEEK_API_KEY;
+    if (credentials.deepseekApiKey === undefined) {
+      throw new MissingCredentialError(
+        'deepseekApiKey',
+        'required for deepseek-* models (compliance: the direct API is China-hosted; '
+          + 'use only for synthetic eval / non-customer-tagged data)',
+      );
+    }
+    apiKey = credentials.deepseekApiKey;
     baseURL = DEEPSEEK_ANTHROPIC_BASE_URL;
-    if (apiKey === undefined || apiKey === '') {
-      throw new Error(
-        'DEEPSEEK_API_KEY environment variable is not configured — required for deepseek-* models. '
-          + 'Set it on the cortex-worker Fly.io app (compliance: direct API is China-hosted; '
-          + 'use only for synthetic eval / non-customer-tagged data).',
-      );
-    }
   } else if (model.startsWith('glm-')) {
-    apiKey = process.env.ZAI_API_KEY;
+    if (credentials.zaiApiKey === undefined) {
+      throw new MissingCredentialError('zaiApiKey', 'required for glm-* models');
+    }
+    apiKey = credentials.zaiApiKey;
     baseURL = GLM_ANTHROPIC_BASE_URL;
-    if (apiKey === undefined || apiKey === '') {
-      throw new Error(
-        'ZAI_API_KEY environment variable is not configured — required for glm-* models. '
-          + 'Set it on the cortex-worker Fly.io app.',
-      );
-    }
   } else {
-    apiKey = process.env.ANTHROPIC_API_KEY;
-    if (apiKey === undefined || apiKey === '') {
-      throw new Error('ANTHROPIC_API_KEY environment variable is not configured');
-    }
+    apiKey = requireAnthropicApiKey(credentials);
   }
   const client = baseURL !== undefined
     ? new Anthropic({ apiKey, baseURL, timeout: SYNTHESIS_REQUEST_TIMEOUT_MS })
@@ -515,6 +556,8 @@ function buildCitationMap(
 // =============================================================================
 
 export interface SynthesizeSectionInput {
+  /** Host-resolved credentials, forwarded to every model call. */
+  credentials: ResearchCredentials;
   sectionPath: string;
   sectionGoal: string;
   quotes: VerbatimQuote[];
@@ -522,12 +565,19 @@ export interface SynthesizeSectionInput {
   targetWords: number;
   /** Code-owned display order; never derived from planner/model prose. */
   sectionOrdinal?: number;
-  /** Phase 1 Experiment 1 — see resolveSynthesisModel(). undefined → glm-5.2. */
+  /** Phase 1 Experiment 1 — see resolveSynthesisModel(). undefined → kind default. */
   synthesisModelOverride?: string;
+  /** Research kind; selects the catalog synthesis model when no override is set. */
+  kind?: 'answer' | 'quick' | 'standard' | 'deep' | 'social' | 'managed';
   /** Phase 1 Experiment 3 — Gemini cache-hit measurement attribution. */
   telemetry?: { organizationId?: string; promptRunId?: string };
   /** Deterministic test/consumer injection; production uses synthesisGenerate. */
   generate?: typeof synthesisGenerate;
+  /**
+   * Decision-brief question texts keyed by `q{n}` — lets q{n}.* sections render
+   * a question-derived heading instead of the ordinal fallback.
+   */
+  sectionTitles?: Record<string, string>;
 }
 
 export interface SynthesizeSectionResult {
@@ -540,6 +590,31 @@ export interface SynthesizeSectionResult {
 export const EVIDENCE_GAP_NOTICE =
   '> **Evidence gap:** No source-validated evidence sentence was available for this section, so no factual synthesis was produced.';
 
+/**
+ * Appended on a one-shot retry when the first draft had evidence units
+ * available but emitted no {{EVIDENCE:EN}} tokens. Measured 2026-08-15:
+ * a quick run died as TOOL_EXECUTION_FAILED after plan+extract+rerank
+ * because the first synthesis draft was unbound and the throw aborted
+ * the durable host before critique could run.
+ */
+export const EVIDENCE_TOKEN_RETRY_SUFFIX =
+  '\n\nRETRY: The previous draft was discarded because it contained no '
+  + '{{EVIDENCE:EN}} tokens. Output at least one exact token such as '
+  + '{{EVIDENCE:E1}} on its own line. Do not invent evidence IDs. '
+  + 'Do not use [^N] citations.';
+
+function evidenceGapDraft(sectionPath: string, sectionOrdinal: number, questionTitle?: string) {
+  return SectionDraftSchema.parse({
+    section_path: sectionPath,
+    heading: codeOwnedSectionHeading(sectionOrdinal, questionTitle),
+    level: 2,
+    body_md: EVIDENCE_GAP_NOTICE,
+    source_urls: [],
+    inline_citations: [],
+    word_count: countWords(EVIDENCE_GAP_NOTICE),
+  });
+}
+
 export async function synthesizeSection(
   input: SynthesizeSectionInput,
 ): Promise<SynthesizeSectionResult> {
@@ -551,10 +626,15 @@ export async function synthesizeSection(
     targetWords,
     sectionOrdinal = 1,
     synthesisModelOverride,
+    kind,
     telemetry,
     generate = synthesisGenerate,
   } = input;
-  const synthModel = resolveSynthesisModel(synthesisModelOverride, SYNTH_MODEL_DEFAULT);
+  const questionTitle = questionHeadingFor(sectionPath, input.sectionTitles);
+  const synthModel = resolveSynthesisModel(
+    synthesisModelOverride,
+    synthModelDefault(kind),
+  );
 
   const citationMap = buildCitationMap(quotes, keyClaims);
   const evidenceUnits = buildSynthesisEvidenceUnits(quotes, keyClaims, citationMap);
@@ -563,18 +643,9 @@ export async function synthesizeSection(
   // for a model to manufacture polished filler. The critique loop can search
   // again; if the final pass is still empty, assembly preserves this notice.
   if (evidenceUnits.length === 0) {
-    const draft = SectionDraftSchema.parse({
-      section_path: sectionPath,
-      heading: codeOwnedSectionHeading(sectionOrdinal),
-      level: 2,
-      body_md: EVIDENCE_GAP_NOTICE,
-      source_urls: [],
-      inline_citations: [],
-      word_count: countWords(EVIDENCE_GAP_NOTICE),
-    });
     logger.warn({ sectionPath }, '[synthesis] Section has no validated evidence');
     return {
-      draft,
+      draft: evidenceGapDraft(sectionPath, sectionOrdinal, questionTitle),
       inputTokens: 0,
       cachedReadTokens: 0,
       outputTokens: 0,
@@ -595,9 +666,9 @@ export async function synthesizeSection(
     'Insert factual support only with exact {{EVIDENCE:EN}} tokens on their own lines. ' +
     'Do not output footnotes or [^N] markers.';
 
-  const callResult = await generate({
+  const generateArgs = {
+    credentials: input.credentials,
     system: SECTION_SYNTHESIS_SYSTEM_PROMPT,
-    user: userMessage,
     model: synthModel,
     maxTokens: Math.max(4096, targetWords * 2),
     telemetry: telemetry !== undefined
@@ -607,13 +678,60 @@ export async function synthesizeSection(
           promptRunId: telemetry.promptRunId,
         }
       : undefined,
-  });
-  const heading = codeOwnedSectionHeading(sectionOrdinal);
-  const level = 2;
-  let bodyContent = callResult.text;
+  };
 
-  const rendered = renderEvidenceBoundMarkdown(bodyContent, evidenceUnits);
-  bodyContent = rendered.bodyMd;
+  let inputTokens = 0;
+  let cachedReadTokens = 0;
+  let outputTokens = 0;
+  const addUsage = (usage: SynthesisCallResult): void => {
+    inputTokens += usage.inputTokens;
+    cachedReadTokens += usage.cachedReadTokens;
+    outputTokens += usage.outputTokens;
+  };
+
+  const first = await generate({ ...generateArgs, user: userMessage });
+  addUsage(first);
+
+  let rendered: RenderEvidenceBoundMarkdownResult;
+  try {
+    rendered = renderEvidenceBoundMarkdown(first.text, evidenceUnits);
+  } catch (error) {
+    if (!(error instanceof SynthesisEvidenceBindingError)) {
+      throw error;
+    }
+    logger.warn(
+      { sectionPath, reason: error.message },
+      '[synthesis] first draft had no evidence tokens; retrying once',
+    );
+    const retry = await generate({
+      ...generateArgs,
+      user: `${userMessage}${EVIDENCE_TOKEN_RETRY_SUFFIX}`,
+    });
+    addUsage(retry);
+    try {
+      rendered = renderEvidenceBoundMarkdown(retry.text, evidenceUnits);
+    } catch (retryError) {
+      if (!(retryError instanceof SynthesisEvidenceBindingError)) {
+        throw retryError;
+      }
+      // Section-level fail-closed. Process-level throw is how a $1 quick
+      // run lost its extract work and surfaced as TOOL_EXECUTION_FAILED.
+      logger.warn(
+        { sectionPath, reason: retryError.message },
+        '[synthesis] retry still unbound; section is an evidence gap',
+      );
+      return {
+        draft: evidenceGapDraft(sectionPath, sectionOrdinal, questionTitle),
+        inputTokens,
+        cachedReadTokens,
+        outputTokens,
+      };
+    }
+  }
+
+  const heading = codeOwnedSectionHeading(sectionOrdinal, questionTitle);
+  const level = 2;
+  const bodyContent = rendered.bodyMd;
 
   // Only selected evidence becomes a section source/citation. This removes
   // phantom bibliography entries at the earliest possible boundary.
@@ -657,9 +775,9 @@ export async function synthesizeSection(
 
   return {
     draft,
-    inputTokens: callResult.inputTokens,
-    cachedReadTokens: callResult.cachedReadTokens,
-    outputTokens: callResult.outputTokens,
+    inputTokens,
+    cachedReadTokens,
+    outputTokens,
   };
 }
 
@@ -681,11 +799,15 @@ export interface SynthesisSectionProgress {
 }
 
 export interface SynthesizeAllInput {
+  /** Host-resolved credentials, forwarded to every model call. */
+  credentials: ResearchCredentials;
   sectionsToWrite: SectionSpec[];
   quotesByPath: Record<string, VerbatimQuote[]>;
   claimsByPath: Record<string, { claim: string; source_url: string; provider: ProviderName }[]>;
   /** Phase 1 Experiment 1 — see resolveSynthesisModel(). */
   synthesisModelOverride?: string;
+  /** Research kind; selects the catalog synthesis model when no override is set. */
+  kind?: 'answer' | 'quick' | 'standard' | 'deep' | 'social' | 'managed';
   /** Phase 1 Experiment 3 — Gemini cache-hit measurement attribution. */
   telemetry?: { organizationId?: string; promptRunId?: string };
   /**
@@ -697,6 +819,11 @@ export interface SynthesizeAllInput {
    * a heartbeat failure must never kill synthesis.
    */
   onSectionComplete?: (progress: SynthesisSectionProgress) => void;
+  /**
+   * Decision-brief question texts keyed by `q{n}` — lets q{n}.* sections render
+   * a question-derived heading instead of the ordinal fallback.
+   */
+  sectionTitles?: Record<string, string>;
 }
 
 const PARALLEL_CHUNK_SIZE = 2;
@@ -713,8 +840,11 @@ export interface SynthesizeAllSectionsResult {
 export async function synthesizeAllSections(
   input: SynthesizeAllInput,
 ): Promise<SynthesizeAllSectionsResult> {
-  const { sectionsToWrite, quotesByPath, claimsByPath, synthesisModelOverride, telemetry, onSectionComplete } = input;
-  const synthModel = resolveSynthesisModel(synthesisModelOverride, SYNTH_MODEL_DEFAULT);
+  const { sectionsToWrite, quotesByPath, claimsByPath, synthesisModelOverride, kind, telemetry, onSectionComplete } = input;
+  const synthModel = resolveSynthesisModel(
+    synthesisModelOverride,
+    synthModelDefault(kind),
+  );
 
   const results: SectionDraft[] = [];
   let totalInputTokens = 0;
@@ -730,6 +860,7 @@ export async function synthesizeAllSections(
         const claims = claimsByPath[spec.section_path];
 
         return synthesizeSection({
+          credentials: input.credentials,
           sectionPath: spec.section_path,
           sectionGoal: spec.goal,
           quotes: quotes !== undefined ? quotes : [],
@@ -737,7 +868,9 @@ export async function synthesizeAllSections(
           targetWords: spec.targetWords,
           sectionOrdinal: i + chunkIndex + 1,
           synthesisModelOverride,
+          kind,
           telemetry,
+          sectionTitles: input.sectionTitles,
         });
       }),
     );
@@ -794,6 +927,11 @@ export interface AssembleFinalReportInput {
     author?: string;
     published_at?: string;
   }>;
+  /**
+   * Decision-brief question texts keyed by `q{n}` — lets q{n}.* sections render
+   * a question-derived heading instead of the ordinal fallback.
+   */
+  sectionTitles?: Record<string, string>;
 }
 
 export interface AssembleFinalReportResult {
@@ -856,8 +994,9 @@ export async function assembleFinalReport(
     gaps,
     synthesisModelOverride,
     sourceMeta,
+    sectionTitles,
   } = input;
-  const assemblyModel = resolveSynthesisModel(synthesisModelOverride, ASSEMBLY_MODEL_DEFAULT);
+  const assemblyModel = resolveSynthesisModel(synthesisModelOverride, assemblyModelDefault());
 
   // ---------------------------------------------------------------------------
   // Citation pruning (audit m2): a section's inline_citations were built from
@@ -917,7 +1056,10 @@ export async function assembleFinalReport(
     });
     return {
       ...s,
-      heading: codeOwnedSectionHeading(sectionIndex + 1),
+      heading: codeOwnedSectionHeading(
+        sectionIndex + 1,
+        questionHeadingFor(s.section_path, sectionTitles),
+      ),
       level: 2,
       body_md: body,
       inline_citations: inlineCitations,

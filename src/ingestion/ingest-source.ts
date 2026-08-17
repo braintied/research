@@ -14,16 +14,8 @@
 
 import { hashUrl, canonicalizeUrl } from '../types.js';
 import type { SearchResult, SearchOpts } from '../types.js';
-import {
-  redditProvider,
-  youtubeProvider,
-  rssProvider,
-  tavilyProvider,
-  crawl4aiProvider,
-  tiktokProvider,
-  instagramProvider,
-  xProvider,
-} from '../providers/index.js';
+import { createProviderRegistry } from '../providers/index.js';
+import type { ResearchCredentials } from '../credentials.js';
 import {
   fetchLinkedInPostsBrightData,
   fetchFacebookGroupPostsBrightData,
@@ -72,10 +64,11 @@ const PROVIDER_RUN_COST_USD: Record<KnowledgeSourceType, number> = {
 // =============================================================================
 
 async function fetchLinkedInPosts(
+  credentials: ResearchCredentials,
   profileIdentifier: string,
   maxItems: number,
 ): Promise<IngestedItem[]> {
-  return fetchLinkedInPostsBrightData(profileIdentifier, maxItems);
+  return fetchLinkedInPostsBrightData(credentials, profileIdentifier, maxItems);
 }
 
 // =============================================================================
@@ -190,12 +183,15 @@ function mapSearchResults(
  * For blog/web_search items, the search snippet alone is thin — crawl the top
  * few URLs for full markdown so categorization + embedding have real signal.
  */
-async function enrichWithFullContent(items: IngestedItem[]): Promise<void> {
+async function enrichWithFullContent(
+  credentials: ResearchCredentials,
+  items: IngestedItem[],
+): Promise<void> {
   let enriched = 0;
   for (const item of items) {
     if (enriched >= BLOG_CONTENT_ENRICH_LIMIT) break;
     try {
-      const md = await crawlUrl(item.url);
+      const md = await crawlUrl(credentials, item.url);
       if (md !== null && md.trim().length > item.contentMd.length) {
         item.contentMd = md.trim();
         item.excerpt = toExcerpt(item.contentMd, item.title);
@@ -215,9 +211,11 @@ async function enrichWithFullContent(items: IngestedItem[]): Promise<void> {
 // =============================================================================
 
 export async function ingestSource(
+  credentials: ResearchCredentials,
   source: KnowledgeSource,
   opts: IngestSourceOptions = {},
 ): Promise<IngestResult> {
+  const providers = createProviderRegistry(credentials);
   const sourceType = KnowledgeSourceTypeSchema.parse(source.sourceType);
   const maxItems = opts.maxItems !== undefined ? opts.maxItems : DEFAULT_MAX_ITEMS;
   const recencyDays = opts.recencyDays !== undefined ? opts.recencyDays : DEFAULT_RECENCY_DAYS;
@@ -241,12 +239,12 @@ export async function ingestSource(
 
     switch (sourceType) {
       case 'reddit': {
-        const r = await redditProvider.search(buildQuery(source), searchOpts);
+        const r = await providers.reddit.search(buildQuery(source), searchOpts);
         items = mapSearchResults(r, source.id, sourceType);
         break;
       }
       case 'youtube': {
-        const r = await youtubeProvider.search(buildQuery(source), searchOpts);
+        const r = await providers.youtube.search(buildQuery(source), searchOpts);
         items = mapSearchResults(r, source.id, sourceType);
         break;
       }
@@ -254,7 +252,7 @@ export async function ingestSource(
       case 'podcast': {
         // RSS provider scans explicit feed URLs supplied via feed_urls; the
         // identifier IS the feed URL. A blank query => match-all in the feed.
-        const r = await rssProvider.search(source.topics.join(' '), {
+        const r = await providers.rss.search(source.topics.join(' '), {
           ...searchOpts,
           feed_urls: [source.identifier],
         });
@@ -263,31 +261,31 @@ export async function ingestSource(
       }
       case 'blog':
       case 'web_search': {
-        const r = await tavilyProvider.search(buildQuery(source), {
+        const r = await providers.tavily.search(buildQuery(source), {
           ...searchOpts,
           include_domains: sourceType === 'blog' ? [extractDomain(source.identifier)] : undefined,
         });
         items = mapSearchResults(r, source.id, sourceType);
-        await enrichWithFullContent(items);
+        await enrichWithFullContent(credentials, items);
         break;
       }
       case 'tiktok': {
-        const r = await tiktokProvider.search(buildQuery(source), searchOpts);
+        const r = await providers.tiktok.search(buildQuery(source), searchOpts);
         items = mapSearchResults(r, source.id, sourceType);
         break;
       }
       case 'instagram': {
-        const r = await instagramProvider.search(buildQuery(source), searchOpts);
+        const r = await providers.instagram.search(buildQuery(source), searchOpts);
         items = mapSearchResults(r, source.id, sourceType);
         break;
       }
       case 'x': {
-        const r = await xProvider.search(buildQuery(source), searchOpts);
+        const r = await providers.x.search(buildQuery(source), searchOpts);
         items = mapSearchResults(r, source.id, sourceType);
         break;
       }
       case 'linkedin': {
-        const liItems = await fetchLinkedInPosts(source.identifier, maxItems);
+        const liItems = await fetchLinkedInPosts(credentials, source.identifier, maxItems);
         for (const it of liItems) {
           it.sourceId = source.id;
         }
@@ -295,7 +293,7 @@ export async function ingestSource(
         break;
       }
       case 'facebook': {
-        const fbItems = await fetchFacebookGroupPostsBrightData(source.identifier, maxItems);
+        const fbItems = await fetchFacebookGroupPostsBrightData(credentials, source.identifier, maxItems);
         for (const it of fbItems) {
           it.sourceId = source.id;
         }

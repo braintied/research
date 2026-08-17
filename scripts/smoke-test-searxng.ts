@@ -23,6 +23,9 @@
  */
 
 import { searxngSearch } from '../src/providers/searxng.js';
+import { resolveResearchCredentials } from '../src/credentials.js';
+
+const credentials = resolveResearchCredentials(process.env);
 
 const QUERY_CORPUS = [
   // M&A / diligence-style
@@ -79,7 +82,7 @@ interface QueryOutcome {
 async function runOne(query: string): Promise<QueryOutcome> {
   const started = Date.now();
   try {
-    const outcome = await searxngSearch(query, { limit: 10 });
+    const outcome = await searxngSearch(credentials, query, { limit: 10 });
     const latencyMs = Date.now() - started;
     const engines = new Set<string>();
     for (const r of outcome.results) {

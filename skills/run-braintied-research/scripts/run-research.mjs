@@ -18,8 +18,8 @@ const VALID_SOURCE_MODES = new Set([
   'facebook_groups', 'cortex', 'telegram', 'all_public', 'all_social', 'all',
 ]);
 const SYNTHESIS_DEFAULTS = new Map([
-  ['answer', 'gemini-3-flash-preview'],
-  ['quick', 'gemini-3-flash-preview'],
+  ['answer', 'gemini-3.6-flash'],
+  ['quick', 'gemini-3.6-flash'],
   ['standard', 'claude-sonnet-4-6'],
   ['deep', 'claude-sonnet-4-6'],
   ['social', 'claude-sonnet-4-6'],
@@ -53,7 +53,6 @@ const RESEARCH_ENV_NAMES = [
   'TWITTERAPI_KEY',
   'APIFY_API_TOKEN',
   'BRIGHTDATA_API_TOKEN',
-  'JINA_API_KEY',
   'CRAWL4AI_URL',
   'BRAINTIED_CRAWL4AI_ALLOWED_DOMAINS',
   'BRAINTIED_CRAWL4AI_NETWORK_GUARD',
@@ -503,6 +502,7 @@ async function buildFreshness() {
 
 async function preflight(
   research,
+  credentials,
   kind,
   maxCostUsd,
   synthesisModel,
@@ -515,10 +515,10 @@ async function preflight(
   }
 
   const enabled = typeof research.getEnabledProviders === 'function'
-    ? Object.keys(research.getEnabledProviders()).sort()
+    ? Object.keys(research.getEnabledProviders(credentials)).sort()
     : [];
   const enabledSearch = typeof research.getEnabledSearchProviders === 'function'
-    ? Object.keys(research.getEnabledSearchProviders()).sort()
+    ? Object.keys(research.getEnabledSearchProviders(credentials)).sort()
     : enabled.filter((provider) => provider !== 'crawl4ai');
   const config = requiredConfiguration(kind, enabled, synthesisModel);
   let sourcePlan = null;
@@ -565,7 +565,7 @@ async function preflight(
     || sourcePlan?.publicModes?.includes('github') === true;
   let githubHealth = null;
   if (typeof research.resolveGitHubPublicAuthState === 'function') {
-    githubHealth = research.resolveGitHubPublicAuthState(process.env);
+    githubHealth = research.resolveGitHubPublicAuthState(credentials.github);
   }
   if (githubRequested) {
     if (githubHealth === null) {
@@ -695,12 +695,18 @@ async function main() {
   const runtimeEnvironment = combineRuntimeEnvironments(fileEnvironment, shellEnvironment);
   resolveGeminiEnvironment(values['gemini-key-name'], runtimeEnvironment);
   const research = await loadPackage();
+  // The process boundary: everything above staged the environment; from here
+  // the package is handed one explicit credential record and reads no env.
+  if (typeof research.resolveResearchCredentials !== 'function') {
+    throw new Error('Built package does not export resolveResearchCredentials. Run npm run build.');
+  }
+  const credentials = research.resolveResearchCredentials(process.env);
   const knownProviders = new Set(Array.isArray(research.PROVIDER_NAMES) ? research.PROVIDER_NAMES : []);
   const invalidProviders = requiredProviders.filter((provider) => !knownProviders.has(provider));
   if (invalidProviders.length > 0) {
     throw new Error(`Unknown --require-providers value(s): ${invalidProviders.join(', ')}.`);
   }
-  const check = await preflight(research, kind, maxCostUsd, synthesisModel, runtimeEnvironment, {
+  const check = await preflight(research, credentials, kind, maxCostUsd, synthesisModel, runtimeEnvironment, {
     sources, requiredProviders, asOf, profileRef,
   });
   if (values.check === true || values['dry-run'] === true) {
@@ -732,6 +738,7 @@ async function main() {
       throw new Error('Built package does not export runResearchProgram. Run npm run build.');
     }
     programResult = await research.runResearchProgram({
+      credentials,
       brief,
       asOf,
       ...(sources.length > 0 ? { sourceModes: sources } : {}),
@@ -746,6 +753,7 @@ async function main() {
     if (result === null) throw new Error('Source program completed without a public report.');
   } else {
     result = await research.runResearch({
+      credentials,
       brief,
       kind,
       ...(maxCostUsd !== undefined ? { maxCostUsd } : {}),

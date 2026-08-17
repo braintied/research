@@ -10,6 +10,7 @@
  * same dispatcher the synthesis stage uses.
  */
 
+import { modalityModelId } from '@braintied/models';
 import { z } from 'zod';
 import { synthesisGenerate } from '../synthesis.js';
 import { runResearch } from '../kinds.js';
@@ -18,6 +19,7 @@ import { safeLogger } from '../logger.js';
 import type { Logger } from '../logger.js';
 import { deepResearchSynthesisCostUsd } from '../depth-config.js';
 import type { FinalReport } from '../types.js';
+import type { ResearchCredentials } from '../credentials.js';
 import { DOC_TYPES, type DocType, type DocTypeDefinition } from './types.js';
 import { prdDefinition, PrdSchema } from './prd.js';
 import { marketReportDefinition, MarketReportSchema } from './market-report.js';
@@ -66,11 +68,16 @@ export type OnUsage = (event: DocUsageEvent) => void | Promise<void>;
 // generateDocument
 // =============================================================================
 
-const DEFAULT_DOC_MODEL = 'gemini-3.6-flash';
+/** Fleet modality doc-synthesis → context-synthesis use-case. */
+const DEFAULT_DOC_MODEL = modalityModelId('doc-synthesis', {
+  resolveOptions: { moduleId: 'research-documents' },
+});
 const DOC_MAX_TOKENS = 8192;
 const MAX_PARSE_RETRIES = 1;
 
 export interface GenerateDocumentInput {
+  /** Host-resolved credentials, forwarded to research and document synthesis. */
+  credentials: ResearchCredentials;
   docType: DocType;
   /** What the document is about. Required even when `research` is supplied. */
   brief: string;
@@ -84,7 +91,7 @@ export interface GenerateDocumentInput {
   researchKind?: ResearchKind;
   /** Caller context woven into the prompt (client name, codebase, region…). */
   context?: string;
-  /** Doc-synthesis model — prefix-routed. Default gemini-3.6-flash. */
+  /** Doc-synthesis model — prefix-routed. Default from fleet modality doc-synthesis. */
   model?: string;
   /** Fires once per LLM call with real token counts, for spend attribution. */
   onUsage?: OnUsage;
@@ -141,6 +148,7 @@ export async function generateDocument(
       : definition.researchKindDefault;
     log.info({ docType: input.docType, kind }, '[generateDocument] Running research');
     researchResult = await runResearch({
+      credentials: input.credentials,
       brief: input.brief,
       kind,
       logger: log,
@@ -173,6 +181,7 @@ export async function generateDocument(
       : '';
 
     const result = await synthesisGenerate({
+      credentials: input.credentials,
       system: definition.systemPrompt,
       user: userPrompt + retrySuffix,
       model,

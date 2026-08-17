@@ -1,5 +1,11 @@
 {
   "compilerOptions": {
+    // tsup's dts step sets `baseUrl: compilerOptions.baseUrl || "."` unconditionally
+    // (tsup 8.5.1, latest). We cannot remove what the tool injects, and TS 6 errors
+    // TS5101 on it. This is TS's own escape hatch, and it is also the concrete reason
+    // TS 7 is blocked here: 7.0 STOPS honouring baseUrl, so tsup must fix this first.
+    "ignoreDeprecations": "6.0",
+    "types": ["node"],
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",

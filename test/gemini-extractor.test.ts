@@ -328,3 +328,36 @@ test('social and video model-selected anchors cannot override the fetched parent
   assert.equal(result.verbatim_quotes[2]?.source_url, parentUrl);
   assert.equal(result.verbatim_quotes[3]?.source_url, parentUrl);
 });
+
+test('thinking tokens are billed as output and counted with candidates', () => {
+  // Google bills thoughtsTokenCount as output and reports it DISJOINT from
+  // candidatesTokenCount. Counting candidates alone under-books every
+  // thinking-enabled call — measured at ~50% metered coverage on the research
+  // key's GCP project before this was fixed.
+  const withThinking = normalizeGeminiExtractionPayload(
+    { key_claims: ['A valid claim survives.'], verbatim_quotes: [] },
+    {
+      provider: 'tavily',
+      url: 'https://docs.example/article',
+      content: DEFAULT_SOURCE_CONTENT,
+      mode: 'longform',
+    },
+    { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 400 },
+  );
+  assert.equal(withThinking?.usage?.candidate_tokens, 450);
+
+  // A non-thinking model omits the field entirely. It must read as 0 — NaN
+  // fails the payload schema and nulls the whole extraction, not just usage.
+  const withoutThinking = normalizeGeminiExtractionPayload(
+    { key_claims: ['A valid claim survives.'], verbatim_quotes: [] },
+    {
+      provider: 'tavily',
+      url: 'https://docs.example/article',
+      content: DEFAULT_SOURCE_CONTENT,
+      mode: 'longform',
+    },
+    { promptTokenCount: 100, candidatesTokenCount: 50 },
+  );
+  assert.equal(withoutThinking?.usage?.candidate_tokens, 50);
+  assert.equal(withoutThinking?.source_url, 'https://docs.example/article');
+});

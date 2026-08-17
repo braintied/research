@@ -6,7 +6,8 @@
  */
 
 import { z } from 'zod';
-import { getGeminiKey, fetchWithRetry, EXTRACTION_MODEL } from '../pipeline-core.js';
+import { fetchWithRetry, extractionModelId } from '../pipeline-core.js';
+import { requireGeminiApiKey, type ResearchCredentials } from '../credentials.js';
 import {
   ExtractedQuotesSchema,
   type ExtractedQuotes,
@@ -23,6 +24,8 @@ import { logger } from '../logger.js';
 // =============================================================================
 
 export interface GeminiExtractInput {
+  /** Host-resolved credentials; the Gemini key is required for extraction. */
+  credentials: ResearchCredentials;
   provider: ProviderName;
   url: string;
   content: string;
@@ -44,6 +47,9 @@ const GeminiResponseEnvelopeSchema = z.object({
   usageMetadata: z.object({
     promptTokenCount: z.number().int().nonnegative().default(0),
     candidatesTokenCount: z.number().int().nonnegative().default(0),
+    // Disjoint from candidates, billed as output. Undeclared here means zod
+    // strips it and every thinking-enabled call under-books.
+    thoughtsTokenCount: z.number().int().nonnegative().default(0),
   }).optional(),
 });
 
@@ -110,7 +116,14 @@ function parseRawQuote(value: unknown, input: GeminiExtractInput): z.infer<typeo
 
 export interface GeminiExtractionUsage {
   promptTokenCount: number;
+  /** Visible output only. Billable output is this PLUS `thoughtsTokenCount`. */
   candidatesTokenCount: number;
+  /**
+   * Optional because non-thinking models and older callers omit it entirely.
+   * Absent must read as 0, never as NaN — a NaN token count fails the payload
+   * schema and nulls the whole extraction, not just the usage block.
+   */
+  thoughtsTokenCount?: number;
 }
 
 /** @internal Pure normalization boundary, exported for offline contract tests. */
@@ -161,7 +174,8 @@ export function normalizeGeminiExtractionPayload(
     usage: usageMeta !== undefined
       ? {
           prompt_tokens: usageMeta.promptTokenCount,
-          candidate_tokens: usageMeta.candidatesTokenCount,
+          candidate_tokens: usageMeta.candidatesTokenCount
+            + (usageMeta.thoughtsTokenCount !== undefined ? usageMeta.thoughtsTokenCount : 0),
         }
       : undefined,
     key_claims: validClaims,
@@ -335,10 +349,10 @@ function parseGeminiJsonObject(rawText: string): unknown {
 // =============================================================================
 
 export async function extractQuotesWithGemini(input: GeminiExtractInput): Promise<ExtractedQuotes> {
-  const geminiKey = getGeminiKey();
+  const geminiKey = requireGeminiApiKey(input.credentials);
   const prompt = buildPrompt(input);
 
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${EXTRACTION_MODEL}:generateContent`;
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${extractionModelId()}:generateContent`;
 
   let rawJson: unknown;
 

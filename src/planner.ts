@@ -4,16 +4,27 @@
  * Decomposes a research brief into 15–35 web-searchable subqueries,
  * grouped by section, with provider routing for each subquery.
  *
- * Primary model: Gemini 3.1 Flash Lite (EXTRACTION_MODEL)
- * Fallback model: Claude Sonnet 4.6 (if Gemini fails after 2 retries)
+ * Primary model: extractionModelId() via @braintied/models (google cheap).
+ * Fallback model: STRONG style from @braintied/models (if Gemini fails after 2 retries).
  */
 
 import { z } from 'zod';
 import Anthropic from '@anthropic-ai/sdk';
+import { resolveForStyle } from '@braintied/models';
 import { logger } from './logger.js';
-import { getGeminiKey, EXTRACTION_MODEL } from './pipeline-core.js';
+import { extractionModelId } from './pipeline-core.js';
+import {
+  requireAnthropicApiKey,
+  requireGeminiApiKey,
+  type ResearchCredentials,
+} from './credentials.js';
 import { SubquerySchema } from './types.js';
 import type { Subquery } from './types.js';
+
+/** Planner Anthropic fallback — live STRONG pin from catalog, not a hardcoded id. */
+function plannerFallbackModelId(): string {
+  return resolveForStyle('STRONG', { moduleId: 'research' }).apiModelId;
+}
 
 // =============================================================================
 // Constants
@@ -24,15 +35,15 @@ const PLANNER_MAX_RETRIES = 2;
 
 /** Provider → the content need it serves, used to build the routing table. */
 const PROVIDER_ROUTING_ROWS: Array<{ need: string; providers: string[] }> = [
-  { need: 'Forum / community voice', providers: ['reddit', 'searxng', 'tavily'] },
+  { need: 'Forum / community voice', providers: ['reddit', 'tavily', 'searxng'] },
   { need: 'Video reviews / demos', providers: ['youtube'] },
   { need: 'YouTube comment threads', providers: ['youtube'] },
-  { need: 'News / recent reactions', providers: ['searxng', 'serper', 'tavily', 'serpapi'] },
+  { need: 'News / recent reactions', providers: ['tavily', 'searxng', 'serper', 'serpapi'] },
   { need: 'Google SERP / ads / PAA', providers: ['serper', 'serpapi'] },
-  { need: 'Long-form blogs / essays', providers: ['exa', 'searxng', 'tavily'] },
+  { need: 'Long-form blogs / essays', providers: ['exa', 'tavily', 'searxng'] },
   { need: 'Academic papers / arxiv', providers: ['exa', 'tavily', 'searxng'] },
   { need: 'Hacker News discussions', providers: ['hn', 'tavily'] },
-  { need: 'RSS newsletters / Substack', providers: ['rss', 'searxng'] },
+  { need: 'RSS newsletters / Substack', providers: ['rss', 'tavily', 'searxng'] },
   { need: 'Competitor landing pages', providers: ['tavily', 'serper', 'serpapi'] },
   { need: 'Audience verbatim pain', providers: ['reddit', 'youtube'] },
   { need: 'Vendor docs / changelogs', providers: ['tavily', 'searxng', 'exa'] },
@@ -114,6 +125,9 @@ const GeminiResponseSchema = z.object({
   usageMetadata: z.object({
     promptTokenCount: z.number().int().nonnegative().default(0),
     candidatesTokenCount: z.number().int().nonnegative().default(0),
+    // Disjoint from candidates, billed as output. Undeclared here means zod
+    // strips it and every thinking-enabled call under-books.
+    thoughtsTokenCount: z.number().int().nonnegative().default(0),
   }).optional(),
 });
 
@@ -128,9 +142,14 @@ export interface PlannerUsage {
 // Gemini call helper
 // =============================================================================
 
-async function callGemini(userMessage: string, systemPrompt: string): Promise<{ text: string; usage: PlannerUsage }> {
-  const key = getGeminiKey();
-  const url = `${GEMINI_API_BASE}/${EXTRACTION_MODEL}:generateContent`;
+async function callGemini(
+  credentials: ResearchCredentials,
+  userMessage: string,
+  systemPrompt: string,
+): Promise<{ text: string; usage: PlannerUsage }> {
+  const key = requireGeminiApiKey(credentials);
+  const wireModel = extractionModelId();
+  const url = `${GEMINI_API_BASE}/${wireModel}:generateContent`;
 
   const body = {
     system_instruction: { parts: [{ text: systemPrompt }] },
@@ -171,9 +190,12 @@ async function callGemini(userMessage: string, systemPrompt: string): Promise<{ 
   return {
     text: firstPart.text,
     usage: {
-      model: EXTRACTION_MODEL,
+      model: wireModel,
       inputTokens: usageMeta !== undefined ? usageMeta.promptTokenCount : 0,
-      outputTokens: usageMeta !== undefined ? usageMeta.candidatesTokenCount : 0,
+      // candidates + thoughts: Google bills thinking tokens as output.
+      outputTokens: usageMeta !== undefined
+        ? usageMeta.candidatesTokenCount + usageMeta.thoughtsTokenCount
+        : 0,
     },
   };
 }
@@ -182,16 +204,16 @@ async function callGemini(userMessage: string, systemPrompt: string): Promise<{ 
 // Claude fallback call helper
 // =============================================================================
 
-async function callClaude(userMessage: string, systemPrompt: string): Promise<{ text: string; usage: PlannerUsage }> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (apiKey === undefined || apiKey === '') {
-    throw new Error('ANTHROPIC_API_KEY environment variable is not configured');
-  }
-
-  const anthropic = new Anthropic({ apiKey });
+async function callClaude(
+  credentials: ResearchCredentials,
+  userMessage: string,
+  systemPrompt: string,
+): Promise<{ text: string; usage: PlannerUsage }> {
+  const anthropic = new Anthropic({ apiKey: requireAnthropicApiKey(credentials) });
+  const modelId = plannerFallbackModelId();
 
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: modelId,
     max_tokens: 8192,
     system: systemPrompt,
     messages: [{ role: 'user', content: userMessage }],
@@ -207,7 +229,7 @@ async function callClaude(userMessage: string, systemPrompt: string): Promise<{ 
   return {
     text,
     usage: {
-      model: 'claude-sonnet-4-6',
+      model: modelId,
       inputTokens: response.usage.input_tokens,
       outputTokens: response.usage.output_tokens,
     },
@@ -236,6 +258,8 @@ function extractJson(text: string): string {
 // =============================================================================
 
 export interface PlanSubqueriesInput {
+  /** Host-resolved credentials; planning needs the Gemini key, Claude on fallback. */
+  credentials: ResearchCredentials;
   promptMd: string;
   targetWordCount: { min: number; max: number };
   refinementHint?: string;
@@ -258,7 +282,7 @@ export interface PlanSubqueriesInput {
 }
 
 export async function planSubqueries(input: PlanSubqueriesInput): Promise<Subquery[]> {
-  const { promptMd, targetWordCount, refinementHint, usageSink } = input;
+  const { credentials, promptMd, targetWordCount, refinementHint, usageSink } = input;
   const subqueriesMin = input.subqueriesMin ?? 15;
   const subqueriesMax = input.subqueriesMax ?? 35;
   const availableProviders =
@@ -287,7 +311,7 @@ export async function planSubqueries(input: PlanSubqueriesInput): Promise<Subque
   let geminiText: string | null = null;
   for (let attempt = 0; attempt < PLANNER_MAX_RETRIES; attempt++) {
     try {
-      const geminiResult = await callGemini(userMessage, systemPrompt);
+      const geminiResult = await callGemini(credentials, userMessage, systemPrompt);
       reportUsage(geminiResult.usage);
       geminiText = geminiResult.text;
       const jsonStr = extractJson(geminiText);
@@ -308,7 +332,7 @@ export async function planSubqueries(input: PlanSubqueriesInput): Promise<Subque
   // Fallback: Claude Sonnet 4.6
   logger.info('[planner] Falling back to Claude for subquery planning');
   try {
-    const claudeResult = await callClaude(userMessage, systemPrompt);
+    const claudeResult = await callClaude(credentials, userMessage, systemPrompt);
     reportUsage(claudeResult.usage);
     const jsonStr = extractJson(claudeResult.text);
     const parsed = PlannerOutputSchema.parse(JSON.parse(jsonStr));
@@ -326,9 +350,12 @@ export async function planSubqueries(input: PlanSubqueriesInput): Promise<Subque
   }
 }
 
-export async function summarizePromptBrief(promptMd: string): Promise<string> {
-  const key = getGeminiKey();
-  const url = `${GEMINI_API_BASE}/${EXTRACTION_MODEL}:generateContent`;
+export async function summarizePromptBrief(
+  credentials: ResearchCredentials,
+  promptMd: string,
+): Promise<string> {
+  const key = requireGeminiApiKey(credentials);
+  const url = `${GEMINI_API_BASE}/${extractionModelId()}:generateContent`;
 
   const systemInstruction =
     'You are a research coordinator. Distill the following research brief into a single paragraph of 2–4 sentences that captures the core question, audience, and desired output. Be precise and concrete. Return only the paragraph text — no labels, no markdown.';

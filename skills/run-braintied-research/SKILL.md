@@ -98,8 +98,24 @@ model providers; treat every brief as outbound data.
    `BRAINTIED_RESEARCH_ENV_FILE` may point to that approved path so the command
    works from any workspace; an explicit `--research-env-file` wins.
    `--load-shell-env` imports the same allowlist from the interactive shell,
-   can discover that pointer, and never imports Agent Auth. For multichannel
-   research, preflight exact lanes and an exact upper boundary:
+   can discover that pointer, and never imports Agent Auth.
+
+   **How the runner resolves env (changed in @braintied/research 1.0.0).** The
+   package itself no longer reads `process.env` anywhere. The runner is the one
+   process boundary: it stages the environment exactly as described above (file
+   allowlist, shell import, masks, Gemini alias selection), then calls
+   `resolveResearchCredentials(process.env)` once and passes the resulting
+   `ResearchCredentials` record into every package entry point. Preflight's
+   `enabled_providers`, `enabled_search_providers`, and `provider_health.github`
+   are all computed from that record, so what preflight reports is exactly what
+   the run will use. Nothing changes about how you invoke the runner; the
+   variable names, `--research-env-file`, `--gemini-key-name`, and
+   `--require-providers` semantics are unchanged. An unparseable
+   `BRAINTIED_GITHUB_REQUIRE_AUTH`, or two Gemini aliases holding different keys
+   with no selector, now fails loudly at that boundary instead of quietly
+   disabling a lane.
+
+   For multichannel research, preflight exact lanes and an exact upper boundary:
 
    ```bash
    node skills/run-braintied-research/scripts/run-research.mjs \
@@ -165,7 +181,7 @@ Source modes are independent of research kind:
 | `x` | Direct posts/threads | twitterapi.io primary; official X v2 fallback; Bright Data known-URL/profile enrichment; Apify last |
 | `reddit` | Threads and comments | Free native OAuth; Bright Data backfill; Apify last |
 | `youtube` | Videos, transcripts, comments | Free native Data API/transcript path; Bright Data backfill |
-| `github` | Repositories, issues, pull requests | Native public REST; only the dedicated `BRAINTIED_GITHUB_PUBLIC_TOKEN` is eligible, and `BRAINTIED_GITHUB_REQUIRE_AUTH=true` fails closed without it |
+| `github` | Repositories, issues, pull requests | Native public REST; only the dedicated `BRAINTIED_GITHUB_PUBLIC_TOKEN` is eligible, and `BRAINTIED_GITHUB_REQUIRE_AUTH=true` fails closed without it. With no GitHub config at all the lane reports `github_auth_unconfigured` |
 | `community` | HN, RSS, podcasts | Free HN/RSS plus configured podcast provider |
 | `all_public` | All six public modes above | Expands deterministically and enforces every lane |
 
@@ -182,7 +198,8 @@ fields. A partial source/profile coverage result is still written for audit and
 exits with status 2.
 
 For operational diagnosis before synthesis, callers may use the exported
-`probePublicSourceHealth` API. It runs only bounded deterministic searches and
+`probePublicSourceHealth` API (it takes `credentials` like every other entry
+point). It runs only bounded deterministic searches and
 returns query hashes, backend/count/date/latency metadata, and sanitized failure
 classes. Its default registry excludes usage-billed providers; passing X,
 Tavily, Bright Data, Apify, or another metered provider registry is an explicit
