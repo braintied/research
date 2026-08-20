@@ -1,5 +1,13 @@
 ## Unreleased
 
+## 1.5.1
+
+### Patch Changes
+
+- Updated dependencies [bfa9c5e]
+
+  - @braintied/cost@3.2.0
+
 - Public GitHub snapshot (`braintied/research`) now ships a comprehensive
   README plus `AGENTS.md` from `packages/research/oss/`. Sync substitutes
   `{{VERSION}}` so the next `stack.mjs publish` of `@braintied/research`
