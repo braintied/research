@@ -69,7 +69,7 @@
     "esbuild": "0.28.1"
   },
   "dependencies": {
-    "@braintied/cost": "3.2.0",
+    "@braintied/cost": "3.3.0",
     "@braintied/models": "1.7.3",
     "@anthropic-ai/sdk": "^0.104.2",
     "openai": "^7.0.0",
