@@ -4,7 +4,7 @@ You name the question and a dollar cap. The engine searches, fetches pages,
 extracts quotes, synthesizes a report, and grounds every citation against
 the fetched evidence.
 
-**1.5.1** of [`@braintied/research`](https://github.com/braintied/stack/tree/main/packages/research).
+**1.5.3** of [`@braintied/research`](https://github.com/braintied/stack/tree/main/packages/research).
 Every stack publish snapshots this repo. Agents: start in [AGENTS.md](./AGENTS.md).
 
 ## Install

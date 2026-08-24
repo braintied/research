@@ -1,5 +1,19 @@
 ## Unreleased
 
+## 1.5.3
+
+### Patch Changes
+
+- Updated dependencies
+  - @braintied/cost@3.3.0
+
+## 1.5.2
+
+### Patch Changes
+
+- Updated dependencies [228faa2]
+  - @braintied/models@1.7.3
+
 ## 1.5.1
 
 ### Patch Changes
