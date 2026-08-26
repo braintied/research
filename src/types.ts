@@ -238,6 +238,11 @@ export interface SearchOpts {
   handles?: string[];
   /** YouTube channel ids. */
   channel_ids?: string[];
+  /**
+   * SearXNG engine names (`bing`, `youtube`, `reddit`). Other providers
+   * ignore this. Empty/absent means the instance default engine set.
+   */
+  engines?: string[];
   /** Maximum provider result pages per ranking stratum. */
   max_pages?: number;
   signal?: AbortSignal;

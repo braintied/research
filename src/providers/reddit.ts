@@ -155,7 +155,7 @@ function unixToIso(utc: number): string {
 }
 
 function recencyToTimeFilter(recencyDays: number | undefined): string {
-  if (recencyDays === undefined) return 'all';
+  if (recencyDays === undefined || recencyDays <= 0) return 'all';
   if (recencyDays <= 1) return 'day';
   if (recencyDays <= 7) return 'week';
   if (recencyDays <= 30) return 'month';

@@ -1,5 +1,19 @@
 ## Unreleased
 
+## 1.6.0
+
+### Minor Changes
+
+- 5df3c0d: SearXNG accepts an `engines` list (`youtube`, `reddit`, `bing`) so discovery can target those indexes without Tavily. `ingestSource` `web_search` uses SearXNG + Crawl4AI when SearXNG URLs are configured; Tavily is the fallback only when SearXNG is off. `recencyDays: 0` means no time filter (Reddit `t=all`).
+
+### Patch Changes
+
+- 45b852e: Coverage counts reddit.com / youtube.com hosts and native providers, not only `source_modes` tags. Web discovery prefers SearXNG (Tavily last). Burning Man briefs restrict Reddit to r/BurningMan. Non-software community seeds prefer RSS; empty HN does not fail coverage. `--kind deep` with reddit/youtube inherits recency 0.
+- 43ca7c5: Source-mode seeds use the first heading of a brief, not the whole markdown, and only append software suffixes on software jobs. `--recency-days 0` is all-time (Reddit `t=all`). Measured 2026-08-26: a Burning Man culture deep run spent $0.47, required reddit+youtube ran, and the bibliography was soccer transfers, baby CPR, and a reggae video named Spark Up because the seed was the entire brief plus `engineering talk demo interview`.
+
+- Coverage counts provider and URL host, not only `source_modes`. Web discovery prefers SearXNG. Burning Man briefs pin Reddit to r/BurningMan. Deep + reddit/youtube inherits recency 0. Empty HN is not a failed culture lane.
+- Source-mode seeds compact to the first heading and skip software suffixes on non-software jobs. `--recency-days 0` is all-time. Measured 2026-08-26 on a Burning Man culture deep run ($0.47, required reddit+youtube ran, bibliography was off-topic).
+
 ## 1.5.3
 
 ### Patch Changes

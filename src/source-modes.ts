@@ -87,15 +87,15 @@ export interface SourceModeDefinition {
 const DEFINITIONS: Record<AtomicSourceMode, SourceModeDefinition> = {
   web: {
     mode: 'web', visibility: 'public',
-    description: 'Broad public web discovery with Tavily quality/raw-content first and self-hosted breadth fallback.',
+    description: 'Broad public web discovery. SearXNG is the search box; Tavily is extract after Crawl4AI is thin.',
     candidateProviders: ['tavily', 'searxng', 'serper', 'serpapi', 'exa'],
-    preferredProviders: ['tavily', 'searxng'],
+    preferredProviders: ['searxng', 'tavily'],
     expectedSourceTypes: ['documentation', 'longform', 'news'],
     defaultSearchOptions: { sort: 'relevance', max_pages: 1 },
     searchResultLimit: 12,
     backendPolicy: [
-      { backend: 'tavily', role: 'discovery', priority: 1, state: 'implemented', note: 'Advanced search plus raw page content when available.' },
-      { backend: 'searxng', role: 'fallback', priority: 2, state: 'implemented', note: 'Free/self-hosted breadth and independent discovery.' },
+      { backend: 'searxng', role: 'discovery', priority: 1, state: 'implemented', note: 'Free/self-hosted search box. Tavily is not the default discovery provider.' },
+      { backend: 'tavily', role: 'fallback', priority: 2, state: 'implemented', note: 'Extract after Crawl4AI is thin; not the search box.' },
       { backend: 'crawl4ai', role: 'acquisition', priority: 1, state: 'implemented', note: 'Preferred page acquisition when search did not return raw content.' },
       { backend: 'direct_fetch', role: 'fallback', priority: 2, state: 'implemented', note: 'Last-resort plain HTTP extraction.' },
     ],
@@ -313,7 +313,10 @@ function searchOptionsFor(
   };
   const boundary = isoUpperBoundary(asOf);
   if (boundary !== undefined) options.published_before = boundary;
-  if (scope?.recencyDays !== undefined) options.recency_days = scope.recencyDays;
+  if (scope?.recencyDays !== undefined) {
+    if (scope.recencyDays > 0) options.recency_days = scope.recencyDays;
+    else delete options.recency_days;
+  }
   if (scope?.maxPages !== undefined) options.max_pages = scope.maxPages;
   if (scope?.includeDomains !== undefined) options.include_domains = scope.includeDomains;
   if (scope?.excludeDomains !== undefined) options.exclude_domains = scope.excludeDomains;
@@ -323,13 +326,76 @@ function searchOptionsFor(
   return options;
 }
 
+const SEED_QUERY_MAX = 160;
+const SOFTWARE_SEED_RE =
+  /\b(agent|agents|loop|loops|graph|graphs|runtime|engineering|repository|github|typescript|python|infra|kubernetes|deploy|sdk)\b/i;
+
+/**
+ * Source-mode seeds must be search queries, not the research brief.
+ * Measured 2026-08-26: a Burning Man culture brief was sent verbatim to
+ * Reddit/YouTube plus the software suffixes below, so the required lanes
+ * matched soccer transfers, baby CPR, and a reggae video named Spark Up.
+ */
+export function compactSeedQuestion(question: string): string {
+  const trimmed = typeof question === 'string' ? question.trim() : '';
+  if (trimmed === '') return '';
+  const headingMatch = trimmed.match(/^#{1,6}\s+(.+)$/m);
+  const firstLine = headingMatch !== null
+    ? headingMatch[1]
+    : (trimmed.split('\n')[0] ?? trimmed);
+  const stripped = firstLine.replace(/[*_`]/g, '').replace(/\s+/g, ' ').trim();
+  if (stripped.length <= SEED_QUERY_MAX) return stripped;
+  const sliced = stripped.slice(0, SEED_QUERY_MAX);
+  const lastSpace = sliced.lastIndexOf(' ');
+  return (lastSpace >= 40 ? sliced.slice(0, lastSpace) : sliced).trimEnd();
+}
+
+export function isSoftwareSeedJob(question: string, compact?: string): boolean {
+  const heading = compact ?? compactSeedQuestion(question);
+  return SOFTWARE_SEED_RE.test(heading) || SOFTWARE_SEED_RE.test(question.slice(0, 400));
+}
+
+const BURNING_MAN_RE = /\b(burning\s*man|r\/burningman|black rock (city|desert)|the playa)\b/i;
+
+export function inferredRedditCommunities(question: string): string[] | undefined {
+  if (BURNING_MAN_RE.test(question)) return ['BurningMan'];
+  return undefined;
+}
+
 function seededQuery(question: string, mode: AtomicPublicSourceMode): string {
-  if (mode === 'github') return `${question} implementation repository issue discussion`;
-  if (mode === 'youtube') return `${question} engineering talk demo interview`;
-  if (mode === 'reddit') return `${question} production experience failure architecture`;
-  if (mode === 'x') return `${question} agents loops graphs engineering`;
-  if (mode === 'community') return `${question} practitioner engineering discussion`;
-  return question;
+  const compact = compactSeedQuestion(question);
+  if (compact === '') return question;
+  if (!isSoftwareSeedJob(question, compact)) return compact;
+  if (mode === 'github') return `${compact} implementation repository issue discussion`;
+  if (mode === 'youtube') return `${compact} engineering talk demo interview`;
+  if (mode === 'reddit') return `${compact} production experience failure architecture`;
+  if (mode === 'x') return `${compact} agents loops graphs engineering`;
+  if (mode === 'community') return `${compact} practitioner engineering discussion`;
+  return compact;
+}
+
+function preferredProvidersFor(
+  mode: AtomicSourceMode,
+  question: string,
+  compact: string,
+): ProviderName[] {
+  const definition = DEFINITIONS[mode];
+  if (mode === 'community' && !isSoftwareSeedJob(question, compact)) {
+    return ['rss', 'hn', 'podcasts'];
+  }
+  return definition.preferredProviders;
+}
+
+function scopeForMode(
+  mode: AtomicPublicSourceMode,
+  input: ResolveSourceExecutionPlanInput,
+): SourceModeScope | undefined {
+  const given = input.scopes?.[mode];
+  if (mode !== 'reddit') return given;
+  if (given?.communities !== undefined && given.communities.length > 0) return given;
+  const inferred = inferredRedditCommunities(input.question);
+  if (inferred === undefined) return given;
+  return { ...given, communities: inferred };
 }
 
 export function resolveSourceExecutionPlan(input: ResolveSourceExecutionPlanInput): SourceExecutionPlan {
@@ -357,7 +423,9 @@ export function resolveSourceExecutionPlan(input: ResolveSourceExecutionPlanInpu
     }
 
     const candidates = definition.candidateProviders.filter((provider) => available.has(provider));
-    const preferred = definition.preferredProviders.filter((provider) => available.has(provider));
+    const compact = compactSeedQuestion(input.question);
+    const preferredNames = preferredProvidersFor(mode, input.question, compact);
+    const preferred = preferredNames.filter((provider) => available.has(provider));
     const selected = preferred.length > 0 ? preferred.slice(0, 1) : candidates.slice(0, 1);
     const ready = selected.length > 0;
     entries.push({
@@ -371,7 +439,7 @@ export function resolveSourceExecutionPlan(input: ResolveSourceExecutionPlanInpu
 
     if (ready) {
       const publicMode = mode as AtomicPublicSourceMode;
-      const scope = input.scopes?.[publicMode];
+      const scope = scopeForMode(publicMode, input);
       seededSubqueries.push(SubquerySchema.parse({
         section_path: `source.${mode}`,
         query: seededQuery(input.question, publicMode),
@@ -428,12 +496,53 @@ export interface SourceModeCoverageReport {
   missingModes: AtomicSourceMode[];
 }
 
+function resultHost(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./u, '').toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Coverage must see a Reddit/YouTube URL even when the planner subquery
+ * left `source_modes` empty. Measured 2026-08-26: native lanes logged 8
+ * hits and the bibliography cited reddit.com, while coverage reported 0
+ * because it only read the tag.
+ */
+export function discoveryMatchesMode(result: SearchResult, mode: AtomicSourceMode): boolean {
+  if (result.source_modes.includes(mode)) return true;
+  if (result.provider === mode) return true;
+  const host = resultHost(result.url);
+  if (mode === 'reddit') {
+    return host === 'reddit.com' || host.endsWith('.reddit.com');
+  }
+  if (mode === 'youtube') {
+    return host === 'youtube.com' || host === 'youtu.be' || host.endsWith('.youtube.com');
+  }
+  if (mode === 'community') {
+    return result.provider === 'hn' || result.provider === 'rss' || result.provider === 'podcasts'
+      || host === 'news.ycombinator.com';
+  }
+  if (mode === 'web') {
+    return result.provider === 'searxng' || result.provider === 'tavily';
+  }
+  return false;
+}
+
+export interface SourceCoverageOptions {
+  /** Brief or compact heading. Empty HN is not a failed lane on non-software jobs. */
+  question?: string;
+}
+
 /** Evaluate public discovery coverage. Trusted counts are supplied by caller. */
 export function evaluateSourceModeCoverage(
   plan: SourceExecutionPlan,
   discoveries: SearchResult[],
   trustedCounts: Partial<Record<TrustedSourceMode, { evidence: number; sources: number }>> = {},
+  options: SourceCoverageOptions = {},
 ): SourceModeCoverageReport {
+  const software = options.question !== undefined && isSoftwareSeedJob(options.question);
   const entries = plan.entries.map((entry): SourceModeCoverageEntry => {
     if (entry.visibility === 'trusted_local') {
       const count = trustedCounts[entry.mode as TrustedSourceMode] ?? { evidence: 0, sources: 0 };
@@ -447,13 +556,18 @@ export function evaluateSourceModeCoverage(
         providers: [], reasons,
       };
     }
-    const matching = discoveries.filter((result) => result.source_modes.includes(entry.mode));
+    const matching = discoveries.filter((result) => discoveryMatchesMode(result, entry.mode));
     const sources = new Set(matching.map((result) => result.url));
     const providers = unique(matching.map((result) => result.provider));
     const reasons: string[] = [];
     if (!entry.ready) reasons.push(entry.missingReason ?? 'source mode unavailable');
-    if (matching.length < entry.minimumDiscoveries) reasons.push(`needs ${entry.minimumDiscoveries} discoveries; found ${matching.length}`);
-    if (sources.size < entry.minimumUniqueSources) reasons.push(`needs ${entry.minimumUniqueSources} unique sources; found ${sources.size}`);
+    const communityEmptyOk = entry.mode === 'community' && !software && matching.length === 0;
+    if (!communityEmptyOk && matching.length < entry.minimumDiscoveries) {
+      reasons.push(`needs ${entry.minimumDiscoveries} discoveries; found ${matching.length}`);
+    }
+    if (!communityEmptyOk && sources.size < entry.minimumUniqueSources) {
+      reasons.push(`needs ${entry.minimumUniqueSources} unique sources; found ${sources.size}`);
+    }
     return {
       mode: entry.mode, required: true, passed: reasons.length === 0,
       discoveryCount: matching.length, uniqueSourceCount: sources.size,

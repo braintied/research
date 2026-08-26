@@ -67,6 +67,29 @@ export interface SearxngSearchOpts {
    * capability.
    */
   timeRange?: 'day' | 'week' | 'month' | 'year';
+  /**
+   * Restrict to named SearXNG engines (`youtube`, `reddit`, `bing`).
+   * Absent means the instance default set.
+   */
+  engines?: string[];
+}
+
+const SEARXNG_ENGINE_NAME = /^[a-z][a-z0-9_-]{0,32}$/;
+
+/** Join a caller engine list into SearXNG `engines=` (invalid names dropped). */
+export function searxngEnginesParam(engines: string[] | undefined): string | undefined {
+  if (engines === undefined || engines.length === 0) return undefined;
+  const cleaned: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of engines) {
+    const name = raw.trim().toLowerCase();
+    if (!SEARXNG_ENGINE_NAME.test(name)) continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    cleaned.push(name);
+  }
+  if (cleaned.length === 0) return undefined;
+  return cleaned.join(',');
 }
 
 /** Map a recency window in days onto SearXNG's discrete time_range buckets. */
@@ -115,6 +138,10 @@ async function callOnce(
   }
   if (opts.timeRange !== undefined) {
     params.set('time_range', opts.timeRange);
+  }
+  const engines = searxngEnginesParam(opts.engines);
+  if (engines !== undefined) {
+    params.set('engines', engines);
   }
   const url = `${baseUrl}/search?${params.toString()}`;
   const timeoutMs = opts.timeoutMs !== undefined ? opts.timeoutMs : 12_000;
@@ -242,6 +269,7 @@ export function createSearxngProvider(credentials: ResearchCredentials): SearchP
       const outcome = await searxngSearch(credentials, query, {
         limit: opts.limit,
         timeRange: recencyDaysToTimeRange(opts.recency_days),
+        engines: opts.engines,
       });
 
       if (!outcome.success) {

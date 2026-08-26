@@ -13,7 +13,12 @@ import { createTavilyProvider, tavilyAnswer } from './tavily.js';
 import { createExaProvider } from './exa.js';
 import { createSerpapiProvider } from './serpapi.js';
 import { createSerperProvider } from './serper.js';
-import { createSearxngProvider } from './searxng.js';
+import {
+  createSearxngProvider,
+  searxngSearch,
+  searxngEnginesParam,
+  recencyDaysToTimeRange,
+} from './searxng.js';
 import { createPerplexityProvider, perplexityAnswer, PerplexityApiError } from './perplexity.js';
 import { createRedditProvider } from './reddit.js';
 import { createYoutubeProvider } from './youtube.js';
@@ -172,6 +177,9 @@ export {
   createSerpapiProvider,
   createSerperProvider,
   createSearxngProvider,
+  searxngSearch,
+  searxngEnginesParam,
+  recencyDaysToTimeRange,
   createPerplexityProvider,
   perplexityAnswer,
   PerplexityApiError,

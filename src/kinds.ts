@@ -259,7 +259,9 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
     seedSubqueries: input.seedSubqueries,
     searchOptions: {
       ...input.searchOptions,
-      ...(input.recencyDays !== undefined ? { recency_days: input.recencyDays } : {}),
+      ...(input.recencyDays !== undefined && input.recencyDays > 0
+        ? { recency_days: input.recencyDays }
+        : {}),
     },
     providerSearchOptions: input.providerSearchOptions,
     subqueryBandOverride: input.subqueryBandOverride,

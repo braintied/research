@@ -53,7 +53,7 @@ const PROVIDER_RUN_COST_USD: Record<KnowledgeSourceType, number> = {
   x: 0.05,
   linkedin: 0.08,
   facebook: 0.08,
-  web_search: 0.004,
+  web_search: 0,
 };
 
 // =============================================================================
@@ -222,7 +222,7 @@ export async function ingestSource(
 
   const searchOpts: SearchOpts = {
     limit: maxItems,
-    recency_days: recencyDays,
+    recency_days: recencyDays > 0 ? recencyDays : undefined,
     signal: opts.signal,
   };
 
@@ -259,13 +259,25 @@ export async function ingestSource(
         items = mapSearchResults(r, source.id, sourceType);
         break;
       }
-      case 'blog':
-      case 'web_search': {
+      case 'blog': {
         const r = await providers.tavily.search(buildQuery(source), {
           ...searchOpts,
-          include_domains: sourceType === 'blog' ? [extractDomain(source.identifier)] : undefined,
+          include_domains: [extractDomain(source.identifier)],
         });
         items = mapSearchResults(r, source.id, sourceType);
+        await enrichWithFullContent(credentials, items);
+        break;
+      }
+      case 'web_search': {
+        if (providers.searxng.enabled) {
+          const r = await providers.searxng.search(buildQuery(source), searchOpts);
+          items = mapSearchResults(r, source.id, sourceType);
+        } else if (providers.tavily.enabled) {
+          const r = await providers.tavily.search(buildQuery(source), searchOpts);
+          items = mapSearchResults(r, source.id, sourceType);
+        } else {
+          throw new Error('web_search requires SearXNG URLs or a Tavily key');
+        }
         await enrichWithFullContent(credentials, items);
         break;
       }

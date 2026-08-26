@@ -6,7 +6,9 @@ import { createProviderRegistry, providersForSubquery } from '../src/index.js';
 import { compileProfileExecution } from '../src/profiles/registry.js';
 import { runResearchProgram, SourcePlanUnavailableError } from '../src/research-program.js';
 import {
+  compactSeedQuestion,
   evaluateSourceModeCoverage,
+  inferredRedditCommunities,
   resolveSourceExecutionPlan,
   type TrustedSourceMode,
 } from '../src/source-modes.js';
@@ -15,6 +17,169 @@ import type { KindResearchResult, RunResearchInput } from '../src/kinds.js';
 
 const question = 'How should Ora evolve long-running agent loops into observable work graphs?';
 const coreProviders = ['tavily', 'x', 'reddit', 'youtube', 'github', 'hn'] as const;
+
+test('compactSeedQuestion uses the first heading of a long brief', () => {
+  const brief = `# Burning Man culture: community voice and contested claims
+
+Date: 2026-08-26 (PT)
+Kind: deep
+
+Produce a cited report of how burners talk.`;
+  assert.equal(
+    compactSeedQuestion(brief),
+    'Burning Man culture: community voice and contested claims',
+  );
+});
+
+test('culture jobs seed reddit and youtube without engineering suffixes', () => {
+  const brief = `# Burning Man culture: community voice and contested claims
+
+Must cover sparkle pony, default world, playa name, MOOP.`;
+  const plan = resolveSourceExecutionPlan({
+    question: brief,
+    modes: ['reddit', 'youtube', 'community'],
+    availableProviders: ['reddit', 'youtube', 'hn'],
+  });
+  const reddit = plan.seededSubqueries.find((subquery) => subquery.source_mode === 'reddit');
+  const youtube = plan.seededSubqueries.find((subquery) => subquery.source_mode === 'youtube');
+  const community = plan.seededSubqueries.find((subquery) => subquery.source_mode === 'community');
+  assert.equal(reddit?.query, 'Burning Man culture: community voice and contested claims');
+  assert.equal(youtube?.query, 'Burning Man culture: community voice and contested claims');
+  assert.equal(community?.query, 'Burning Man culture: community voice and contested claims');
+  assert.equal(reddit?.query.includes('production experience'), false);
+  assert.equal(youtube?.query.includes('engineering talk'), false);
+});
+
+test('software jobs keep the engineering seed suffixes', () => {
+  const plan = resolveSourceExecutionPlan({
+    question,
+    modes: ['reddit', 'youtube'],
+    availableProviders: ['reddit', 'youtube'],
+  });
+  assert.match(
+    plan.seededSubqueries.find((subquery) => subquery.source_mode === 'reddit')?.query ?? '',
+    /production experience failure architecture/,
+  );
+  assert.match(
+    plan.seededSubqueries.find((subquery) => subquery.source_mode === 'youtube')?.query ?? '',
+    /engineering talk demo interview/,
+  );
+});
+
+test('inferredRedditCommunities only fires on Burning Man jobs', () => {
+  assert.deepEqual(inferredRedditCommunities('r/BurningMan glitter MOOP'), ['BurningMan']);
+  assert.deepEqual(inferredRedditCommunities('Black Rock City theme camps'), ['BurningMan']);
+  assert.equal(inferredRedditCommunities('brake shop West Adams'), undefined);
+});
+
+test('web seed prefers SearXNG when it is enabled', () => {
+  const plan = resolveSourceExecutionPlan({
+    question,
+    modes: ['web'],
+    availableProviders: ['tavily', 'searxng'],
+  });
+  assert.deepEqual(
+    plan.seededSubqueries.find((subquery) => subquery.source_mode === 'web')?.providers,
+    ['searxng'],
+  );
+});
+
+test('web seed falls back to Tavily when SearXNG is off', () => {
+  const plan = resolveSourceExecutionPlan({
+    question,
+    modes: ['web'],
+    availableProviders: ['tavily'],
+  });
+  assert.deepEqual(
+    plan.seededSubqueries.find((subquery) => subquery.source_mode === 'web')?.providers,
+    ['tavily'],
+  );
+});
+
+test('Burning Man reddit seeds restrict to r/BurningMan', () => {
+  const plan = resolveSourceExecutionPlan({
+    question: '# Burning Man culture: community voice\n\nsparkle pony',
+    modes: ['reddit'],
+    availableProviders: ['reddit'],
+  });
+  assert.deepEqual(
+    plan.seededSubqueries[0]?.search_options.communities,
+    ['BurningMan'],
+  );
+});
+
+test('culture community seed prefers RSS over HN', () => {
+  const plan = resolveSourceExecutionPlan({
+    question: '# Burning Man culture: community voice',
+    modes: ['community'],
+    availableProviders: ['hn', 'rss'],
+  });
+  assert.deepEqual(
+    plan.seededSubqueries.find((subquery) => subquery.source_mode === 'community')?.providers,
+    ['rss'],
+  );
+});
+
+test('software community seed still prefers HN', () => {
+  const plan = resolveSourceExecutionPlan({
+    question,
+    modes: ['community'],
+    availableProviders: ['hn', 'rss'],
+  });
+  assert.deepEqual(
+    plan.seededSubqueries.find((subquery) => subquery.source_mode === 'community')?.providers,
+    ['hn'],
+  );
+});
+
+test('coverage counts a reddit.com URL with empty source_modes', () => {
+  const plan = resolveSourceExecutionPlan({
+    question: '# Burning Man culture',
+    modes: ['reddit'],
+    availableProviders: ['reddit'],
+  });
+  const hits = [1, 2, 3].map((index) => SearchResultSchema.parse({
+    provider: 'tavily',
+    url: `https://www.reddit.com/r/BurningMan/comments/abc${index}/glitter`,
+    title: `Thread ${index}`,
+    snippet: 'MOOP',
+    source_modes: [],
+  }));
+  const coverage = evaluateSourceModeCoverage(plan, hits, {}, { question: '# Burning Man culture' });
+  assert.equal(coverage.passed, true);
+  assert.equal(coverage.entries[0]?.discoveryCount, 3);
+});
+
+test('empty HN does not fail community coverage on a culture job', () => {
+  const plan = resolveSourceExecutionPlan({
+    question: '# Burning Man culture',
+    modes: ['community'],
+    availableProviders: ['hn'],
+  });
+  const coverage = evaluateSourceModeCoverage(plan, [], {}, { question: '# Burning Man culture' });
+  assert.equal(coverage.passed, true);
+  assert.deepEqual(coverage.missingModes, []);
+});
+
+test('recencyDays 0 drops the 365-day source-mode default', () => {
+  const plan = resolveSourceExecutionPlan({
+    question: 'Burning Man culture community voice contested claims',
+    modes: ['reddit', 'youtube'],
+    availableProviders: ['reddit', 'youtube'],
+    scopes: {
+      reddit: { recencyDays: 0 },
+      youtube: { recencyDays: 0 },
+    },
+  });
+  assert.equal(
+    plan.seededSubqueries.find((subquery) => subquery.source_mode === 'reddit')?.search_options.recency_days,
+    undefined,
+  );
+  assert.equal(
+    plan.seededSubqueries.find((subquery) => subquery.source_mode === 'youtube')?.search_options.recency_days,
+    undefined,
+  );
+});
 
 test('all_public compiles to deterministic core searches and never exposes Crawl4AI as search', () => {
   const plan = resolveSourceExecutionPlan({

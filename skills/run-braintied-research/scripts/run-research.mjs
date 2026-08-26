@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import { execFile } from 'node:child_process';
-import { constants as fsConstants } from 'node:fs';
+import fs, { constants as fsConstants } from 'node:fs';
 import { access, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -65,7 +66,32 @@ const IMPORTABLE_ENV_NAMES = [...RESEARCH_ENV_NAMES, GEMINI_KEY_NAME_VARIABLE];
 const IMPORTABLE_ENV_NAME_SET = new Set(IMPORTABLE_ENV_NAMES);
 const SHELL_CAPTURE_NAME_SET = new Set([...IMPORTABLE_ENV_NAMES, SHARED_ENV_FILE_VARIABLE]);
 const BRAINTIED_SEARXNG_URLS = 'https://cortex-searxng-a.fly.dev,https://cortex-searxng-b.fly.dev';
-const PACKAGE_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+
+function resolvePackageRoot() {
+  const fromImport = fileURLToPath(new URL('../../../', import.meta.url));
+  const override = process.env.BRAINTIED_RESEARCH_PACKAGE_ROOT;
+  const worktree = path.join(os.homedir(), 'Development/.worktrees/research-main/packages/research');
+  const candidates = [fromImport];
+  if (typeof override === 'string' && override.trim() !== '') candidates.push(override.trim());
+  candidates.push(worktree);
+  for (const root of candidates) {
+    const dist = path.join(root, 'dist', 'index.mjs');
+    const pkg = path.join(root, 'package.json');
+    if (!fs.existsSync(dist) || !fs.existsSync(pkg)) continue;
+    try {
+      if (JSON.parse(fs.readFileSync(pkg, 'utf8')).name !== '@braintied/research') continue;
+    } catch {
+      continue;
+    }
+    return root;
+  }
+  throw new Error(
+    `Built package not found at ${path.join(fromImport, 'dist', 'index.mjs')}. `
+      + 'Run from packages/research or set BRAINTIED_RESEARCH_PACKAGE_ROOT to an origin/main checkout.',
+  );
+}
+
+const PACKAGE_ROOT = resolvePackageRoot();
 const DIST_ENTRY = path.join(PACKAGE_ROOT, 'dist', 'index.mjs');
 const PACKAGE_JSON = path.join(PACKAGE_ROOT, 'package.json');
 const SOURCE_ROOT = path.join(PACKAGE_ROOT, 'src');
@@ -91,7 +117,7 @@ Options:
                             Import allowlisted settings from a secure dotenv file
   --gemini-key-name <name>  Select one Gemini alias when configured values conflict
   --load-shell-env          Import allowlisted settings from an interactive shell
-  --recency-days <integer>  Recency window for answer or pipeline searches
+  --recency-days <integer>  Recency window; 0 means all-time (no time filter)
   --sources <csv>           Explicit lanes: web,x,reddit,youtube,github,community,...
   --require-providers <csv> Fail preflight unless these providers are enabled
   --as-of <ISO date/time>   Reproducible upper boundary (required with --sources/profile)
@@ -160,6 +186,15 @@ function parsePositiveInteger(raw, label) {
   if (parsed === undefined) return undefined;
   if (!Number.isInteger(parsed)) {
     throw new Error(`${label} must be a whole number.`);
+  }
+  return parsed;
+}
+
+function parseRecencyDays(raw, label) {
+  if (raw === undefined) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${label} must be a whole number ≥ 0 (0 = all-time).`);
   }
   return parsed;
 }
@@ -659,7 +694,7 @@ async function main() {
   }
 
   const maxCostUsd = parsePositiveNumber(values['max-cost-usd'], '--max-cost-usd');
-  const recencyDays = parsePositiveInteger(values['recency-days'], '--recency-days');
+  const recencyDays = parseRecencyDays(values['recency-days'], '--recency-days');
   const sources = parseCsv(values.sources, '--sources');
   const requiredProviders = parseCsv(values['require-providers'], '--require-providers');
   const asOf = values['as-of'];

@@ -56,14 +56,14 @@ test('public source health probes only selected lanes with bounded, metadata-onl
   const registry = {
     tavily: mockProvider(
       'tavily',
-      'offline_web',
-      [1, 2, 3, 4].map((index) => mockResult('tavily', index, 'offline_web')),
+      'unused_backend',
+      [mockResult('tavily', 1, 'unused_backend')],
       calls,
     ),
     searxng: mockProvider(
       'searxng',
-      'unused_backend',
-      [mockResult('searxng', 1, 'unused_backend')],
+      'offline_web',
+      [1, 2, 3, 4].map((index) => mockResult('searxng', index, 'offline_web')),
       calls,
     ),
     x: mockProvider(
@@ -77,7 +77,7 @@ test('public source health probes only selected lanes with bounded, metadata-onl
   const report = await probePublicSourceHealth({
     question: publicQuestion,
     modes: ['web', 'x'],
-    requiredProviders: ['tavily', 'x'],
+    requiredProviders: ['searxng', 'x'],
     asOf: '2026-07-21',
     scopes: { x: { handles: ['openclaw'], maxPages: 10 } },
     limit: 100,
@@ -85,8 +85,8 @@ test('public source health probes only selected lanes with bounded, metadata-onl
     timeoutMs: 60_000,
   }, { providerRegistry: registry });
 
-  assert.deepEqual(calls.map((call) => call.provider).sort(), ['tavily', 'x']);
-  assert.ok(!calls.some((call) => call.provider === 'searxng'));
+  assert.deepEqual(calls.map((call) => call.provider).sort(), ['searxng', 'x']);
+  assert.ok(!calls.some((call) => call.provider === 'tavily'));
   assert.ok(calls.every((call) => call.options.limit === 8));
   assert.ok(calls.every((call) => call.options.max_pages <= 2));
   assert.equal(calls.find((call) => call.provider === 'x')?.options.published_before,

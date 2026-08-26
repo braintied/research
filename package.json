@@ -1,6 +1,6 @@
 {
   "name": "@braintied/research",
-  "version": "1.5.3",
+  "version": "1.6.0",
   "description": "Cited research with a budget. Free search/fetch via SearXNG + Crawl4AI. Multi-provider lanes, typed credentials, grounded citations.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -69,8 +69,8 @@
     "esbuild": "0.28.1"
   },
   "dependencies": {
-    "@braintied/cost": "3.2.0",
-    "@braintied/models": "1.7.3",
+    "@braintied/cost": "3.1.0",
+    "@braintied/models": "1.7.2",
     "@anthropic-ai/sdk": "^0.104.2",
     "openai": "^7.0.0",
     "youtube-transcript": "^1.3.1",

@@ -440,15 +440,20 @@ export async function runResearchProgram(input: RunResearchProgramInput): Promis
       search_options: { ...subquery.search_options, published_before: publishedBefore },
     }));
   }
-  if (input.recencyDays !== undefined) {
-    plan.seededSubqueries = plan.seededSubqueries.map((subquery) => ({
-      ...subquery,
-      search_options: { ...subquery.search_options, recency_days: input.recencyDays },
-    }));
-  }
-
   if (!plan.ready) throw new SourcePlanUnavailableError(plan);
   const kind = input.kind ?? 'deep';
+  const socialModes = plan.publicModes.some((mode) => mode === 'reddit' || mode === 'youtube');
+  const recencyDays = input.recencyDays !== undefined
+    ? input.recencyDays
+    : (kind === 'deep' && socialModes ? 0 : undefined);
+  if (recencyDays !== undefined) {
+    plan.seededSubqueries = plan.seededSubqueries.map((subquery) => {
+      const search_options = { ...subquery.search_options };
+      if (recencyDays > 0) search_options.recency_days = recencyDays;
+      else delete search_options.recency_days;
+      return { ...subquery, search_options };
+    });
+  }
   if (plan.publicModes.length > 0 && (kind === 'answer' || kind === 'managed')) {
     throw new Error(`Research kind ${kind} cannot enforce deterministic source modes; use quick, standard, deep, or social.`);
   }
@@ -464,7 +469,7 @@ export async function runResearchProgram(input: RunResearchProgramInput): Promis
         maxCostUsd: input.maxCostUsd,
         synthesisModelOverride: input.synthesisModelOverride,
         minFreeResults: input.minFreeResults,
-        recencyDays: input.recencyDays,
+        recencyDays,
         providers: plan.providerAllowlist,
         seedSubqueries: plan.seededSubqueries,
         providerSearchOptions: input.providerSearchOptions,
@@ -525,6 +530,7 @@ export async function runResearchProgram(input: RunResearchProgramInput): Promis
     plan,
     publicResearch?.discoveries ?? [],
     trustedCounts(evidenceByMode),
+    { question: input.brief },
   );
   const profileCoverage = profileExecution !== null
     ? evaluateCoverage(profileExecution.profile, [...publicEvidence, ...trustedEvidence], input.asOf)
