@@ -9,6 +9,7 @@ export {
   getPlaylistVideoIds,
   buildPlaylistMembership,
 } from './channel.js';
+export { resolveChannelId } from './channel.js';
 export type { ChannelVideoRef, ChannelPlaylist } from './channel.js';
 
 export { getVideoMetadata } from './metadata.js';

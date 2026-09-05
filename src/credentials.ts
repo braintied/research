@@ -112,6 +112,10 @@ export interface ResearchCredentials {
   readonly perplexityApiKey?: string;
   readonly listennotesApiKey?: string;
   readonly youtubeApiKey?: string;
+  /** Groq Whisper (whisper-large-v3-turbo): tier-2 audio transcription for YouTube and podcast audio. */
+  readonly groqApiKey?: string;
+  /** Deepgram Nova-3: tier-3 audio transcription, and the only tier for files over Groq's 25 MB cap. */
+  readonly deepgramApiKey?: string;
   readonly reddit?: RedditCredentials;
   readonly x?: XCredentials;
   /** Apify actor runs — Instagram Stories (primary), X fallback, TikTok collector. */
@@ -177,6 +181,8 @@ export const RESEARCH_ENV_NAMES = [
   'PERPLEXITY_API_KEY',
   'LISTENNOTES_API_KEY',
   'YOUTUBE_API_KEY',
+  'GROQ_API_KEY',
+  'DEEPGRAM_API_KEY',
   'REDDIT_CLIENT_ID',
   'REDDIT_CLIENT_SECRET',
   'REDDIT_USER_AGENT',
@@ -352,6 +358,8 @@ export function resolveResearchCredentials(env: ResearchEnvironment): ResearchCr
   const searxngUrls = csv(env, 'SEARXNG_URLS').map((url) => url.replace(/\/+$/, ''));
   const perplexityApiKey = trimmed(env, 'PERPLEXITY_API_KEY');
   const listennotesApiKey = trimmed(env, 'LISTENNOTES_API_KEY');
+  const groqApiKey = trimmed(env, 'GROQ_API_KEY');
+  const deepgramApiKey = trimmed(env, 'DEEPGRAM_API_KEY');
   const youtubeApiKey = trimmed(env, 'YOUTUBE_API_KEY');
   const apifyApiToken = trimmed(env, 'APIFY_API_TOKEN');
   const apifyAllowFallback = trimmed(env, 'APIFY_ALLOW_FALLBACK') === '1';
@@ -375,6 +383,8 @@ export function resolveResearchCredentials(env: ResearchEnvironment): ResearchCr
     ...(perplexityApiKey === undefined ? {} : { perplexityApiKey }),
     ...(listennotesApiKey === undefined ? {} : { listennotesApiKey }),
     ...(youtubeApiKey === undefined ? {} : { youtubeApiKey }),
+    ...(groqApiKey === undefined ? {} : { groqApiKey }),
+    ...(deepgramApiKey === undefined ? {} : { deepgramApiKey }),
     ...(reddit === undefined ? {} : { reddit }),
     ...(x === undefined ? {} : { x }),
     ...(apifyApiToken === undefined ? {} : { apifyApiToken }),

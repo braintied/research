@@ -12,7 +12,6 @@
  * IngestResult with `error` set, so one bad source never aborts a sweep.
  */
 
-import { hashUrl, canonicalizeUrl } from '../types.js';
 import type { SearchResult, SearchOpts } from '../types.js';
 import { createProviderRegistry } from '../providers/index.js';
 import type { ResearchCredentials } from '../credentials.js';
@@ -23,6 +22,8 @@ import {
 import { crawlUrl } from '../pipeline-core.js';
 import { logger } from '../logger.js';
 import { KnowledgeSourceTypeSchema } from './types.js';
+import { buildIngestedItem, toExcerpt } from './build-item.js';
+import { ingestCatalog, parseCatalogConfig } from './catalog.js';
 import type {
   KnowledgeSource,
   KnowledgeSourceType,
@@ -75,12 +76,6 @@ async function fetchLinkedInPosts(
 // Helpers
 // =============================================================================
 
-function toExcerpt(content: string, snippet: string): string {
-  const base = content.trim().length > 0 ? content.trim() : snippet.trim();
-  if (base.length <= 320) return base;
-  return `${base.slice(0, 320).trim()}…`;
-}
-
 function searchEngagementToIngest(
   e: SearchResult['engagement'],
 ): IngestEngagement {
@@ -91,40 +86,6 @@ function searchEngagementToIngest(
   if (e.comment_count !== undefined) out.comments = e.comment_count;
   if (e.score !== undefined) out.score = e.score;
   return out;
-}
-
-interface BuildItemInput {
-  sourceId: string | null;
-  sourceType: KnowledgeSourceType;
-  url: string;
-  title: string;
-  contentMd: string;
-  author: string | null;
-  publishedAt: string | null;
-  engagement: IngestEngagement;
-}
-
-function buildItem(input: BuildItemInput): IngestedItem {
-  const canonical = canonicalizeUrl(input.url);
-  return {
-    sourceId: input.sourceId,
-    sourceType: input.sourceType,
-    url: canonical,
-    urlHash: hashUrl(canonical),
-    title: input.title,
-    contentMd: input.contentMd,
-    excerpt: toExcerpt(input.contentMd, input.title),
-    author: input.author,
-    publishedAt: input.publishedAt,
-    engagement: input.engagement,
-    qualityScore: null,
-    // categorize/embed fill these in later; defaults keep the type total.
-    category: 'other',
-    tags: [],
-    whyItMatters: null,
-    quotes: [],
-    embedding: null,
-  };
 }
 
 /**
@@ -164,7 +125,7 @@ function mapSearchResults(
     if (r.url.length === 0) continue;
     const content = r.snippet.trim();
     out.push(
-      buildItem({
+      buildIngestedItem({
         sourceId,
         sourceType,
         url: r.url,
@@ -235,6 +196,27 @@ export async function ingestSource(
   };
 
   try {
+    // Catalog mode enumerates ONE account's own output (a channel's uploads, a
+    // profile's posts, a feed's episodes, a site's pages) instead of searching
+    // a topic. It is the person-corpus door; the switch below is the topic door.
+    const catalog = parseCatalogConfig(source.config);
+    if (catalog !== null) {
+      const harvested = await ingestCatalog(credentials, source, catalog, {
+        maxItems,
+        recencyDays,
+        signal: opts.signal,
+      });
+      // Same dedupe contract as the sweep lanes: one item per url_hash, then
+      // the caller's ceiling. A profile crawl can return one post twice.
+      const seenHashes = new Set<string>();
+      const uniqueItems = harvested.items.filter((it) => {
+        if (seenHashes.has(it.urlHash)) return false;
+        seenHashes.add(it.urlHash);
+        return true;
+      });
+      return { ...baseResult, items: uniqueItems.slice(0, maxItems), costUsd: harvested.costUsd };
+    }
+
     let items: IngestedItem[] = [];
 
     switch (sourceType) {

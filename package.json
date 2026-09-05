@@ -1,6 +1,6 @@
 {
   "name": "@braintied/research",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Cited research with a budget. Free search/fetch via SearXNG + Crawl4AI. Multi-provider lanes, typed credentials, grounded citations.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

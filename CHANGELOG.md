@@ -1,4 +1,26 @@
-## Unreleased
+## 1.7.0
+
+### Minor Changes
+
+- d0a0ed7: Catalog mode for knowledge ingestion, the person-corpus door. A source with
+  `config.mode = 'catalog'` enumerates ONE account's own output instead of
+  searching a topic: a YouTube channel's uploads (`resolveChannelId` accepts a
+  `UC…` id, a `/channel/` URL or an `@handle`), an Instagram profile's posts
+  (`discoverInstagramProfilePosts`, Bright Data `discover_by=url`, the path Swishh
+  creator enrichment already proved), every episode in a podcast or RSS feed, and
+  a site's sitemap pages through `crawlUrl`. `config.transcribe = true` adds
+  transcripts: YouTube through the existing captions → Groq → Deepgram stack, and
+  podcast enclosures through the new `transcribeAudioUrl`, which HEAD-probes the
+  file and skips Groq's 25 MB cap straight to Deepgram instead of downloading
+  twice. `ResearchCredentials` gains `groqApiKey` / `deepgramApiKey`
+  (`GROQ_API_KEY`, `DEEPGRAM_API_KEY`) so the ingestion core can reach the paid
+  tiers without a host passing keys per call. Cost is metered per lane from what
+  the providers bill (Bright Data per record, Groq/Deepgram per audio hour); the
+  sweep lanes are unchanged.
+
+  Built for the Tucker Hamilton corpus (Coxie 360, 2026-09-02): 282 channel
+  uploads, 248 Instagram posts, 345 podcast episodes and a 10-page site, none of
+  which the topic sweep (15 items, 30 days) could reach.
 
 ## 1.6.0
 
@@ -700,8 +722,6 @@ opts)`, `summarizePromptBrief(credentials, promptMd)`, and every Bright Data
 
   All eighteen now declare UNLICENSED and ship the same proprietary LICENSE file.
   No runtime behaviour changes.
-
-## Unreleased
 
 ### Bright Data primary / Apify opt-in only (2026-08-01)
 

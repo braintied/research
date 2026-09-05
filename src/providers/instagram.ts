@@ -64,7 +64,7 @@ const RecordArraySchema = z.array(z.unknown());
 
 type InstagramRecord = z.infer<typeof RecordSchema>;
 
-interface NormalizedInstagramPost {
+export interface NormalizedInstagramPost {
   url: string;
   canonicalId: string;
   caption: string;
@@ -727,6 +727,101 @@ async function discoverHashtag(
   if (posts.length === 0) {
     throw new Error('Bright Data Instagram discovery returned no usable content');
   }
+  return posts;
+}
+
+export interface InstagramProfilePostsInput {
+  /** Instagram username, with or without a leading @, or a profile URL. */
+  username: string;
+  /** Post ceiling for the discovery crawl. Bright Data bills per returned record. */
+  limit: number;
+  /** ISO date (YYYY-MM-DD); only posts on or after it are discovered. */
+  since?: string;
+  signal?: AbortSignal;
+}
+
+function usernameFromIdentifier(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.includes('instagram.com/')) {
+    const canonical = canonicalizeInstagramProfileUrl(
+      trimmed.startsWith('http') ? trimmed : `https://${trimmed}`,
+    );
+    if (canonical === null) return null;
+    const segment = new URL(canonical).pathname.split('/').filter(Boolean)[0];
+    return segment === undefined ? null : segment.toLowerCase();
+  }
+  const handle = trimmed.replace(/^@/, '').toLowerCase();
+  return /^[a-z0-9._]{1,30}$/.test(handle) ? handle : null;
+}
+
+async function triggerProfileDiscovery(
+  username: string,
+  limit: number,
+  since: string | undefined,
+  token: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  // Profile collections must go through async discover_by=url: the sync
+  // /scrape endpoint on the posts dataset accepts only direct post URLs and
+  // rejects num_of_posts (measured in Swishh creator enrichment, 2026-07).
+  const endpoint = `${BRIGHTDATA_BASE_URL}/trigger`
+    + `?dataset_id=${BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID}`
+    + '&type=discover_new&discover_by=url';
+  const input: Record<string, unknown> = {
+    url: `https://www.instagram.com/${username}/`,
+    num_of_posts: limit,
+  };
+  if (since !== undefined) input.start_date = since;
+  const response = await fetchWithTimeout(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify([input]),
+  }, TRIGGER_TIMEOUT_MS, signal);
+  const raw = await readJsonResponse(response, 'Instagram profile discovery trigger');
+  const parsed = TriggerResponseSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new Error('Bright Data Instagram profile discovery trigger returned no snapshot_id');
+  }
+  return parsed.data.snapshot_id;
+}
+
+/**
+ * Every public post and reel on ONE profile, newest first, via Bright Data's
+ * posts dataset (discover_by=url). This is the person-corpus primitive: the
+ * search() path above discovers by hashtag and cannot enumerate an account.
+ *
+ * Bills per returned record (order of $1.50 per 1,000). Pass `since` to keep a
+ * refresh crawl to the delta. Throws when the profile yields no usable posts
+ * so a private or misspelled account cannot read as "no new content".
+ */
+export async function discoverInstagramProfilePosts(
+  credentials: ResearchCredentials,
+  input: InstagramProfilePostsInput,
+): Promise<NormalizedInstagramPost[]> {
+  const token = requireBrightDataToken(credentials);
+  const username = usernameFromIdentifier(input.username);
+  if (username === null) {
+    throw new Error(`Instagram profile identifier is not a username or profile URL: ${input.username.slice(0, 80)}`);
+  }
+  if (!Number.isFinite(input.limit) || input.limit < 1) {
+    throw new RangeError('Instagram profile discovery needs a positive post limit');
+  }
+  const limit = Math.floor(input.limit);
+  const snapshotId = await triggerProfileDiscovery(username, limit, input.since, token, input.signal);
+  await waitForSnapshot(snapshotId, token, input.signal);
+  const records = await downloadSnapshotRecords(snapshotId, token, input.signal);
+  const posts = records
+    .map(record => normalizeInstagramRecord(record))
+    .filter((post): post is NormalizedInstagramPost => post !== null)
+    .slice(0, limit);
+  if (posts.length === 0) {
+    throw new Error(`Bright Data Instagram profile discovery returned no usable posts for @${username}`);
+  }
+  logger.info({ username, postCount: posts.length }, '[Instagram] Bright Data profile discovery complete');
   return posts;
 }
 

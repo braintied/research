@@ -63,7 +63,7 @@ export class TranscriptUnavailableError extends Error {
     const detail = Object.entries(tierErrors)
       .map(([tier, reason]) => `${tier}: ${reason}`)
       .join('; ');
-    super(`No transcript available for video ${videoId}. ${detail}`);
+    super(`No transcript available for ${videoId}. ${detail}`);
     this.name = 'TranscriptUnavailableError';
     this.videoId = videoId;
     this.tierErrors = tierErrors;
@@ -648,4 +648,109 @@ export async function extractTranscriptWithFallback(input: {
   }
   logger.error({ videoId: input.videoId }, '[YouTubeTranscript] All transcript tiers failed');
   throw new TranscriptUnavailableError(input.videoId, tierErrors);
+}
+
+// =============================================================================
+// Public: arbitrary audio URL (podcast enclosures, hosted recordings)
+// =============================================================================
+
+export interface AudioTranscriptInput {
+  /** Direct URL to an audio file (mp3/m4a/webm). Redirects are followed by fetch. */
+  audioUrl: string;
+  /** Content type used for the upload part; defaults to the response's content-type, then audio/mpeg. */
+  mimeType?: string;
+  groqApiKey?: string;
+  deepgramApiKey?: string;
+}
+
+async function probeAudio(audioUrl: string): Promise<{ bytes: number | null; mimeType: string | null }> {
+  try {
+    const response = await fetch(audioUrl, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(20_000) });
+    if (!response.ok) return { bytes: null, mimeType: null };
+    const length = response.headers.get('content-length');
+    const type = response.headers.get('content-type');
+    return {
+      bytes: length !== null && Number.isFinite(parseInt(length, 10)) ? parseInt(length, 10) : null,
+      mimeType: type !== null && type.length > 0 ? type.split(';')[0].trim() : null,
+    };
+  } catch {
+    return { bytes: null, mimeType: null };
+  }
+}
+
+/**
+ * Transcribe an audio file by URL: Groq Whisper first (when the file fits
+ * Groq's 25 MB cap), then Deepgram Nova-3 (100 MB cap). There is no captions
+ * tier for arbitrary audio, so at least one paid key is required.
+ *
+ * Built for podcast enclosures: a 50-minute megaphone MP3 at 128 kbps is
+ * ~48 MB, which skips Groq and lands on Deepgram; a 64 kbps mono file fits
+ * Groq at roughly a sixth of the price. The HEAD probe decides the tier order
+ * before any bytes are downloaded, so an oversize file is never pulled twice.
+ */
+export async function transcribeAudioUrl(input: AudioTranscriptInput): Promise<TranscriptResult> {
+  const tierErrors: Record<string, string> = {};
+  const wantsGroq = input.groqApiKey !== undefined && input.groqApiKey.length > 0;
+  const wantsDeepgram = input.deepgramApiKey !== undefined && input.deepgramApiKey.length > 0;
+  if (!wantsGroq && !wantsDeepgram) {
+    tierErrors['config'] = 'No groqApiKey or deepgramApiKey provided; audio transcription has no free tier';
+    throw new TranscriptUnavailableError(input.audioUrl, tierErrors);
+  }
+
+  const probe = await probeAudio(input.audioUrl);
+  const mimeType = input.mimeType ?? probe.mimeType ?? 'audio/mpeg';
+  const groqFits = probe.bytes === null || probe.bytes <= GROQ_MAX_AUDIO_BYTES;
+
+  if (wantsGroq && input.groqApiKey !== undefined && groqFits) {
+    try {
+      const audioBytes = await downloadAudioBytes(input.audioUrl, GROQ_MAX_AUDIO_BYTES);
+      const groq = await transcribeWithGroq(audioBytes, mimeType, input.groqApiKey);
+      const segments = windowSegments(groq.raw);
+      logger.info({ audioUrl: input.audioUrl.slice(0, 120), count: segments.length }, '[AudioTranscript] Success via Groq Whisper tier');
+      return {
+        text: groq.raw.length > 0 ? fullTextFromWindows(segments) : groq.text,
+        segments,
+        tier: 'groq-whisper',
+        hasCaptions: false,
+        language: groq.language,
+        usage: {
+          provider: 'groq',
+          audioDurationSeconds: groq.durationSeconds,
+          estimatedCostUsd: (groq.durationSeconds / 3600) * GROQ_TURBO_COST_PER_HOUR_USD,
+        },
+      };
+    } catch (err) {
+      tierErrors['groq-whisper'] = err instanceof Error ? err.message : String(err);
+      logger.warn({ audioUrl: input.audioUrl.slice(0, 120) }, '[AudioTranscript] Groq Whisper tier failed');
+    }
+  } else if (wantsGroq && !groqFits) {
+    tierErrors['groq-whisper'] = `skipped: ${Math.round((probe.bytes ?? 0) / 1024 / 1024)}MB exceeds Groq's ${Math.round(GROQ_MAX_AUDIO_BYTES / 1024 / 1024)}MB cap`;
+  }
+
+  if (wantsDeepgram && input.deepgramApiKey !== undefined) {
+    try {
+      const audioBytes = await downloadAudioBytes(input.audioUrl, DEEPGRAM_MAX_AUDIO_BYTES);
+      const deepgram = await transcribeWithDeepgram(audioBytes, mimeType, input.deepgramApiKey);
+      const segments = windowSegments(deepgram.raw);
+      logger.info({ audioUrl: input.audioUrl.slice(0, 120), count: segments.length }, '[AudioTranscript] Success via Deepgram tier');
+      return {
+        text: deepgram.raw.length > 0 ? fullTextFromWindows(segments) : deepgram.text,
+        segments,
+        tier: 'deepgram',
+        hasCaptions: false,
+        language: deepgram.language,
+        usage: {
+          provider: 'deepgram',
+          audioDurationSeconds: deepgram.durationSeconds,
+          estimatedCostUsd: (deepgram.durationSeconds / 60) * DEEPGRAM_NOVA3_COST_PER_MINUTE_USD,
+        },
+      };
+    } catch (err) {
+      tierErrors['deepgram'] = err instanceof Error ? err.message : String(err);
+      logger.warn({ audioUrl: input.audioUrl.slice(0, 120) }, '[AudioTranscript] Deepgram tier failed');
+    }
+  }
+
+  logger.error({ audioUrl: input.audioUrl.slice(0, 120) }, '[AudioTranscript] All transcript tiers failed');
+  throw new TranscriptUnavailableError(input.audioUrl, tierErrors);
 }

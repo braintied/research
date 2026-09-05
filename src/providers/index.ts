@@ -203,8 +203,13 @@ export {
   canonicalizeInstagramProfileUrl,
   canonicalizeInstagramStoriesUrl,
   parseInstagramStoriesUrl,
+  discoverInstagramProfilePosts,
 } from './instagram.js';
-export type { InstagramStoriesTarget } from './instagram.js';
+export type {
+  InstagramStoriesTarget,
+  InstagramProfilePostsInput,
+  NormalizedInstagramPost,
+} from './instagram.js';
 export { resolveGitHubPublicAuthState } from './github.js';
 export type { GitHubPublicAuthCode, GitHubPublicAuthState } from './github.js';
 

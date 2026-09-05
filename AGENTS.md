@@ -3,7 +3,7 @@
 How a coding agent runs `@braintied/research`. Humans can start at
 [README.md](./README.md). This file is the contract.
 
-**1.6.0** · package-owned skill: `skills/run-braintied-research/`.
+**1.7.0** · package-owned skill: `skills/run-braintied-research/`.
 
 Edit `braintied/stack` → `packages/research/oss/`, then:
 

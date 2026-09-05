@@ -162,6 +162,7 @@ export {
   createFacebookGroupsProvider,
   createTiktokProvider,
   createInstagramProvider,
+  discoverInstagramProfilePosts,
   BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID,
   BRIGHTDATA_INSTAGRAM_PROFILES_DATASET_ID,
   APIFY_INSTAGRAM_STORIES_ACTOR_ID,
@@ -183,6 +184,8 @@ export {
 } from './providers/index.js';
 export type {
   InstagramStoriesTarget,
+  InstagramProfilePostsInput,
+  NormalizedInstagramPost,
   ProviderRegistry,
   PollSnapshotOptions,
   ScrapeDatasetOptions,
@@ -289,6 +292,7 @@ export * from './documents/index.js';
 // YouTube channel ingestion — Data API v3 channel catalog, playlists,
 // metadata, and comment trees. All keys are function arguments.
 export {
+  resolveChannelId,
   listChannelVideos,
   getChannelPlaylists,
   getPlaylistVideoIds,
@@ -303,9 +307,15 @@ export type {
   YoutubeComment,
 } from './youtube/index.js';
 
+// RSS/Atom feed reader — the podcast lane's transport, exported so a host can
+// size a catalog run (episode count, durations) before it approves the spend.
+export { fetchRssFeed } from './advice-rss.js';
+export type { FeedItem, FeedResult } from './advice-rss.js';
+
 // Unified YouTube transcript stack — captions → Groq Whisper → Deepgram.
-export { extractTranscriptWithFallback, TranscriptUnavailableError } from './transcript/index.js';
+export { extractTranscriptWithFallback, transcribeAudioUrl, TranscriptUnavailableError } from './transcript/index.js';
 export type {
+  AudioTranscriptInput,
   TranscriptResult,
   TranscriptSegmentWindow,
   TranscriptTier,

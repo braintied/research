@@ -357,3 +357,63 @@ export async function buildPlaylistMembership(input: {
   );
   return membership;
 }
+
+// =============================================================================
+// Channel identifier resolution
+// =============================================================================
+
+const CHANNEL_ID_PATTERN = /^UC[\w-]{22}$/;
+
+/**
+ * Turn whatever a human pasted into a channel id: a bare `UC…` id, a
+ * `/channel/UC…` URL, or an `@handle` (bare or as a URL). Handles need the
+ * Data API (`channels?forHandle=`), which is one quota unit.
+ */
+export async function resolveChannelId(input: {
+  identifier: string;
+  youtubeApiKey?: string;
+}): Promise<string> {
+  const raw = input.identifier.trim();
+  if (CHANNEL_ID_PATTERN.test(raw)) return raw;
+
+  let handle: string | null = null;
+  if (raw.startsWith('http://') || raw.startsWith('https://') || raw.includes('youtube.com/')) {
+    const url = new URL(raw.startsWith('http') ? raw : `https://${raw}`);
+    const segments = url.pathname.split('/').filter(Boolean);
+    const channelIdx = segments.indexOf('channel');
+    if (channelIdx !== -1) {
+      const id = segments[channelIdx + 1];
+      if (id !== undefined && CHANNEL_ID_PATTERN.test(id)) return id;
+    }
+    const at = segments.find((seg) => seg.startsWith('@'));
+    if (at !== undefined) handle = at.slice(1);
+  } else if (raw.startsWith('@')) {
+    handle = raw.slice(1);
+  }
+
+  if (handle === null || handle.length === 0) {
+    throw new Error(`YouTube identifier is not a channel id, /channel/ URL, or @handle: ${raw.slice(0, 80)}`);
+  }
+  if (input.youtubeApiKey === undefined || input.youtubeApiKey.length === 0) {
+    throw new Error(`Resolving YouTube handle @${handle} needs youtubeApiKey (channels?forHandle)`);
+  }
+
+  await throttleYoutubeApiCall();
+  const params = new URLSearchParams({ part: 'id', forHandle: handle, key: input.youtubeApiKey });
+  const response = await fetch(`${YT_API_BASE}/channels?${params.toString()}`, {
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!response.ok) {
+    throw new Error(`YouTube channels?forHandle failed: HTTP ${response.status}`);
+  }
+  const parsed = HandleLookupSchema.parse(await response.json());
+  const id = parsed.items[0]?.id;
+  if (id === undefined) {
+    throw new Error(`YouTube handle @${handle} resolved to no channel`);
+  }
+  return id;
+}
+
+const HandleLookupSchema = z.object({
+  items: z.array(z.object({ id: z.string().min(1) })).default([]),
+});
