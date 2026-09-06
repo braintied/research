@@ -312,6 +312,41 @@ test('site catalog takes same-host sitemap pages, follows a sitemap index, and c
   assert.equal(result.costUsd, 0);
 });
 
+test('podcast catalog keys each episode by its enclosure, not the show-page <link>', async () => {
+  const showPage = (n: number): FeedResult['items'][number] => ({ ...episode(n, `https://cdn.example/${n}.mp3`), url: 'https://www.fighterpilotpodcast.com/' });
+  const result = await ingestCatalog({}, source({ sourceType: 'podcast', identifier: 'https://feeds.example/fpp' }),
+    { mode: 'catalog', transcribe: false }, { maxItems: 10, recencyDays: 0 }, new Date(),
+    { fetchFeed: async () => feed([
+      showPage(1), showPage(2), showPage(3),
+      { ...episode(4, null), url: 'https://www.fighterpilotpodcast.com/' },
+      { ...episode(5, null), url: 'https://www.fighterpilotpodcast.com/' },
+    ]) });
+  assert.equal(result.items.length, 5);
+  // Three enclosures stay three; the two link-only episodes share one hash and
+  // will collapse at the store, which is the pre-fix behaviour for all five.
+  assert.equal(new Set(result.items.map((item) => item.urlHash)).size, 4, 'three enclosures plus one shared show page');
+  assert.deepEqual(result.items.slice(0, 3).map((item) => item.url), ['https://cdn.example/1.mp3', 'https://cdn.example/2.mp3', 'https://cdn.example/3.mp3']);
+  assert.equal(result.items[3]?.url, 'https://www.fighterpilotpodcast.com/', 'no enclosure: the link is all there is');
+});
+
+test('generic rss catalog keeps the article link even when an enclosure is present', async () => {
+  const result = await ingestCatalog({}, source({ sourceType: 'rss', identifier: 'https://feeds.example/blog' }),
+    { mode: 'catalog', transcribe: false }, { maxItems: 10, recencyDays: 0 }, new Date(),
+    { fetchFeed: async () => feed([episode(1, 'https://cdn.example/1.mp3')]) });
+  assert.equal(result.items[0]?.url, 'https://feeds.example/fpp/1');
+});
+
+test('listSitemapPages names itself: every sitemap request carries a User-Agent', async () => {
+  const agents: Array<string | undefined> = [];
+  const pages = await listSitemapPages('https://www.example.test', 10, async (url, options) => {
+    agents.push(options?.headers?.['User-Agent']);
+    return { finalUrl: url, headers: {}, ok: true, status: 200, text: '<urlset><url><loc>https://www.example.test/about</loc></url></urlset>' };
+  });
+  assert.deepEqual(pages, ['https://www.example.test', 'https://www.example.test/about']);
+  assert.equal(agents.length, 1);
+  assert.match(agents[0] ?? '', /^OraResearch\/1\.0/);
+});
+
 test('listSitemapPages returns only the seed page when the site has no sitemap', async () => {
   const pages = await listSitemapPages('https://nositemap.test/home', 10,
     async (url) => ({ finalUrl: url, headers: {}, ok: false, status: 404, text: '' }));

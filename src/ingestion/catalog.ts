@@ -294,7 +294,16 @@ async function ingestFeedCatalog(
   const items: IngestedItem[] = [];
   for (const entry of feed.items.slice(0, opts.maxItems)) {
     if (opts.signal?.aborted === true) throw new Error('catalog ingest aborted');
-    if (entry.url.length === 0) { bump(skipped, 'no_url'); continue; }
+    // A podcast episode is its audio file. The feed's <link> is usually the
+    // show's homepage, the same one on every episode: the Fighter Pilot Podcast
+    // feed carries 345 episodes and 13 distinct links, so keying on <link>
+    // stored 18 of them (measured 2026-09-04). The parser already falls back to
+    // the enclosure when <link> is absent; catalog mode prefers it whenever it
+    // exists. Generic RSS keeps the article link, which is the article.
+    const episodeUrl = sourceType === 'podcast' && entry.audioUrl !== null && entry.audioUrl.length > 0
+      ? entry.audioUrl
+      : entry.url;
+    if (episodeUrl.length === 0) { bump(skipped, 'no_url'); continue; }
     let contentMd = entry.description.trim();
 
     if (catalog.transcribe && (catalog.maxTranscripts === undefined || transcripts.attempted < catalog.maxTranscripts)) {
@@ -314,7 +323,7 @@ async function ingestFeedCatalog(
         } catch (err) {
           bump(skipped, 'transcript_unavailable');
           logger.warn(
-            { url: entry.url, error: err instanceof Error ? err.message : String(err) },
+            { url: episodeUrl, error: err instanceof Error ? err.message : String(err) },
             '[catalog] Episode transcript unavailable; keeping show-notes item',
           );
         }
@@ -324,8 +333,8 @@ async function ingestFeedCatalog(
     items.push(buildIngestedItem({
       sourceId: source.id,
       sourceType,
-      url: entry.url,
-      title: entry.title.length > 0 ? entry.title : entry.url,
+      url: episodeUrl,
+      title: entry.title.length > 0 ? entry.title : episodeUrl,
       contentMd,
       author: feed.feedTitle.length > 0 ? feed.feedTitle : null,
       publishedAt: entry.publishedAt,
@@ -341,6 +350,17 @@ async function ingestFeedCatalog(
 // =============================================================================
 
 const LOC_PATTERN = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
+
+/**
+ * Sent on every sitemap request. `fetchPublicText` sets no User-Agent of its
+ * own, and a request with none is what site builders refuse: Duda answered
+ * tuckerhamilton.com/sitemap.xml with 403 to a bare request and 200 to any
+ * named agent (measured 2026-09-04). Same identity the RSS provider sends.
+ */
+const SITEMAP_HEADERS: Readonly<Record<string, string>> = {
+  'User-Agent': 'OraResearch/1.0 (catalog; contact: team@braintied.com)',
+  Accept: 'application/xml,text/xml;q=0.9,*/*;q=0.8',
+};
 
 function locsFrom(xml: string): string[] {
   const out: string[] = [];
@@ -370,6 +390,7 @@ export async function listSitemapPages(
   let response;
   try {
     response = await fetchText(sitemapUrl, {
+      headers: SITEMAP_HEADERS,
       acceptedContentTypes: ['application/xml', 'text/xml', 'application/rss+xml', 'text/plain', 'text/html'],
       maxBytes: 5 * 1024 * 1024,
     });
@@ -377,7 +398,12 @@ export async function listSitemapPages(
     logger.warn({ sitemapUrl, error: err instanceof Error ? err.message : String(err) }, '[catalog] sitemap fetch failed');
     return pages;
   }
-  if (!response.ok) return pages;
+  if (!response.ok) {
+    // Not an exception path, so it used to return the seed page in silence and
+    // a 10-page site harvested as 1 with nothing in the log to say why.
+    logger.warn({ sitemapUrl, status: response.status }, '[catalog] sitemap refused; harvesting the seed page only');
+    return pages;
+  }
 
   let locs = locsFrom(response.text);
   const childSitemaps = locs.filter((loc) => /sitemap[^/]*\.xml(\?.*)?$/i.test(loc));
@@ -386,6 +412,7 @@ export async function listSitemapPages(
     for (const child of childSitemaps.slice(0, 20)) {
       try {
         const childResponse = await fetchText(child, {
+          headers: SITEMAP_HEADERS,
           acceptedContentTypes: ['application/xml', 'text/xml', 'text/plain'],
           maxBytes: 5 * 1024 * 1024,
         });

@@ -1,3 +1,12 @@
+## 1.7.1
+
+### Patch Changes
+
+- 30d7e1c: Catalog mode, two defects the first real harvest exposed (Tucker Hamilton, 2026-09-04):
+
+  - Podcast episodes are keyed by their enclosure, not the feed's `<link>`. The Fighter Pilot Podcast feed carries 345 episodes and 13 distinct links (the show homepage on most of them), so the catalog stored 18. Generic RSS still keys on the article link.
+  - Sitemap requests now carry a User-Agent (`fetchPublicText` sets none, and Duda answers a bare request with 403), and a refused sitemap is logged with its status instead of silently harvesting the seed page alone.
+
 ## 1.7.0
 
 ### Minor Changes
