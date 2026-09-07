@@ -204,6 +204,7 @@ export {
   canonicalizeInstagramStoriesUrl,
   parseInstagramStoriesUrl,
   discoverInstagramProfilePosts,
+  InstagramSnapshotPendingError,
 } from './instagram.js';
 export type {
   InstagramStoriesTarget,

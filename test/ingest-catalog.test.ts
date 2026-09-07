@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import test, { afterEach } from 'node:test';
 
 import { ingestSource } from '../src/ingestion/ingest-source.js';
+import { discoverInstagramProfilePosts, InstagramSnapshotPendingError } from '../src/providers/instagram.js';
 import { ingestCatalog, listSitemapPages, parseCatalogConfig } from '../src/ingestion/catalog.js';
 import { transcribeAudioUrl, TranscriptUnavailableError } from '../src/transcript/index.js';
 import { resolveChannelId } from '../src/youtube/channel.js';
@@ -109,6 +110,42 @@ test('instagram catalog enumerates a profile, not a hashtag, and bills per recor
   // Bright Data bills every record it returned, the duplicate included; the
   // dedupe happens on our side after the meter has run.
   assert.ok(Math.abs(result.costUsd - 3 * 0.0015) < 1e-9, `expected 3 billed records, got ${result.costUsd}`);
+});
+
+test('instagram catalog resumes a finished snapshot without triggering a second crawl', async () => {
+  const calls: string[] = [];
+  globalThis.fetch = (async (input: FetchInput) => {
+    const url = hrefOf(input);
+    calls.push(url);
+    if (url.includes('/trigger')) throw new Error('a resume must never trigger');
+    if (url.includes('/progress/')) return json({ status: 'ready' });
+    if (url.includes('/snapshot/')) {
+      return json([{ url: 'https://www.instagram.com/p/RES001/', description: 'resumed post', user_posted: 'cincohamilton', date_posted: '2026-09-01T10:00:00.000Z', likes: 5 }]);
+    }
+    throw new Error(`unexpected ${url}`);
+  }) as typeof fetch;
+  const result = await ingestSource({ brightdata: { apiToken: 'bd-fixture' } }, source({ // git-secret-allow: fake fixture value
+    sourceType: 'instagram',
+    identifier: 'cincohamilton',
+  }), { maxItems: 300, recencyDays: 0, resumeInstagramSnapshotId: 'sd_resume_1' });
+  assert.equal(result.error, null);
+  assert.equal(calls.filter((u) => u.includes('/trigger')).length, 0);
+  assert.ok(calls.some((u) => u.includes('/progress/sd_resume_1')), 'polls the given snapshot');
+  assert.ok(calls.some((u) => u.includes('/snapshot/sd_resume_1')), 'downloads the given snapshot');
+  assert.equal(result.items[0]?.url, 'https://www.instagram.com/p/RES001/');
+});
+
+test('instagram profile discovery that outruns its wait names the snapshot it left running', async () => {
+  globalThis.fetch = (async (input: FetchInput) => {
+    const url = hrefOf(input);
+    if (url.includes('/trigger')) return json({ snapshot_id: 'sd_slow_9' });
+    if (url.includes('/progress/')) return json({ status: 'running' });
+    throw new Error(`unexpected ${url}`);
+  }) as typeof fetch;
+  await assert.rejects(
+    discoverInstagramProfilePosts({ brightdata: { apiToken: 'bd-fixture' } }, { username: 'cincohamilton', limit: 10, maxWaitMs: 1 }), // git-secret-allow: fake fixture value
+    (err: unknown) => err instanceof InstagramSnapshotPendingError && err.snapshotId === 'sd_slow_9',
+  );
 });
 
 test('instagram catalog refuses a bad identifier before spending', async () => {

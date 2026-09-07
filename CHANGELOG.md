@@ -1,3 +1,9 @@
+## 1.7.2
+
+### Patch Changes
+
+- 7cae633: Instagram profile discovery waits up to 20 minutes (was 180 s, which gave up on a 247-post crawl Bright Data finished a minute later, records already billed), and a wait that still runs out throws `InstagramSnapshotPendingError` carrying the snapshot id. `discoverInstagramProfilePosts({ resumeSnapshotId })`, `CatalogIngestOptions.resumeInstagramSnapshotId` and `IngestSourceOptions.resumeInstagramSnapshotId` collect that snapshot without a second crawl.
+
 ## 1.7.1
 
 ### Patch Changes

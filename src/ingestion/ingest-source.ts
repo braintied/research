@@ -205,6 +205,7 @@ export async function ingestSource(
         maxItems,
         recencyDays,
         signal: opts.signal,
+        ...(opts.resumeInstagramSnapshotId === undefined ? {} : { resumeInstagramSnapshotId: opts.resumeInstagramSnapshotId }),
       });
       // Same dedupe contract as the sweep lanes: one item per url_hash, then
       // the caller's ceiling. A profile crawl can return one post twice.

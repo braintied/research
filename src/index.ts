@@ -163,6 +163,7 @@ export {
   createTiktokProvider,
   createInstagramProvider,
   discoverInstagramProfilePosts,
+  InstagramSnapshotPendingError,
   BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID,
   BRIGHTDATA_INSTAGRAM_PROFILES_DATASET_ID,
   APIFY_INSTAGRAM_STORIES_ACTOR_ID,

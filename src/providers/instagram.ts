@@ -48,6 +48,28 @@ const DOWNLOAD_TIMEOUT_MS = 60_000;
 const SCRAPE_TIMEOUT_MS = 90_000;
 const POLL_INTERVAL_MS = 5_000;
 const POLL_MAX_WAIT_MS = 180_000;
+/**
+ * A profile discovery crawl is not a single-post scrape. Bright Data took
+ * about four minutes to return 247 posts for one account (2026-09-07), so
+ * the 180 s ceiling that suits a post or hashtag pull gave up with the
+ * snapshot still running and the records already billed. Twenty minutes,
+ * and the timeout carries the snapshot id so the caller can resume it.
+ */
+const PROFILE_DISCOVERY_MAX_WAIT_MS = 20 * 60_000;
+
+/**
+ * Thrown when a Bright Data snapshot is still running at the wait ceiling.
+ * The snapshot keeps running on Bright Data's side and is billed once; pass
+ * `snapshotId` back as `resumeSnapshotId` to collect it without a second crawl.
+ */
+export class InstagramSnapshotPendingError extends Error {
+  readonly snapshotId: string;
+  constructor(snapshotId: string, waitedMs: number) {
+    super(`Bright Data Instagram snapshot ${snapshotId} still running after ${Math.round(waitedMs / 1000)}s; resume it with resumeSnapshotId`);
+    this.name = 'InstagramSnapshotPendingError';
+    this.snapshotId = snapshotId;
+  }
+}
 const MAX_SEARCH_RESULTS = 25;
 const MAX_HASHTAGS_PER_SEARCH = 2;
 
@@ -673,11 +695,12 @@ async function waitForSnapshot(
   snapshotId: string,
   token: string,
   signal?: AbortSignal,
+  maxWaitMs: number = POLL_MAX_WAIT_MS,
 ): Promise<void> {
   const endpoint = `${BRIGHTDATA_BASE_URL}/progress/${encodeURIComponent(snapshotId)}`;
   const startedAt = Date.now();
 
-  while (Date.now() - startedAt < POLL_MAX_WAIT_MS) {
+  while (Date.now() - startedAt < maxWaitMs) {
     const response = await fetchWithTimeout(endpoint, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}` },
@@ -695,7 +718,7 @@ async function waitForSnapshot(
     await abortableSleep(POLL_INTERVAL_MS, signal);
   }
 
-  throw new Error(`Bright Data Instagram snapshot timed out after ${POLL_MAX_WAIT_MS}ms`);
+  throw new InstagramSnapshotPendingError(snapshotId, maxWaitMs);
 }
 
 async function downloadSnapshotRecords(
@@ -738,6 +761,13 @@ export interface InstagramProfilePostsInput {
   /** ISO date (YYYY-MM-DD); only posts on or after it are discovered. */
   since?: string;
   signal?: AbortSignal;
+  /**
+   * A snapshot id from an earlier InstagramSnapshotPendingError. Skips the
+   * trigger (and its bill) and collects that snapshot instead.
+   */
+  resumeSnapshotId?: string;
+  /** Wait ceiling for the crawl; default PROFILE_DISCOVERY_MAX_WAIT_MS (20 min). */
+  maxWaitMs?: number;
 }
 
 function usernameFromIdentifier(value: string): string | null {
@@ -811,8 +841,14 @@ export async function discoverInstagramProfilePosts(
     throw new RangeError('Instagram profile discovery needs a positive post limit');
   }
   const limit = Math.floor(input.limit);
-  const snapshotId = await triggerProfileDiscovery(username, limit, input.since, token, input.signal);
-  await waitForSnapshot(snapshotId, token, input.signal);
+  const maxWaitMs = input.maxWaitMs !== undefined ? input.maxWaitMs : PROFILE_DISCOVERY_MAX_WAIT_MS;
+  const snapshotId = input.resumeSnapshotId !== undefined && input.resumeSnapshotId.length > 0
+    ? input.resumeSnapshotId
+    : await triggerProfileDiscovery(username, limit, input.since, token, input.signal);
+  if (input.resumeSnapshotId !== undefined) {
+    logger.info({ username, snapshotId }, '[Instagram] Resuming Bright Data profile discovery snapshot');
+  }
+  await waitForSnapshot(snapshotId, token, input.signal, maxWaitMs);
   const records = await downloadSnapshotRecords(snapshotId, token, input.signal);
   const posts = records
     .map(record => normalizeInstagramRecord(record))

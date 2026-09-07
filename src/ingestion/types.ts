@@ -129,4 +129,10 @@ export interface IngestSourceOptions {
   recencyDays?: number;
   /** Abort signal forwarded to provider HTTP calls. */
   signal?: AbortSignal;
+  /**
+   * Catalog mode, Instagram lane: collect a snapshot an earlier run timed out
+   * on (InstagramSnapshotPendingError.snapshotId) instead of triggering a new
+   * crawl. Runtime only; a stored source never carries it.
+   */
+  resumeInstagramSnapshotId?: string;
 }

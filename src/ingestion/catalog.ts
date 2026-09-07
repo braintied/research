@@ -75,6 +75,12 @@ export interface CatalogIngestOptions {
   maxItems: number;
   recencyDays: number;
   signal?: AbortSignal;
+  /**
+   * Runtime only, never stored on a source: collect an Instagram profile
+   * snapshot an earlier run triggered and timed out on, instead of paying
+   * for a second crawl.
+   */
+  resumeInstagramSnapshotId?: string;
 }
 
 /**
@@ -224,6 +230,7 @@ async function ingestInstagramCatalog(
     limit: opts.maxItems,
     ...(cutoff === null ? {} : { since: cutoff.toISOString().slice(0, 10) }),
     ...(opts.signal === undefined ? {} : { signal: opts.signal }),
+    ...(opts.resumeInstagramSnapshotId === undefined ? {} : { resumeSnapshotId: opts.resumeInstagramSnapshotId }),
   });
 
   const items = posts.map((post) => {
