@@ -13,6 +13,12 @@ export {
   CONTRACTOR_TAXONOMY,
   type CategorizeTaxonomy,
 } from './categorize.js';
+export {
+  PUBLIC_FIGURE_CATEGORIES,
+  PUBLIC_FIGURE_TAXONOMY,
+  publicFigureTaxonomy,
+  type PublicFigureCategory,
+} from './public-figure.js';
 export { embedItems } from './embed-items.js';
 export { buildIngestedItem, toExcerpt } from './build-item.js';
 export type { BuildItemInput } from './build-item.js';

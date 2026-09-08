@@ -1,3 +1,28 @@
+## 1.8.0
+
+### Minor Changes
+
+- Add `publicFigureTaxonomy(subjectName, descriptor)` and `PUBLIC_FIGURE_TAXONOMY`: a
+  categorizer taxonomy for a corpus that is ONE PERSON'S published output, classified by
+  the job an item can do for a repurposing team rather than by subject matter. Categories
+  are thesis / origin_story / doctrine / craft / promotion / tribute / guest_subject /
+  press / other.
+
+  `guest_subject` is the category that earns its place: a person corpus built from an
+  interview show is mostly other people talking, and an engine that cannot separate the
+  host's material from a guest's publishes a guest's sentence under the host's name. It
+  is a weak signal read from an 800-character head — it narrows what a human or an
+  utterance-level speaker check has to look at, and never establishes who spoke.
+
+  `quoteVoice` deliberately refuses to presume the speaker, and both arguments to
+  `publicFigureTaxonomy` throw when blank: the name reaches five prompt fields and a
+  partial substitution is invisible in the output.
+
+  Measured 2026-09-08 on a 422-item person corpus: `category` was `'other'`, `quotes`
+  was `[]` and `why_it_matters` was `NULL` on every row, because the only taxonomy that
+  existed classified for contractors. `CONTRACTOR_TAXONOMY` is unchanged and shares no
+  category name except `other`.
+
 ## 1.7.2
 
 ### Patch Changes
