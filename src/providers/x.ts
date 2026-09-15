@@ -44,7 +44,7 @@ import {
 } from '../types.js';
 import { extractQuotesWithGemini } from './gemini-extractor.js';
 
-type XBackend = 'x_api_v2' | 'twitterapi_io' | 'apify';
+export type XBackend = 'x_api_v2' | 'twitterapi_io' | 'apify';
 
 // Apify is last-resort only — imported gate lives in credentials.
 
@@ -1333,4 +1333,159 @@ export function createXProvider(credentials: ResearchCredentials): SearchProvide
       });
     },
   };
+}
+
+// =============================================================================
+// Raw tweet chain — transport-level multi-backend fetch for external consumers
+// =============================================================================
+
+/**
+ * One backend's outcome in the fallback chain, in chain order. `ok` is true
+ * only for the backend that produced the returned payload; every earlier
+ * backend records `ok: false` with the logged reason. A backend whose
+ * credential resolves to null is SKIPPED (never attempted) and is therefore
+ * absent from this array.
+ */
+export interface XBackendAttempt {
+  backend: XBackend;
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * Raw, verbatim tweet payload from the winning backend, plus which backend it
+ * came from and the full fallback trail. Nothing here is normalized into the
+ * package's `TweetItem` shape — the payload is returned exactly as the winning
+ * transport produced it, so a consumer that already owns a rich X assembler can
+ * feed it straight in and keep its enrichment (threadPosts, notableReplies,
+ * quoteTweets, communityTake, author followers/verified/bio, ...) intact.
+ */
+export interface XTweetChainResult {
+  /**
+   * Raw tweet records from the winning backend, verbatim:
+   * - `twitterapi_io`: the raw `tweets` array from GET /twitter/tweets
+   *   (apidojo camelCase: `id`, `text`, `author{...}`, `createdAt`, `likeCount`, ...).
+   * - `x_api_v2`: the raw official post object(s) from the `data` field of the
+   *   GET /2/tweets/<id> envelope (snake_case: `id`, `text`, `author_id`,
+   *   `public_metrics{...}`, ...). Author expansion is carried in `includes`.
+   * - `apify`: the raw dataset items from `apidojo/tweet-scraper` (camelCase,
+   *   author embedded per item).
+   */
+  tweets: unknown[];
+  /** The backend that produced `tweets`. */
+  backend: XBackend;
+  /**
+   * `x_api_v2` only: the raw `includes.users` expansion that accompanies the
+   * post (author `id`, `name`, `username`). Absent for the other backends,
+   * whose author data is embedded in each tweet record.
+   */
+  includes?: unknown[];
+  /** One entry per actually-attempted backend, in chain order. */
+  attempts: ReadonlyArray<XBackendAttempt>;
+}
+
+export interface XTweetChainOptions {
+  /** Optional cancellation. An abort is rethrown, never treated as a backend failure. */
+  signal?: AbortSignal;
+}
+
+/**
+ * Fetch one tweet's raw payload through the declared X backend chain in the
+ * documented order (`twitterapi_io` → `x_api_v2` → `apify`), falling through on
+ * any single backend's failure so the X lane survives one vendor going down.
+ *
+ * This is the transport-level companion to `createXProvider`, NOT a
+ * replacement: `createXProvider` keeps its `SearchProvider` semantics
+ * (search/fetch/extract returning normalized `FetchResult`s), while this
+ * returns the raw payload a rich assembler needs. Credentials are read from the
+ * passed record (`credentials.x` / `credentials.apifyApiToken`); like the rest
+ * of this module, no `process.env` is read here.
+ */
+export async function fetchTweetWithBackends(
+  credentials: ResearchCredentials,
+  tweetId: string,
+  opts?: XTweetChainOptions,
+): Promise<XTweetChainResult> {
+  const signal = opts?.signal;
+  const attempts: XBackendAttempt[] = [];
+
+  // 1. twitterapi.io (primary)
+  const twitterApiKey = twitterApiKeyOf(credentials);
+  if (twitterApiKey !== null) {
+    try {
+      const raw = await twitterApiGet('/twitter/tweets', { tweet_ids: tweetId }, twitterApiKey);
+      if (raw.length > 0) {
+        attempts.push({ backend: 'twitterapi_io', ok: true });
+        return { tweets: raw, backend: 'twitterapi_io', attempts };
+      }
+      attempts.push({ backend: 'twitterapi_io', ok: false, error: 'no tweet returned for id' });
+      logger.warn({ tweetId }, '[X] twitterapi.io returned no tweet for id — falling back');
+    } catch (err) {
+      if (signal?.aborted === true) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      attempts.push({ backend: 'twitterapi_io', ok: false, error: msg.slice(0, 200) });
+      logger.warn({ tweetId, error: msg.slice(0, 120) }, '[X] twitterapi.io fetch failed — falling back');
+    }
+  }
+
+  // 2. Official X API v2 (secondary)
+  const bearerToken = officialXBearerToken(credentials);
+  if (bearerToken !== null) {
+    try {
+      const envelope = await officialXGet(
+        `/tweets/${encodeURIComponent(tweetId)}`,
+        {
+          'tweet.fields': OFFICIAL_X_TWEET_FIELDS,
+          expansions: 'author_id',
+          'user.fields': 'id,name,username',
+        },
+        bearerToken,
+        signal,
+      );
+      const posts = officialEnvelopePosts(envelope);
+      if (posts.length > 0) {
+        attempts.push({ backend: 'x_api_v2', ok: true });
+        const users = envelope.includes?.users;
+        return {
+          tweets: posts,
+          ...(users !== undefined ? { includes: users } : {}),
+          backend: 'x_api_v2',
+          attempts,
+        };
+      }
+      attempts.push({ backend: 'x_api_v2', ok: false, error: 'no post returned for id' });
+      logger.warn({ tweetId }, '[X] Official API returned no post for id — falling back to Apify');
+    } catch (err) {
+      if (signal?.aborted === true) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      attempts.push({ backend: 'x_api_v2', ok: false, error: msg.slice(0, 200) });
+      logger.warn({ tweetId, error: msg.slice(0, 120) }, '[X] Official API fetch failed — falling back to Apify');
+    }
+  }
+
+  // 3. Apify (last resort, gated by APIFY_ALLOW_FALLBACK)
+  const apifyToken = apifyTokenOf(credentials);
+  if (!isApifyFallbackAllowed(credentials) || apifyToken === null) {
+    throw new Error(
+      'No usable X backend (twitterapi.io and official X API failed or unset; Apify fallback disabled unless APIFY_ALLOW_FALLBACK=1)',
+    );
+  }
+
+  try {
+    await apifyRateLimit();
+    const { runId, datasetId } = await startApifyRun(
+      ACTOR_ID,
+      { tweetIds: [tweetId], includeReplies: true, maxTweets: 50 },
+      apifyToken,
+    );
+    await pollRunUntilDone(runId, apifyToken);
+    const items = await fetchDatasetItems(datasetId, apifyToken);
+    attempts.push({ backend: 'apify', ok: true });
+    return { tweets: items, backend: 'apify', attempts };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    attempts.push({ backend: 'apify', ok: false, error: msg.slice(0, 200) });
+    logger.warn({ tweetId, error: msg.slice(0, 120) }, '[X] Apify fetch failed (last backend)');
+    throw err;
+  }
 }

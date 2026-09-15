@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { createXProvider } from '../src/providers/x.js';
+import { createXProvider, fetchTweetWithBackends } from '../src/providers/x.js';
 import type { ResearchCredentials } from '../src/credentials.js';
 
 const twitterApiAdvancedSearchFixture: unknown = JSON.parse(
@@ -329,6 +329,116 @@ test('official recent search falls through instead of truncating a requested 90-
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.pathname, '/twitter/tweet/advanced_search');
     assert.equal(results[0]?.raw_metadata['backend'], 'twitterapi_io');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('fetchTweetWithBackends falls through to x_api_v2 when twitterapi.io returns a 402 balance failure', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
+    calls.push(`${url.origin}${url.pathname}`);
+
+    if (url.origin === 'https://api.twitterapi.io') {
+      assert.equal(url.pathname, '/twitter/tweets');
+      assert.equal(url.searchParams.get('tweet_ids'), '123');
+      assert.equal(new Headers(init?.headers).get('x-api-key'), 'primary-test-token');
+      // Mirrors the live twitterapi.io failure: prepaid balance exhausted → 402.
+      return new Response(
+        JSON.stringify({ error: 'Unauthorized', message: 'Credits is not enough.Please recharge' }),
+        { status: 402 },
+      );
+    }
+
+    assert.equal(url.origin, 'https://api.x.com');
+    assert.equal(url.pathname, '/2/tweets/123');
+    assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer official-test-token');
+    return Response.json({
+      data: {
+        id: '123',
+        text: 'Fallback post from the official API',
+        author_id: 'author-1',
+        conversation_id: '123',
+        created_at: new Date(Date.now() - 60_000).toISOString(),
+        public_metrics: { like_count: 7, reply_count: 2, impression_count: 70 },
+      },
+      includes: { users: [{ id: 'author-1', username: 'fallbackuser', name: 'Fallback User' }] },
+    });
+  }) as typeof fetch;
+
+  try {
+    const result = await fetchTweetWithBackends(
+      xCredentials({
+        twitterapiKey: 'primary-test-token',  // git-secret-allow: fake fixture value, never a live credential
+        bearerToken: 'official-test-token',  // git-secret-allow: fake fixture value, never a live credential
+      }),
+      '123',
+    );
+
+    assert.deepEqual(calls, [
+      'https://api.twitterapi.io/twitter/tweets',
+      'https://api.x.com/2/tweets/123',
+    ]);
+
+    assert.equal(result.backend, 'x_api_v2');
+    assert.equal(result.attempts.length, 2);
+
+    assert.equal(result.attempts[0]?.backend, 'twitterapi_io');
+    assert.equal(result.attempts[0]?.ok, false);
+    assert.match(result.attempts[0]?.error ?? '', /HTTP 402/);
+
+    assert.equal(result.attempts[1]?.backend, 'x_api_v2');
+    assert.equal(result.attempts[1]?.ok, true);
+
+    const tweets = result.tweets as Array<{ id: string; text: string; author_id: string }>;
+    assert.equal(tweets.length, 1);
+    assert.equal(tweets[0]?.text, 'Fallback post from the official API');
+    assert.equal(tweets[0]?.author_id, 'author-1');
+
+    const includes = result.includes as Array<{ id: string; username: string }>;
+    assert.equal(includes[0]?.username, 'fallbackuser');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('fetchTweetWithBackends returns the primary backend raw payload without touching the fallback', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
+    calls.push(`${url.origin}${url.pathname}`);
+    assert.equal(url.origin, 'https://api.twitterapi.io');
+    assert.equal(url.pathname, '/twitter/tweets');
+    assert.equal(new Headers(init?.headers).get('x-api-key'), 'primary-test-token');
+    return Response.json({
+      tweets: [{
+        id: '7003',
+        text: 'Primary raw payload',
+        createdAt: new Date(Date.now() - 60_000).toISOString(),
+        author: { userName: 'primary' },
+      }],
+    });
+  }) as typeof fetch;
+
+  try {
+    const result = await fetchTweetWithBackends(
+      xCredentials({ twitterapiKey: 'primary-test-token' }),  // git-secret-allow: fake fixture value, never a live credential
+      '7003',
+    );
+
+    assert.equal(result.backend, 'twitterapi_io');
+    assert.equal(result.attempts.length, 1);
+    assert.equal(result.attempts[0]?.ok, true);
+    assert.equal(result.includes, undefined);
+    assert.equal(calls.length, 1);
+
+    const tweets = result.tweets as Array<{ id: string; text: string }>;
+    assert.equal(tweets[0]?.text, 'Primary raw payload');
   } finally {
     globalThis.fetch = originalFetch;
   }

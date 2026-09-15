@@ -28,7 +28,7 @@ import { createCrawl4aiProvider } from './crawl4ai.js';
 import { createFacebookGroupsProvider } from './facebook-groups.js';
 import { createTiktokProvider } from './tiktok.js';
 import { createInstagramProvider } from './instagram.js';
-import { createXProvider } from './x.js';
+import { createXProvider, fetchTweetWithBackends } from './x.js';
 import { createPodcastsProvider } from './podcasts.js';
 import { createGithubProvider } from './github.js';
 
@@ -192,9 +192,16 @@ export {
   createTiktokProvider,
   createInstagramProvider,
   createXProvider,
+  fetchTweetWithBackends,
   createPodcastsProvider,
   createGithubProvider,
 };
+export type {
+  XBackend,
+  XBackendAttempt,
+  XTweetChainResult,
+  XTweetChainOptions,
+} from './x.js';
 export {
   BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID,
   BRIGHTDATA_INSTAGRAM_PROFILES_DATASET_ID,
