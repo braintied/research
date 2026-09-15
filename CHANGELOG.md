@@ -1,3 +1,56 @@
+## 1.9.2
+
+### Minor Changes
+
+- Expose `fetchTweetWithBackends(credentials, tweetId, opts?)` (plus the
+  `XBackend`, `XBackendAttempt`, `XTweetChainResult`, `XTweetChainOptions` types)
+  from `providers/x.ts`, re-exported through `providers/index` and the package
+  barrel. It runs the declared X transport chain (`twitterapi_io` -> `x_api_v2`
+  -> `apify`) and returns the RAW winning-backend tweet payload plus the backend
+  that served it and the fallback trail, so a consumer with its own rich X
+  assembler survives one vendor going down. `createXProvider` and the
+  `SearchProvider` contract are unchanged.
+
+  Republished as 1.9.2 (not 1.9.0/1.9.1) to rebuild against the current base:
+  1.9.0/1.9.1 were cut from a stale checkout and pinned unpublished
+  `@braintied/cost@3.3.1`; 1.9.2 pins the published `@braintied/cost@3.4.0` and
+  `@braintied/models@1.10.0`.
+
+## 1.9.0
+
+### Minor Changes
+
+- 6f19cc8: New `./evidence` subpath export: `isVerbatimQuoteSupportedBySource` and
+  `isKeyClaimSupportedBySource` from `src/evidence-validation.ts`.
+
+  They were reachable from nowhere. Both are used inside `src/index.ts` and
+  neither was ever re-exported from it, so a second consumer needing the
+  fail-closed contract — a quote must equal one complete fetched sentence or
+  line, a key claim must too and carry at least four tokens — had no import path
+  and had to copy them. `@braintied/intros` is that second consumer, checking a
+  model's cited evidence against an approved profile field, and its first draft
+  did exactly that: a private `approved.includes(evidence_text)`, which accepts
+  any fragment. A complete-sentence check decays into a substring check the
+  moment it is copied.
+
+  The module is pure string matching with no imports, so it is its own tsup entry
+  and the subpath pulls in none of the engine — no Anthropic or OpenAI SDK, no
+  YouTube libraries, no `@braintied/cost`. The `@internal` tags on the two
+  functions are now public documentation; nothing else changed and no existing
+  export moved.
+
+### Patch Changes
+
+- Updated dependencies [3c2a1a4]
+- Updated dependencies [a68c042]
+- Updated dependencies [4e97d79]
+- Updated dependencies [4e97d79]
+- Updated dependencies [63d6c57]
+- Updated dependencies [63d6c57]
+- Updated dependencies [9896efe]
+  - @braintied/cost@3.4.0
+  - @braintied/models@1.10.0
+
 ## 1.8.0
 
 ### Minor Changes

@@ -49,7 +49,15 @@ function sourceEvidenceUnits(sourceContent: string): string[] {
     .filter((unit) => unit.length > 0);
 }
 
-/** @internal True only when the quote equals one complete fetched sentence/line. */
+/**
+ * True only when the quote equals one complete fetched sentence or line.
+ *
+ * Public through the `./evidence` subpath since 1.9.0. A second consumer
+ * (`@braintied/intros`, checking a model's cited evidence against an approved
+ * profile field) needs exactly this contract, and the alternative to exporting
+ * it was a copy - which is how a complete-sentence check silently becomes a
+ * substring check.
+ */
 export function isVerbatimQuoteSupportedBySource(
   quote: string,
   sourceContent: string,
@@ -60,8 +68,12 @@ export function isVerbatimQuoteSupportedBySource(
 }
 
 /**
- * @internal True only for a material claim equal to one complete fetched
- * sentence or line after conservative presentation normalization.
+ * True only for a material claim equal to one complete fetched sentence or
+ * line after conservative presentation normalization, carrying at least four
+ * tokens.
+ *
+ * Public through the `./evidence` subpath since 1.9.0. See the note on
+ * `isVerbatimQuoteSupportedBySource`.
  */
 export function isKeyClaimSupportedBySource(
   claim: string,
