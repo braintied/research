@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { CONSENTED_PERSON_PROFILE_V1 } from './consented-person.js';
 import { ORA_AGENT_RUNTIME_PROFILE } from './ora-agent-runtime.js';
 import {
   WEB_DESIGN_INTELLIGENCE_PROFILE,
@@ -14,10 +15,15 @@ import {
   type ResearchProfile,
 } from './types.js';
 
+// APPEND, never insert. This is a `readonly [...] as const` tuple, so a
+// consumer reading `RESEARCH_PROFILES[0]` gets a positional type: prepending a
+// profile silently changes what every existing index means, which `check-bump`
+// reports as a major surface change and which it is.
 export const RESEARCH_PROFILES = [
   ORA_AGENT_RUNTIME_PROFILE,
   WEB_DESIGN_INTELLIGENCE_PROFILE,
   WEB_DESIGN_INTELLIGENCE_PROFILE_V1,
+  CONSENTED_PERSON_PROFILE_V1,
 ] as const;
 
 function profileRef(profile: ResearchProfile): string {

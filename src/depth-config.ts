@@ -30,12 +30,19 @@ export interface DepthTunables {
   /** Max URLs fetched per subquery during step 6 (fetch-content). */
   urlsPerSubquery: number;
   /**
-   * Max passes through the critique-and-refine loop (step 9). The loop
-   * already does gap-driven retries: it analyzes the draft, identifies
-   * missing sections / thin sections / providers that should have been
-   * called, generates 10-15 new subqueries via `planSubqueries(refinementHint)`,
-   * and re-runs search → fetch → extract → synthesize for those gaps.
-   * Wide mode just gives the loop more turns before final assembly.
+   * Number of CRITIQUE CALLS in the critique-and-refine loop (step 9), not
+   * the number of refinement rounds. Every pass critiques the draft; every
+   * pass except the last may then plan new subqueries and re-run
+   * search → fetch → extract → synthesize for the gaps. The last pass only
+   * records the final gaps. So:
+   *
+   *   0 → no critique at all
+   *   1 → one critique, ZERO refinement (the loop exits on its last pass)
+   *   2 → critique, one refinement round, final critique
+   *
+   * Both loops that read this knob (`runResearch` here and the Cortex
+   * Worker's deep-research-prompt-runner) share these semantics. Use
+   * `refinementRounds()` rather than reasoning about the raw value.
    */
   critiqueMaxPasses: number;
   /** Hard cost cap for the entire prompt run. */
@@ -80,7 +87,9 @@ export const DEPTH_CONFIG: Record<ResearchDepth, DepthTunables> = {
     subqueriesMin: 5,
     subqueriesMax: 8,
     urlsPerSubquery: 3,
-    critiqueMaxPasses: 1,
+    // 2 = one refinement round. At 1 the loop critiqued and then exited
+    // before refining (see critiqueMaxPasses), so blog never refilled a gap.
+    critiqueMaxPasses: 2,
     hardCapUsd: 1.25,
     targetWordCountMin: 1000,
     targetWordCountMax: 2200,
@@ -91,11 +100,19 @@ export const DEPTH_CONFIG: Record<ResearchDepth, DepthTunables> = {
   // project ~$200/7d; extract volume dominated the bill. Caps cut theoretical
   // fan-out (subqueriesMax × urlsPerSubquery) and hard extract pages ~2×
   // without removing the critique loop.
+  //
+  // 2026-09-24: the 2026-08-01 cost program set critiqueMaxPasses 3 → 1 meaning
+  // to keep one refinement round. Under the loop's semantics 1 is ZERO rounds:
+  // the critique ran, found the gaps, and the loop exited on its last pass.
+  // Measured on the two standard runs of 2026-09-24: 13 of 20 sections were
+  // evidence gaps labelled "after refinement" while no refinement search ever
+  // ran (5 Tavily calls, all before extraction). 2 restores the one round the
+  // cost program intended; the shared maxExtractPages budget still bounds it.
   standard: {
     subqueriesMin: 8,
     subqueriesMax: 16,
     urlsPerSubquery: 4,
-    critiqueMaxPasses: 1,
+    critiqueMaxPasses: 2,
     hardCapUsd: 3.0,
     targetWordCountMin: 800,
     targetWordCountMax: 5000,
@@ -131,6 +148,35 @@ export function coerceDepth(input: string | null | undefined): ResearchDepth {
   if (input === 'blog') return 'blog';
   if (input === 'wide') return 'wide';
   return 'standard';
+}
+
+/**
+ * Refinement rounds a depth actually buys: every critique pass except the
+ * last may refine. `critiqueMaxPasses: 1` is therefore zero rounds.
+ */
+export function refinementRounds(config: Pick<DepthTunables, 'critiqueMaxPasses'>): number {
+  return Math.max(0, config.critiqueMaxPasses - 1);
+}
+
+/**
+ * Extract pages held back from the main pass so a refinement round has pages
+ * to spend on the sections the critique found empty.
+ *
+ * Without a reserve the main pass consumes the whole shared budget (measured
+ * 2026-09-24: 20 of 20 standard pages spent before the first critique), and
+ * a refinement round can search but never extract, so it cannot close a gap.
+ * The reserve is released to the refinement passes; when the draft already
+ * meets the bar it is simply never spent.
+ */
+export const REFINEMENT_EXTRACT_RESERVE_SHARE = 0.3;
+
+export function refinementExtractReserve(
+  config: Pick<DepthTunables, 'critiqueMaxPasses' | 'maxExtractPages'>,
+): number {
+  if (refinementRounds(config) === 0) return 0;
+  const reserve = Math.ceil(config.maxExtractPages * REFINEMENT_EXTRACT_RESERVE_SHARE);
+  // Never starve the main pass: it always keeps at least half the budget.
+  return Math.min(reserve, Math.floor(config.maxExtractPages / 2));
 }
 
 /** Look up tunables for a depth mode. Always returns a valid config. */

@@ -7,10 +7,18 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
+import { assessEvidenceCoverage } from './evidence-coverage.mjs';
 import { assessGrounding } from './grounding-quality.mjs';
 
 const VALID_KINDS = ['answer', 'quick', 'standard', 'deep', 'managed', 'social'];
 const VALID_PROFILE_MODES = ['snapshot', 'update', 'monitor'];
+// Mirrors the Cortex Worker research.run SourceModeSchema. cortex/telegram are
+// trusted-local lanes: the worker refuses a request made only of them.
+const VALID_SOURCE_MODES = [
+  'web', 'x', 'reddit', 'youtube', 'github', 'community', 'instagram', 'tiktok',
+  'facebook_groups', 'cortex', 'telegram', 'all_public', 'all_social', 'all',
+];
+const TRUSTED_ONLY_SOURCE_MODES = new Set(['cortex', 'telegram']);
 const PIPELINE_KINDS = new Set(['quick', 'standard', 'deep', 'social']);
 const DEFAULT_ENDPOINT = 'https://ora-cortex-worker.fly.dev/internal/tools/execute';
 const DEFAULT_KEYCHAIN_SERVICE = 'braintied-agent-auth';
@@ -34,7 +42,11 @@ Options:
   --recency-days <integer>  Recency window for answer or pipeline searches
   --profile <id@version>    Versioned investigation profile
   --profile-mode <mode>     snapshot|update|monitor (requires --profile)
-  --as-of <ISO date/time>   Exact evidence boundary (required with --profile)
+  --sources <csv>           Explicit evidence lanes, each one required:
+                            web,x,reddit,youtube,github,community,... A lane that
+                            finds nothing marks the run partial (exit 2)
+  --as-of <ISO date/time>   Exact evidence boundary (required with --profile
+                            or --sources)
   --endpoint <url>          Internal tool endpoint
   --timeout-seconds <n>     Request timeout, 1-3600
                             (default: 3600 for deep, 1200 otherwise)
@@ -72,6 +84,7 @@ function parseCli() {
       profile: { type: 'string' },
       'profile-mode': { type: 'string' },
       'as-of': { type: 'string' },
+      sources: { type: 'string' },
       endpoint: { type: 'string' },
       'timeout-seconds': { type: 'string' },
       'request-id': { type: 'string' },
@@ -132,6 +145,22 @@ function parseAsOf(raw) {
     throw new Error('--as-of must be a real calendar date.');
   }
   return raw;
+}
+
+function parseSourceModes(raw) {
+  if (raw === undefined) return undefined;
+  const modes = raw.split(',').map((mode) => mode.trim()).filter((mode) => mode !== '');
+  if (modes.length === 0) throw new Error('--sources must name at least one lane.');
+  const unknown = modes.filter((mode) => !VALID_SOURCE_MODES.includes(mode));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown --sources value(s): ${unknown.join(', ')}. Expected: ${VALID_SOURCE_MODES.join(', ')}.`);
+  }
+  if (new Set(modes).size !== modes.length) throw new Error('--sources must not repeat a lane.');
+  if (modes.length > 12) throw new Error('--sources accepts at most 12 lanes.');
+  if (modes.every((mode) => TRUSTED_ONLY_SOURCE_MODES.has(mode))) {
+    throw new Error('--sources needs at least one public lane; cortex/telegram alone are refused by research.run.');
+  }
+  return modes;
 }
 
 function parseRequestId(raw) {
@@ -335,6 +364,7 @@ function createResearchCheckpoint({
   profileRef,
   profileMode,
   asOf,
+  sourceModes,
   timeoutSeconds,
 }) {
   return {
@@ -357,6 +387,7 @@ function createResearchCheckpoint({
     profile_ref: profileRef ?? null,
     profile_mode: profileMode ?? null,
     as_of: asOf ?? null,
+    source_modes: sourceModes ?? null,
     timeout_seconds: timeoutSeconds,
   };
 }
@@ -933,6 +964,7 @@ async function main() {
   const profileRef = parseProfileRef(values.profile);
   const profileMode = parseProfileMode(values['profile-mode']);
   const asOf = parseAsOf(values['as-of']);
+  const sourceModes = parseSourceModes(values.sources);
   const requestedRequestId = parseRequestId(values['request-id']);
   if (values.probe === true && values.check !== true && values['dry-run'] !== true) {
     throw new Error('--probe is supported only with --check or --dry-run.');
@@ -950,8 +982,11 @@ async function main() {
   if (profileRef !== undefined && asOf === undefined) {
     throw new Error('--as-of is required with --profile.');
   }
-  if (profileRef === undefined && asOf !== undefined) {
-    throw new Error('--as-of currently requires --profile on the internal runner.');
+  if (sourceModes !== undefined && asOf === undefined) {
+    throw new Error('--as-of is required with --sources (research.run binds source lanes to a date).');
+  }
+  if (profileRef === undefined && sourceModes === undefined && asOf !== undefined) {
+    throw new Error('--as-of requires --profile or --sources on the internal runner.');
   }
   const endpoint = resolveEndpoint(values.endpoint);
   const auth = await resolveAgentToken(values['keychain-service'], values['keychain-account']);
@@ -973,6 +1008,7 @@ async function main() {
     requested_profile_ref: profileRef ?? null,
     requested_profile_mode: profileMode ?? null,
     requested_as_of: asOf ?? null,
+    requested_source_modes: sourceModes ?? null,
     requested_request_id: requestedRequestId ?? null,
     timeout_seconds: timeoutSeconds,
     agent_token_source: auth.source,
@@ -1036,6 +1072,7 @@ async function main() {
     profileRef,
     profileMode,
     asOf,
+    sourceModes,
     timeoutSeconds,
   };
   const persistCheckpoint = async (run) => atomicWrite(
@@ -1070,6 +1107,7 @@ async function main() {
       ...(profileRef !== undefined ? { profileRef } : {}),
       ...(profileMode !== undefined ? { profileMode } : {}),
       ...(asOf !== undefined ? { asOf } : {}),
+      ...(sourceModes !== undefined ? { sourceModes } : {}),
     },
   });
   const result = execution.result;
@@ -1082,6 +1120,7 @@ async function main() {
   const finishedAt = new Date();
   const durationMs = Number(process.hrtime.bigint() - startedMonotonic) / 1_000_000;
   const groundingAssessment = assessGrounding(result.grounding ?? null);
+  const evidenceCoverage = assessEvidenceCoverage(result.report);
 
   const metadata = {
     mode: 'internal',
@@ -1099,6 +1138,7 @@ async function main() {
     profile_ref: profileRef ?? null,
     profile_mode: profileMode ?? null,
     as_of: asOf ?? null,
+    source_modes: sourceModes ?? null,
     timeout_seconds: timeoutSeconds,
     applied_max_cost_usd: result.appliedMaxCostUsd ?? null,
     cost_usd: result.costUsd,
@@ -1113,6 +1153,7 @@ async function main() {
     grounding: result.grounding ?? null,
     grounding_quality: groundingAssessment.quality,
     grounding_passed: groundingAssessment.passed,
+    evidence_coverage: evidenceCoverage,
     program_status: result.programStatus ?? null,
     source_coverage: result.sourceCoverage ?? null,
     profile_coverage: result.profileCoverage ?? null,
@@ -1158,12 +1199,27 @@ async function main() {
     grounding_check_status: metadata.grounding?.status ?? null,
     grounding_ratio: groundingAssessment.ratio,
     grounding_passed: metadata.grounding_passed,
+    evidence_coverage_status: evidenceCoverage.status,
+    evidence_coverage_ratio: evidenceCoverage.ratio,
+    evidence_gap_sections: evidenceCoverage.evidence_gap_sections,
+    sections_total: evidenceCoverage.sections_total,
     program_status: metadata.program_status,
     private_evidence_count:
       metadata.private_manifest?.coverage?.evidenceCount ?? 0,
     trusted_finding_count:
       result.trustedLocalAppendix?.includedFindingCount ?? 0,
   }, null, 2)}\n`);
+
+  if (!evidenceCoverage.passed) {
+    // Grounding "strong" only means the citations present are real. Say out
+    // loud when most sections have none, so nobody quotes this as complete.
+    await writeStderrLine(JSON.stringify({
+      event: 'braintied_internal_research_thin_report',
+      evidence_coverage_status: evidenceCoverage.status,
+      sections_with_evidence: evidenceCoverage.sections_with_evidence,
+      sections_total: evidenceCoverage.sections_total,
+    }));
+  }
 
   if (metadata.program_status === 'partial'
       || metadata.source_coverage?.passed === false

@@ -24,6 +24,23 @@ requires it to advertise `research.run`; it does not call a model or search
 provider. A live run requires `--allow-external` and writes mode, request ID,
 actual cost, bibliography, gaps, and grounding without persisting the token.
 
+Explicit evidence lanes reach the internal runner with `--sources` and an
+`--as-of` boundary. Every requested lane is required: a lane that finds
+nothing marks the run partial and exits 2. Use this when the brief is about
+code (`--sources web,github`), community voice (`reddit`), or video
+(`youtube`); without it the planner decides the lanes on its own.
+
+```bash
+node skills/run-braintied-research/scripts/run-internal-research.mjs \
+  --brief-file /tmp/brief.md --kind standard --max-cost-usd 2 \
+  --sources web,github --as-of 2026-09-24 \
+  --output /tmp/report.md --metadata /tmp/run.json --allow-external
+```
+
+Final metadata carries `evidence_coverage` (`complete` / `partial` / `thin` /
+`empty`, with the gap section headings) next to grounding. Grounding says the
+citations present are real; coverage says how many sections have any.
+
 Versioned internal profile runs add an exact evidence boundary while keeping
 their public and private data planes separate:
 

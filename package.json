@@ -1,6 +1,6 @@
 {
   "name": "@braintied/research",
-  "version": "1.9.2",
+  "version": "2.0.0",
   "description": "Cited research with a budget. Free search/fetch via SearXNG + Crawl4AI. Multi-provider lanes, typed credentials, grounded citations.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -23,9 +23,8 @@
   ],
   "scripts": {
     "build": "tsup",
-    "test": "npm run build && npm run test:unit && npm run test:instagram",
+    "test": "npm run build && npm run test:unit && npm run test:dist",
     "test:unit": "tsx --test test/*.test.ts",
-    "test:instagram": "node --test tests/instagram-brightdata.test.mjs",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
@@ -33,7 +32,8 @@
     "smoke:searxng": "npx tsx scripts/smoke-test-searxng.ts",
     "smoke:crawl4ai": "npx tsx scripts/smoke-test-crawl4ai.ts",
     "eval:baseline": "tsx evals/run-baseline.ts",
-    "eval:ablation": "tsx evals/run-fanout-ablation.ts"
+    "eval:ablation": "tsx evals/run-fanout-ablation.ts",
+    "test:dist": "node --test tests/*.test.mjs"
   },
   "keywords": [
     "research",
@@ -83,6 +83,7 @@
     "youtubei.js": "^17.2.0"
   },
   "devDependencies": {
+    "@braintied/consent": "workspace:*",
     "@google/genai": "^2.13.0",
     "@types/node": "^22.19.17",
     "tsup": "^8.5.0",

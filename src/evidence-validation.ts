@@ -14,6 +14,18 @@
  * own wording.
  */
 
+/**
+ * The evidence contract itself, re-exported here so `./evidence` is the ONE
+ * light subpath carrying both halves: the type an item must conform to, and
+ * the two checks that say whether its text is really in its source.
+ *
+ * Type-only, so nothing is added to this subpath's runtime bundle — the point
+ * of the subpath is that `@braintied/intros` and `@braintied/onboarding-core`
+ * can hold the contract without importing the engine. A consumer needing the
+ * runtime Zod schema imports `EvidenceItemSchema` from the package root.
+ */
+export type { EvidenceItem, EvidenceSourceClass, EvidenceVisibility } from './evidence.js';
+
 const MIN_KEY_CLAIM_TOKENS = 4;
 
 /** Normalize presentation-only differences without changing words. */

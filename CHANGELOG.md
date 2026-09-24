@@ -1,3 +1,143 @@
+## 2.0.0
+
+### Major Changes
+
+- Published as 2.0.0, not 1.11.0. The registry was at 1.9.2, and 1.10.0 (never published) added `"linkedin"` to the evidence `provider` union. That widens `EvidenceItemSchema`, `RESEARCH_PROFILES` and every profile's `requiredProviders` / `sourcePacks` types, so a consumer switching exhaustively over providers must handle `linkedin`. `stack.mjs publish` measured this against 1.9.2 and required a major. No runtime behaviour differs from the 1.11.0 entry below; 1.11.0 was never published.
+
+### Minor Changes (carried from 1.11.0)
+
+- da23cc9: Standard and blog research refine their gaps again, the internal runner takes `--sources`, and run metadata reports evidence coverage.
+
+  - `critiqueMaxPasses` counts critique calls, and the loop's last pass never refines. The 2026-08-01 cost program set standard and blog to 1, meaning to keep one refinement round; 1 is zero rounds. Measured on the two standard runs of 2026-09-24: 13 of 20 sections came back as evidence gaps labelled "after refinement" while no refinement search ran. Standard and blog are now 2 (one round). `refinementRounds()` states the semantics; the Cortex Worker prompt runner shares them.
+  - Part of the extract budget (30%, never more than half) is held for the refinement round. The main pass used 20 of 20 standard pages before the first critique, so a refinement could search but never extract. `refinementExtractReserve()`; the total page budget is unchanged.
+  - `run-internal-research.mjs --sources web,github --as-of <date>` forwards `sourceModes` to `research.run`, which the worker already accepted. The fleet CLI advertised `--sources` and the internal path could not send it.
+  - Final metadata carries `evidence_coverage` (`complete`/`partial`/`thin`/`empty`), computed from the returned sections by `evidence-coverage.mjs`, and the runner prints a `thin_report` event when under half the sections carry evidence. Grounding stays as it was: it grades the citations present, and coverage says how many sections have any.
+
+## 1.10.1
+
+### Patch Changes
+
+- Updated dependencies [3f1319e]
+- Updated dependencies [3f1319e]
+  - @braintied/cost@4.2.0
+  - @braintied/models@1.16.0
+
+## 1.10.0
+
+### Minor Changes
+
+- efce796: A strict LinkedIn public-profile provider and `consented-person@1`, the research
+  program for looking up one person who asked to be looked up.
+
+  `fetchLinkedInPublicProfile` takes one `/in/<id>` URL the subject supplied and
+  returns their own published profile — headline, about, positions, education,
+  skills, location, and the sites the profile itself lists — as one
+  `EvidenceItem` per field, each tagged `first_party_statement` with its source
+  URL and retrieval time. It is modelled on `providers/instagram.ts`, not on the
+  tolerant LinkedIn _posts_ wrapper: that wrapper logs a warning and returns `[]`
+  when its dataset id is unset, and a tolerated empty result is the wrong
+  contract for a person's name twice over — it reads as "this person has no
+  profile" to an interview about to open with what it just learned, and it hides
+  a misconfiguration behind someone's identity.
+
+  Two guards decide who this is, and both refuse rather than degrade. A URL that
+  is not one member's profile is refused (`/company/`, `/school/`, `/feed/`,
+  `/posts/`, a search URL, and `/in/<id>/recent-activity/` — a sub-page is not
+  the profile, and some of those sub-pages are other people). A record whose
+  `/in/<id>` is not the one asked for raises
+  `LinkedInProfileIdentityMismatchError`, as does a declared subject that
+  disagrees with the URL — checked BEFORE the fetch, because refusing after the
+  records are billed still bills them. Connections, followers, recommendations
+  and "people also viewed" are not in the normalizer at all, so their absence is
+  structural rather than a policy comment.
+
+  `consented-person@1` is registered under the fleet's `slug@version`
+  convention. Its inputs are the subject's own anchors — their name plus a link,
+  handle, city, or affiliation THEY gave — and a name with nothing to anchor it
+  to is refused, because a name alone matches every namesake. What it
+  deliberately does not do: no people-search or background-check sites (a
+  41-entry denylist applied twice, as `excludeDomains` on every pack and again
+  by `isDeniedSource` after results come back, because a provider that ignores
+  an exclude parameter fails silently); no inference of a personal fact, with
+  health, finances, family, legal, sexuality, politics, immigration and religion
+  named in the preamble and the output contract requiring a source URL and an
+  exact quote per item; nobody but the subject; no Cortex ingest, and no index
+  sink on the run; and `snapshot` mode only, since a standing watch on a named
+  human is a different product needing its own consent.
+
+  Both refuse without a consent row. `requireSourceConsent` takes the
+  `ConsentRow` a caller got from `@braintied/consent`'s `requireConsent` — the
+  row, not a boolean, because a boolean is the caller's assertion that it
+  checked, carries no notice hash and no proof, and is satisfied by `true`. Four
+  refusals are named separately: missing, wrong purpose, not granted (with the
+  state, so `withdrawn` and `stale` say why), and a grant with no `recordUri`.
+  "Wrong purpose" is the quiet one: a route holding `source:interview` that
+  reaches a web-research fetch has a real grant in hand and is still reading
+  something the person did not agree to.
+
+  The per-subject cost ceiling is the approved budget, structurally
+  `@braintied/on-demand`'s `OnDemandApproval`, passed through to the pipeline's
+  existing `maxCostUsd`. No new cap field: a number the runner reads and the
+  pipeline does not is a lie told to whoever reads the config. An optional
+  `spendGate` accepts `@braintied/pricing/gate`'s decision, and the TIGHTER of
+  the two ceilings binds — taking the looser is how Sentigen ended up with two
+  limits and no bound. There is deliberately no `ON_DEMAND_REQUIRE_APPROVAL=0`
+  bypass; this package reads no environment, and an env var that turns off budget
+  approval for a run against a named human is the wrong thing to have available.
+
+  Also: `linkedin` joins the closed provider set as a FETCH-ONLY provider
+  (`capabilities.search === false`) and is absent from `SOURCE_TYPE_ROUTING`, so
+  no planner fan-out can route to it and no pipeline run can write a discovery
+  carrying the name — a consumer with a provider CHECK constraint needs no
+  migration until it deliberately persists LinkedIn profile evidence. The
+  `./evidence` subpath now also carries the `EvidenceItem` type (type-only, so
+  nothing joins that subpath's runtime bundle), so `@braintied/onboarding-core`
+  can hold the evidence contract without importing the engine. Namesake
+  resolution is injected rather than imported: `@braintied/entity-resolution`
+  depends on `@supabase/supabase-js`, and a database client inside a
+  third-party-safe engine is the wrong trade, so the default `anchorMatch` is
+  exact-anchor matching that fails closed and a host wanting fuzzier scoring
+  passes its own matcher in.
+
+  `test:instagram` became `test:dist` over `tests/*.test.mjs`, so a new
+  build-level test file is discovered rather than sitting there uninvoked. It
+  earned its place immediately: the root index re-exports providers by an
+  explicit allow-list, not `export *`, so the whole new surface was missing from
+  the built package while every source-level test passed.
+
+### Patch Changes
+
+- Updated dependencies [4e2d462]
+  - @braintied/cost@4.1.0
+
+## 1.9.6
+
+### Patch Changes
+
+- Updated dependencies [d9468ef]
+  - @braintied/models@1.15.0
+
+## 1.9.5
+
+### Patch Changes
+
+- Updated dependencies [0ee8e20]
+  - @braintied/models@1.14.0
+
+## 1.9.4
+
+### Patch Changes
+
+- Updated dependencies [0c2eed7]
+  - @braintied/models@1.13.0
+
+## 1.9.3
+
+### Patch Changes
+
+- Updated dependencies [b27d34f]
+  - @braintied/models@1.12.0
+
 ## 1.9.2
 
 ### Minor Changes

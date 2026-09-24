@@ -30,7 +30,21 @@ export const EvidenceItemSchema = z.object({
   author: z.string().max(500).optional(),
   publishedAt: IsoTimestampSchema.optional(),
   retrievedAt: IsoTimestampSchema,
-  provider: ProviderNameSchema.or(z.literal('internal')).or(z.literal('manual')),
+  /**
+   * Which transport read this.
+   *
+   * A search `ProviderName`, plus three that are not search lanes:
+   * `internal` (our own records), `manual` (the person pasted it), and
+   * `linkedin` (the strict member-profile fetch in `providers/linkedin.ts`,
+   * which is deliberately absent from `PROVIDER_NAMES` — see the note there).
+   * Mislabelling a Bright Data LinkedIn read as `manual` would make a
+   * consent-gated fetch indistinguishable from something the person typed,
+   * which is the one thing provenance on this field exists to prevent.
+   */
+  provider: ProviderNameSchema
+    .or(z.literal('internal'))
+    .or(z.literal('manual'))
+    .or(z.literal('linkedin')),
   sourceClass: EvidenceSourceClassSchema,
   lane: SourceLaneSchema,
   sourcePackId: z.string().min(1).max(120),

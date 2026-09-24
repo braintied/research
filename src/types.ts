@@ -14,6 +14,16 @@ import { createHash } from 'node:crypto';
 
 // =============================================================================
 // Provider names — closed set, must match DB CHECK constraints
+//
+// Deliberately WITHOUT `linkedin`, even though 1.10.0 adds a strict LinkedIn
+// member-profile fetch (`providers/linkedin.ts`). Widening this enum is a
+// MAJOR change, not a minor one: a consumer keying a map on it
+// (`Record<ProviderName, SearchProvider>`, which this package does itself) or
+// switching exhaustively over it stops compiling, and `check-bump` correctly
+// refused the first attempt at this. LinkedIn is also not a search
+// lane — one person's profile is not a search result — so it has no business
+// in a search-provider registry. The evidence contract carries the name
+// instead: see `EvidenceItemSchema.provider` in `evidence.ts`.
 // =============================================================================
 
 export const PROVIDER_NAMES = [

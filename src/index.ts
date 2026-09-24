@@ -39,7 +39,7 @@ import type {
   ReportChunkInput,
   SearchOpts,
 } from './types.js';
-import { DEPTH_CONFIG, getModelPricing } from './depth-config.js';
+import { DEPTH_CONFIG, getModelPricing, refinementExtractReserve } from './depth-config.js';
 import type { ResearchDepth } from './depth-config.js';
 import { CostTracker } from './cost-tracker.js';
 import {
@@ -96,6 +96,9 @@ export {
   deepResearchSynthesisCostUsd,
   MODEL_PRICING,
   DEEPSEEK_V4_PRO_PROMO_EXPIRY_AT,
+  refinementRounds,
+  refinementExtractReserve,
+  REFINEMENT_EXTRACT_RESERVE_SHARE,
 } from './depth-config.js';
 export type { ResearchDepth, DepthTunables, ModelPricing } from './depth-config.js';
 export { CostTracker } from './cost-tracker.js';
@@ -183,8 +186,28 @@ export {
   unlockUrl,
   fetchLinkedInPostsBrightData,
   fetchFacebookGroupPostsBrightData,
+  // Strict, consent-gated LinkedIn member profile. Named explicitly because
+  // this block is an allow-list, not `export *`: the dist export test in
+  // tests/ is what caught these missing, since a source-level suite imports
+  // the provider module directly and cannot see the root surface.
+  fetchLinkedInPublicProfile,
+  canonicalizeLinkedInProfileUrl,
+  linkedInPublicIdentifier,
+  normalizeLinkedInProfileRecord,
+  linkedInProfileEvidence,
+  NotALinkedInProfileUrlError,
+  LinkedInProfileIdentityMismatchError,
+  BRIGHTDATA_LINKEDIN_PROFILES_DATASET_ID,
+  LINKEDIN_PUBLIC_PROFILE_PURPOSE,
+  LINKEDIN_PUBLIC_PROFILE_SOURCE_PACK,
 } from './providers/index.js';
 export type {
+  LinkedInPosition,
+  LinkedInEducation,
+  NormalizedLinkedInProfile,
+  LinkedInProfileFieldId,
+  FetchLinkedInPublicProfileInput,
+  LinkedInPublicProfileResult,
   InstagramStoriesTarget,
   InstagramProfilePostsInput,
   NormalizedInstagramPost,
@@ -241,6 +264,10 @@ export { parseMarkdownReport } from './parse-markdown-report.js';
 
 // Versioned investigation profiles, evidence lineage, and coverage gates.
 export * from './profiles/index.js';
+// Consent as a required input, and the one program that runs against a named
+// person. Both refuse rather than degrade: see `consent-gate.ts`.
+export * from './consent-gate.js';
+export * from './consented-person.js';
 export * from './evidence.js';
 export * from './source-modes.js';
 export * from './source-health.js';
@@ -936,11 +963,17 @@ export async function runDeepResearch(
   // ---------------------------------------------------------------------------
   // Run-level budget (main + critique). Prevents one brief from minting
   // thousands of Gemini extract calls (Aug 2026 GCP incident class).
+  //
+  // Part of the budget is held back for the refinement pass. Without it the
+  // main pass spent every page (20 of 20, measured 2026-09-24) and the
+  // critique's refinement subqueries could search but never extract.
+  const refinementReserve = refinementExtractReserve(depthConfig);
   const extractBudget: ExtractBudget = {
-    remaining: depthConfig.maxExtractPages,
+    remaining: depthConfig.maxExtractPages - refinementReserve,
     concurrency: depthConfig.extractConcurrency,
     doneUrls: new Set<string>(),
   };
+  let refinementReserveReleased = refinementReserve === 0;
 
   const extraction = await extractQuotes(
     input.credentials,
@@ -1060,6 +1093,11 @@ export async function runDeepResearch(
     recordSourceMeta(extraResults);
     const extraToFetch = extraResults.slice(0, Math.min(extraResults.length, CUMULATIVE_URL_CEILING));
     const extraMarkdown = await fetchContent(input.credentials, extraToFetch, enabledProviders, log, input.cache);
+
+    if (!refinementReserveReleased) {
+      extractBudget.remaining += refinementReserve;
+      refinementReserveReleased = true;
+    }
 
     const extraExtraction = await extractQuotes(
       input.credentials,

@@ -218,6 +218,31 @@ export type {
   InstagramProfilePostsInput,
   NormalizedInstagramPost,
 } from './instagram.js';
+// Strict, consent-gated LinkedIn member-profile surface. Deliberately beside
+// the Instagram strict exports and NOT beside the tolerant Bright Data
+// ingestion block below: the tolerant wrapper returns [] on a missing dataset
+// id, which is the contract this module exists to refuse.
+export {
+  BRIGHTDATA_LINKEDIN_PROFILES_DATASET_ID,
+  LINKEDIN_PUBLIC_PROFILE_PURPOSE,
+  LINKEDIN_PUBLIC_PROFILE_SOURCE_PACK,
+  canonicalizeLinkedInProfileUrl,
+  linkedInPublicIdentifier,
+  normalizeLinkedInProfileRecord,
+  linkedInProfileEvidence,
+  fetchLinkedInPublicProfile,
+  NotALinkedInProfileUrlError,
+  LinkedInProfileIdentityMismatchError,
+} from './linkedin.js';
+export type {
+  LinkedInPosition,
+  LinkedInEducation,
+  NormalizedLinkedInProfile,
+  LinkedInProfileFieldId,
+  FetchLinkedInPublicProfileInput,
+  LinkedInPublicProfileResult,
+} from './linkedin.js';
+
 export { resolveGitHubPublicAuthState } from './github.js';
 export type { GitHubPublicAuthCode, GitHubPublicAuthState } from './github.js';
 
