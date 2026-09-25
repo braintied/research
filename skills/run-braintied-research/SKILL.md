@@ -9,17 +9,68 @@ Use the package-owned runner to turn a written brief into a cited report plus
 machine-readable run metadata. The engine calls external search, crawl, and
 model providers; treat every brief as outbound data.
 
+**Unified system:** this is the **paid RUN** step. Fleet policy lives in
+`~/.agents/rules/research.md`. North star:
+`ora-ai/platform/docs/research/UNIFIED-RESEARCH-SYSTEM.md`.
+
+> **Cortex Worker policy (2026-08-15).** On-demand `research.run` is allowed
+> with an approved dollar ceiling. Host-crons and `CONTENT_PIPELINE_ENABLED`
+> stay off. Do not scale the worker or flip the freeze stub without G.
+>
+> A failed run that prints only `Tool execution failed` is a host redaction,
+> not proof the engine is down. Check `ora_core.internal_tool_runs` and
+> `ai_usage_events` before concluding anything.
+
+This file in `packages/research` is the only source.
+`~/.claude/skills/run-braintied-research` is a symlink into a worktree pinned to
+`origin/main` (`~/Development/.worktrees/research-main`), not a copy. After
+changes to `packages/research` land on `main`, refresh it with the script
+from `origin/main` (a shared checkout's copy can be stale):
+`git -C ~/Development/stack fetch -q origin main && git -C ~/Development/stack show origin/main:packages/research/scripts/install-skill.sh | bash`.
+Edit the
+package through a PR, never the install worktree: the script refuses to move a
+worktree with local edits.
+
 ## Required workflow
 
+0. **Which tool, then recall.** Before any paid run:
+
+   ```bash
+   research which "<topic>"
+   ```
+
+   If that prints `searxng` or `crawl4ai`, do **not** continue to `--run`.
+   Use `web_search` / Crawl4AI. Tavily is last, never the search box.
+   Skill: `braintied-research-tools`. Then query the corpus with
+   `research-recall` (or `research "<topic>"`). If discoveries already
+   answer the brief, stop and cite them. Only continue when there is a
+   clear evidence gap.
 1. **Classify the brief before running anything.** Remove secrets, personal
    data, customer data, private financial details, unreleased deal terms, and
    proprietary source text. Replace sensitive specifics with neutral
    placeholders. Never use another project or company's credentials without
    explicit authorization from the credential owner.
 2. **Choose the smallest adequate kind, explicit source modes, and a budget.**
-   Kind controls depth/cost; source mode controls which evidence lanes must
-   actually execute. Pipeline kinds require `--max-cost-usd`; `answer` and
-   `managed` do not honor that cap and must be chosen deliberately.
+   Default to `quick`. Kind controls depth/cost; source mode controls which
+   evidence lanes must actually execute. Pipeline kinds require
+   `--max-cost-usd`; `answer` and `managed` do not honor that cap and must be
+   chosen deliberately. Prefer caps of `$2` or less unless G approves more.
+   For code questions pass `--sources web,github` (the fleet CLI and the
+   internal runner both take it).
+2b. **Estimate, then a human approves (mandatory before spend).** Never call a
+   paid runner until G (or a named operator) has approved a dollar ceiling.
+
+   ```bash
+   research "<topic>" --estimate --kind quick --max-cost-usd 1
+   # show the estimate and ceiling; wait for approval language
+   research "<topic>" --run --kind quick --max-cost-usd 1 \
+     --approved-max-cost-usd <approved-ceiling> \
+     --allow-external --approved-by <operator>
+   ```
+
+   `--run` **refuses** without `--approved-max-cost-usd`. Every proposal and
+   run is appended to `~/.agents/state/on-demand-runs.jsonl`. Do not invent a
+   second ledger.
 3. **Write a brief file.** Prefer a file over shell-embedded text so quoting is
    deterministic and the exact outbound prompt can be reviewed.
 4. **Preflight in two layers.** First verify local Agent Auth availability from
@@ -56,10 +107,18 @@ model providers; treat every brief as outbound data.
    missing route, failed authentication, or a catalog that lacks durable
    protocol v2 submission/status endpoints for `research.run`.
 
-5. **Run only after the outbound brief, credentials, and remote catalog are authorized.** Pass
+5. **Run only after estimate approval, outbound brief, credentials, and remote
+   catalog are authorized.** Prefer the fleet CLI (`research` / `bt-research`)
+   so the ledger records the run. The package runner is for advanced paths
+   and still requires a prior approved ceiling equal to `--max-cost-usd`. Pass
    `--allow-external`, an explicit report path, and a metadata path:
 
    ```bash
+   # Preferred (ledger + gate):
+   research "…" --run --kind deep --max-cost-usd 5 \
+     --approved-max-cost-usd 5 --allow-external --approved-by galen
+
+   # Advanced internal runner (only after the same approval):
    node skills/run-braintied-research/scripts/run-internal-research.mjs \
      --brief-file /tmp/research-brief.md \
      --kind deep \
@@ -249,3 +308,28 @@ Run `node skills/run-braintied-research/scripts/run-internal-research.mjs --help
 for the default internal surface and `run-research.mjs --help` for the local
 fallback. Read [references/runtime.md](references/runtime.md) when
 configuring Agent Auth, providers, output, or a failed preflight.
+
+## Close the loop: capture what you produced
+
+A paid engine run stores itself: the host writes `ora_core` for you. Anything
+you assemble around it does not. A synthesis across several runs, a comparison
+you wrote up, or a sweep done with free tools (WebSearch, WebFetch, `db`,
+`sntgn`) when recall showed the corpus was enough, all die in the transcript
+unless you ingest them.
+
+```bash
+node ~/.local/lib/ora-platform/scripts/research-result-ingest.mjs \
+  --file <report.md> --ad-hoc --prompt-id "<topic>/<slug>" \
+  --date-anchor YYYY-MM-DD --brief "one line" --tags "agent-findings,<topic>"
+```
+
+Run it from `~/.local/lib/ora-platform`, not a working tree; refresh that
+install with `bash ~/.local/lib/ora-platform/refresh.sh`. Add `--dry-run`
+first to see the parse and chunk plan. It costs embeddings only
+(voyage-4-large), calls no paid model, and starts no research run. It works on
+a plain markdown doc with no frontmatter.
+
+Never ingest meeting transcripts, messages, or contact PII. Sentigen is the
+system of record for those, and Cortex must not hold a second copy. Reference
+the meeting or CRM entity id instead. The full rule, including why free-tool
+research is not exempt, is `~/.agents/rules/research.md`.

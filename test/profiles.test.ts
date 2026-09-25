@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   ORA_AGENT_RUNTIME_PROFILE,
+  TRAVEL_INTELLIGENCE_PROFILE,
   WEB_DESIGN_INTELLIGENCE_PROFILE,
   WEB_DESIGN_INTELLIGENCE_PROFILE_V1,
   compileResearchBrief,
@@ -75,4 +76,21 @@ test('profile hash and compiled brief are deterministic', () => {
   const second = compileResearchBrief('ora-agent-runtime@1', input);
   assert.equal(first.profileSha256, second.profileSha256);
   assert.equal(first.outboundBrief, second.outboundBrief);
+});
+
+test('travel intelligence profile ranks official rules first and keeps private prior out of the outbound brief', () => {
+  assert.equal(getResearchProfile('travel-intelligence').version, 1);
+  const compiled = compileResearchBrief(TRAVEL_INTELLIGENCE_PROFILE, {
+    question: 'Two travellers, Goa for Edge City then Mumbai then six months in Bali: hacks, rules, where to stay.',
+    asOf: '2026-09-24',
+    mode: 'snapshot',
+  });
+  assert.equal(compiled.profileRef, 'travel-intelligence@1');
+  assert.match(compiled.outboundBrief, /Official entry rules, fees and passenger rights/);
+  assert.match(compiled.outboundBrief, /Reddit traveller and resident experience/);
+  assert.match(compiled.outboundBrief, /Local Facebook groups/);
+  assert.doesNotMatch(compiled.outboundBrief, /Braintied travel research prior/);
+  assert.match(compiled.privateRecallBrief ?? '', /Braintied travel research prior/);
+  const required = TRAVEL_INTELLIGENCE_PROFILE.coverageRequirements.filter((c) => c.required).map((c) => c.id);
+  assert.deepEqual(required, ['official-rules', 'expert-tactics', 'traveller-experience']);
 });

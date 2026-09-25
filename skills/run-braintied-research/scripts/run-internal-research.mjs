@@ -2,6 +2,7 @@
 
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -24,9 +25,42 @@ const DEFAULT_ENDPOINT = 'https://ora-cortex-worker.fly.dev/internal/tools/execu
 const DEFAULT_KEYCHAIN_SERVICE = 'braintied-agent-auth';
 const DEFAULT_KEYCHAIN_ACCOUNT = 'codex';
 const CHECKPOINT_SCHEMA_VERSION = 1;
-const PACKAGE_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
-const PACKAGE_JSON = path.join(PACKAGE_ROOT, 'package.json');
+const PACKAGE_NAME = '@braintied/research';
+const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const execFileAsync = promisify(execFile);
+
+/**
+ * Resolve the @braintied/research package root.
+ *
+ * The skill is also installed as a plain copy under
+ * ~/.claude/skills/run-braintied-research/scripts, where ../../../ is ~/.claude
+ * and the old heuristic opened ~/.claude/package.json. Take the first candidate
+ * whose package.json actually names this package, and fail with every path
+ * tried rather than report a version read from somebody else's manifest.
+ */
+function resolvePackageRoot() {
+  const home = process.env.HOME;
+  const candidates = [
+    process.env.BRAINTIED_RESEARCH_PACKAGE_ROOT,
+    // In the package: skills/run-braintied-research/scripts -> package root.
+    path.resolve(THIS_DIR, '../../..'),
+    home ? path.join(home, 'Development/stack/packages/research') : undefined,
+  ].filter((candidate) => typeof candidate === 'string' && candidate.length > 0);
+
+  for (const root of candidates) {
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
+    } catch {
+      continue;
+    }
+    if (parsed?.name === PACKAGE_NAME) return root;
+  }
+  throw new Error(
+    `Could not find the ${PACKAGE_NAME} package root. Tried: ${candidates.join(', ')}. `
+      + 'Set BRAINTIED_RESEARCH_PACKAGE_ROOT to the package directory.',
+  );
+}
 
 const USAGE = `Usage:
   run-internal-research.mjs --check --kind <kind> [--max-cost-usd <number>]
@@ -277,7 +311,8 @@ async function probeInternalCatalog({ endpoint, token, timeoutSeconds }) {
 }
 
 async function packageVersion() {
-  const parsed = JSON.parse(await readFile(PACKAGE_JSON, 'utf8'));
+  const packageJson = path.join(resolvePackageRoot(), 'package.json');
+  const parsed = JSON.parse(await readFile(packageJson, 'utf8'));
   return typeof parsed.version === 'string' ? parsed.version : 'unknown';
 }
 
@@ -820,10 +855,37 @@ async function submitDurableResearch({
         && (errorCode === 'ADMISSION_LIMIT_REACHED'
           || errorCode === 'ADMISSION_PAUSED')
       ) {
+        /*
+         * NAME THE LIMIT THAT USUALLY FIRED.
+         *
+         * This message blamed the daily reserved-cost window, so an operator
+         * read it as "out of budget" and stopped. Measured 2026-08-31: six
+         * concurrent `research --run` calls, the 5th and 6th refused within
+         * half a second, with $0.13 spent all day against
+         * principal_daily_cost_usd 100 and organization_daily_cost_usd 150.
+         * The limit that fired was max_active_per_principal = 4.
+         *
+         * The worker folds six policy checks into one ADMISSION_LIMIT_REACHED
+         * (max_run_cost_usd, max_submissions_per_principal_minute,
+         * max_active_per_principal/_organization, principal_/organization_
+         * daily_cost_usd), so the runner cannot know which one it was. Lead
+         * with concurrency, which clears in seconds, and hand over the query
+         * that tells them apart.
+         */
+        const retry = 'Re-run with the same --request-id to resume rather than pay twice.';
         throw new Error(
-          `${boundedServerMessage(response, payload)} (${errorCode}). `
-            + 'Raise ora_core.internal_tool_admission_policies limits or wait for the '
-            + 'daily reserved-cost window to roll, then re-run with the same --request-id.',
+          errorCode === 'ADMISSION_PAUSED'
+            ? `${boundedServerMessage(response, payload)} (${errorCode}). `
+              + 'Admission is paused, not over a limit; the worker pauses admission while a '
+              + `deploy drains, so wait a minute and retry. ${retry}`
+            : `${boundedServerMessage(response, payload)} (${errorCode}). `
+              + 'Usually CONCURRENCY, not budget: max_active_per_principal / '
+              + 'max_active_per_organization clear as running calls finish, so wait for one '
+              + 'and retry. The same code also covers max_submissions_per_principal_minute, '
+              + 'max_run_cost_usd and the principal/organization daily cost caps. '
+              + 'Check which before raising anything: '
+              + "db c \"select * from ora_core.internal_tool_admission_policies where tool_name='research.run'\". "
+              + retry,
         );
       }
       if (!retryableHttpStatus(response.status)) {

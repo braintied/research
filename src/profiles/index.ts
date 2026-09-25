@@ -8,6 +8,7 @@ export {
 } from './consented-person.js';
 export type { ExcludedCategory } from './consented-person.js';
 export { ORA_AGENT_RUNTIME_PROFILE } from './ora-agent-runtime.js';
+export { TRAVEL_INTELLIGENCE_PROFILE } from './travel-intelligence.js';
 export {
   WEB_DESIGN_INTELLIGENCE_PROFILE,
   WEB_DESIGN_INTELLIGENCE_PROFILE_V1,

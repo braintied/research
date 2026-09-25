@@ -357,9 +357,43 @@ export function isSoftwareSeedJob(question: string, compact?: string): boolean {
 
 const BURNING_MAN_RE = /\b(burning\s*man|r\/burningman|black rock (city|desert)|the playa)\b/i;
 
+/**
+ * Travel questions search the travel communities plus the destination's own.
+ * Unscoped Reddit search for "Mopa taxi to Mandrem" returned laser engravers
+ * (2026-09-24); scoped to r/goa it is a local question with local answers.
+ * Only communities known to exist are listed. A destination not in the table
+ * still gets the travel communities.
+ */
+const TRAVEL_RE =
+  /\b(travel|travell?ing|itinerary|flights?|airfare|airline|airport|layover|hotels?|hostel|airbnb|villa|resort|visa|e-?visa|nomad|backpack(ing)?|stopover|award travel)\b/i;
+const TRAVEL_COMMUNITIES = ['travel', 'solotravel', 'TravelHacks', 'digitalnomad'] as const;
+const FLIGHT_RE = /\b(flights?|airfare|airline|layover|stopover|business class|premium economy|upgrade)\b/i;
+const POINTS_RE = /\b(miles|points|award|status match|transfer partner)\b/i;
+const DESTINATION_COMMUNITIES: ReadonlyArray<readonly [RegExp, readonly string[]]> = [
+  [/\bgoa\b|mandrem|anjuna|arambol|panjim|\bmopa\b/i, ['goa', 'india']],
+  [/\bmumbai\b|\bbombay\b/i, ['mumbai', 'india']],
+  [/\bindia\b|delhi|bangalore|bengaluru|rajasthan|kerala|jaipur/i, ['india']],
+  [/\bbali\b|canggu|pererenan|ubud|uluwatu|seminyak/i, ['bali', 'indonesia']],
+  [/\bindonesia\b|jakarta|lombok/i, ['indonesia']],
+  [/\bjapan\b|tokyo|kyoto|osaka/i, ['JapanTravel']],
+  [/\bthailand\b|bangkok|chiang mai|phuket/i, ['Thailand']],
+  [/\bmexico\b|cdmx|oaxaca|tulum/i, ['mexico']],
+  [/\bportugal\b|lisbon|porto/i, ['portugal']],
+];
+
+export function inferredTravelCommunities(question: string): string[] | undefined {
+  if (!TRAVEL_RE.test(question)) return undefined;
+  const communities: string[] = [];
+  for (const [re, subs] of DESTINATION_COMMUNITIES) if (re.test(question)) communities.push(...subs);
+  communities.push(...TRAVEL_COMMUNITIES);
+  if (FLIGHT_RE.test(question)) communities.push('Flights');
+  if (POINTS_RE.test(question)) communities.push('awardtravel');
+  return [...new Set(communities)];
+}
+
 export function inferredRedditCommunities(question: string): string[] | undefined {
   if (BURNING_MAN_RE.test(question)) return ['BurningMan'];
-  return undefined;
+  return inferredTravelCommunities(question);
 }
 
 function seededQuery(question: string, mode: AtomicPublicSourceMode): string {

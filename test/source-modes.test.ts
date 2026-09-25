@@ -96,6 +96,31 @@ test('web seed falls back to Tavily when SearXNG is off', () => {
   );
 });
 
+test('travel questions scope Reddit to travel and destination communities', () => {
+  assert.deepEqual(
+    inferredRedditCommunities('Mopa airport taxi to Mandrem, Goa: travel tips'),
+    ['goa', 'india', 'travel', 'solotravel', 'TravelHacks', 'digitalnomad'],
+  );
+  assert.deepEqual(
+    inferredRedditCommunities('Pererenan Bali villa long stay for a digital nomad'),
+    ['bali', 'indonesia', 'travel', 'solotravel', 'TravelHacks', 'digitalnomad'],
+  );
+  const flight = inferredRedditCommunities('Turkish Airlines LAX to Mumbai flight upgrade, award travel');
+  assert.ok(flight?.includes('Flights'));
+  assert.ok(flight?.includes('awardtravel'));
+  assert.deepEqual(flight?.slice(0, 2), ['mumbai', 'india']);
+  assert.equal(inferredRedditCommunities('cheapest flights, any airline')?.includes('india'), false);
+});
+
+test('travel inference stays off non-travel questions', () => {
+  // "trip", "points" and "miles" alone are not travel: a psychedelic trip, pain points.
+  assert.equal(inferredRedditCommunities('the psychedelic trip as creative act'), undefined);
+  assert.equal(inferredRedditCommunities('customer pain points in onboarding'), undefined);
+  assert.equal(inferredRedditCommunities('brake shop West Adams'), undefined);
+  // Burning Man keeps its own community even when travel words appear.
+  assert.deepEqual(inferredRedditCommunities('Burning Man travel and flights to Reno'), ['BurningMan']);
+});
+
 test('Burning Man reddit seeds restrict to r/BurningMan', () => {
   const plan = resolveSourceExecutionPlan({
     question: '# Burning Man culture: community voice\n\nsparkle pony',

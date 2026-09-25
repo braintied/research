@@ -1,3 +1,29 @@
+## 2.1.0
+
+### Minor Changes
+
+- 9a1a914: New `travel-intelligence@1` research profile, and destination-aware Reddit scoping for travel questions.
+
+  The profile sends one trip question to every place the answer lives, and ranks official rules above everything else:
+
+  - **Official rules:** government visa, entry-rule and passenger-rights pages.
+  - **Expert blogs:** OMAAT, TPG, Frequent Miler, View from the Wing and others.
+  - **Reddit:** travel and destination subreddits.
+  - **Social and video:** X, YouTube walkthroughs, and TikTok/Instagram.
+  - **Local groups:** Facebook groups, where long-stay rental markets trade.
+
+  Official rules, expert tactics and first-hand traveller experience are required coverage. Social, video and local-group evidence is optional and labelled as leads.
+
+  `inferredRedditCommunities` now scopes travel questions to r/travel, r/solotravel, r/TravelHacks and r/digitalnomad, plus the destination's own subreddits (Goa, Mumbai, India, Bali, Indonesia, Japan, Thailand, Mexico, Portugal). It adds r/Flights and r/awardtravel when the question calls for them. Measured 2026-09-24: an unscoped search for "Mopa taxi to Mandrem" returned laser-engraver pages.
+
+  Bare "trip", "points" and "miles" do not trigger travel scoping, so a psychedelic "trip" or customer "pain points" stay unscoped. Burning Man keeps r/BurningMan.
+
+### Patch Changes
+
+- d9e4be2: `scripts/install-skill.sh` installs with the pnpm version the repo pins in `packageManager`, not whatever `pnpm` is on PATH. When the two differ it runs `npx pnpm@<pinned>`. If install or build fails, it prints the last 30 lines of output and the path to the full log. Before this, pnpm 8.15.6 on the agent laptop refused the lockfile and the script failed without saying why.
+- d8158ac: The internal research runner's `ADMISSION_LIMIT_REACHED` error now leads with concurrency, which is the usual cause and clears in seconds. The old text blamed the daily reserved-cost window, so operators read a refusal as "out of budget" and stopped. The worker folds six policy checks into that one code, so the message names all of them and gives the query that shows which one fired. `ADMISSION_PAUSED` gets its own text: admission is paused, not over a limit.
+- b3caab8: The internal research runner now finds the `@braintied/research` package root from a skill install. A copy under `~/.claude/skills/run-braintied-research/scripts` resolved `../../../` to `~/.claude` and read `~/.claude/package.json`. It now checks `$BRAINTIED_RESEARCH_PACKAGE_ROOT`, then the package it ships in, then `~/Development/stack/packages/research`, takes the first whose `package.json` is named `@braintied/research`, and fails naming every path it tried when none is. `scripts/install-skill.sh` installs the skill as a symlink into a worktree pinned to `origin/main`, replacing the hand copy under `~/.claude/skills`.
+
 ## 2.0.0
 
 ### Major Changes

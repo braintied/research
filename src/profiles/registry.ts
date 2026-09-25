@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { CONSENTED_PERSON_PROFILE_V1 } from './consented-person.js';
 import { ORA_AGENT_RUNTIME_PROFILE } from './ora-agent-runtime.js';
+import { TRAVEL_INTELLIGENCE_PROFILE } from './travel-intelligence.js';
 import {
   WEB_DESIGN_INTELLIGENCE_PROFILE,
   WEB_DESIGN_INTELLIGENCE_PROFILE_V1,
@@ -24,6 +25,7 @@ export const RESEARCH_PROFILES = [
   WEB_DESIGN_INTELLIGENCE_PROFILE,
   WEB_DESIGN_INTELLIGENCE_PROFILE_V1,
   CONSENTED_PERSON_PROFILE_V1,
+  TRAVEL_INTELLIGENCE_PROFILE,
 ] as const;
 
 function profileRef(profile: ResearchProfile): string {
