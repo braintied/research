@@ -20,6 +20,7 @@ import type {
   IndexSink,
   OnPipelineUsage,
   ResearchCacheAdapter,
+  EvidenceFunnel,
   ValidatedEvidenceExcerpt,
 } from './index.js';
 import { runManagedResearch } from './managed-research.js';
@@ -187,6 +188,11 @@ export interface KindResearchResult {
    * interpreted as zero accepted evidence and can never satisfy coverage.
    */
   validatedEvidence?: ValidatedEvidenceExcerpt[];
+  /**
+   * Stage counts for pipeline runs (sources fetched, extracted, validated).
+   * Absent for managed and answer engines, which do no quote extraction.
+   */
+  evidenceFunnel?: EvidenceFunnel;
 }
 
 /**
@@ -277,5 +283,6 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
     grounding: result.grounding,
     discoveries: result.discoveries,
     validatedEvidence: result.validatedEvidence,
+    evidenceFunnel: result.evidenceFunnel,
   };
 }

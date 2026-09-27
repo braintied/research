@@ -1218,6 +1218,9 @@ async function main() {
     evidence_coverage: evidenceCoverage,
     program_status: result.programStatus ?? null,
     source_coverage: result.sourceCoverage ?? null,
+    // Stage counts (sources with content → extracted → validated). Null when
+    // the worker predates research 2.2.0 or the engine does no extraction.
+    evidence_funnel: result.evidenceFunnel ?? null,
     profile_coverage: result.profileCoverage ?? null,
     private_manifest: result.privateManifest ?? null,
     trusted_output: values['trusted-output'] === undefined
@@ -1280,6 +1283,7 @@ async function main() {
       evidence_coverage_status: evidenceCoverage.status,
       sections_with_evidence: evidenceCoverage.sections_with_evidence,
       sections_total: evidenceCoverage.sections_total,
+      evidence_funnel: metadata.evidence_funnel,
     }));
   }
 

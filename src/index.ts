@@ -377,6 +377,41 @@ interface ExtractBudget {
   concurrency: number;
   /** URLs already extracted this run — skip re-paying Gemini for them. */
   doneUrls: Set<string>;
+  /** Stage counts for the run, shared by the first pass and refinement. */
+  funnel: EvidenceFunnel;
+}
+
+/**
+ * Where a run's evidence went, stage by stage. A thin report used to say only
+ * "no source-validated evidence"; on 2026-09-26 a run discovered 55 sources
+ * and kept zero, and nothing in the metadata said which stage dropped them.
+ */
+export interface EvidenceFunnel {
+  /** Search results that arrived with fetched page content. */
+  sourcesWithContent: number;
+  /** Pages sent to the extractor. */
+  sourcesExtracted: number;
+  /** Pages with content that the extract budget skipped. */
+  sourcesSkippedForBudget: number;
+  quotesExtracted: number;
+  quotesValidated: number;
+  claimsExtracted: number;
+  claimsValidated: number;
+  /** Pages whose every extracted item failed source validation. */
+  sourcesWithNoValidatedEvidence: number;
+}
+
+function emptyEvidenceFunnel(): EvidenceFunnel {
+  return {
+    sourcesWithContent: 0,
+    sourcesExtracted: 0,
+    sourcesSkippedForBudget: 0,
+    quotesExtracted: 0,
+    quotesValidated: 0,
+    claimsExtracted: 0,
+    claimsValidated: 0,
+    sourcesWithNoValidatedEvidence: 0,
+  };
 }
 
 // =============================================================================
@@ -723,6 +758,8 @@ export interface RunDeepResearchResult {
    * CALLER decides whether to flag, retry, or reject.
    */
   grounding: GroundingResult;
+  /** Stage counts: how many sources and items survived each step. */
+  evidenceFunnel: EvidenceFunnel;
 }
 
 export interface ValidatedEvidenceExcerpt {
@@ -972,6 +1009,7 @@ export async function runDeepResearch(
     remaining: depthConfig.maxExtractPages - refinementReserve,
     concurrency: depthConfig.extractConcurrency,
     doneUrls: new Set<string>(),
+    funnel: emptyEvidenceFunnel(),
   };
   let refinementReserveReleased = refinementReserve === 0;
 
@@ -1251,6 +1289,7 @@ export async function runDeepResearch(
     discoveries: allDiscoveries,
     validatedEvidence,
     grounding,
+    evidenceFunnel: extractBudget.funnel,
   };
 }
 
@@ -1711,6 +1750,9 @@ async function extractQuotes(
   );
   const skippedForBudget = candidates.length - allowed.length;
   extractBudget.remaining -= allowed.length;
+  extractBudget.funnel.sourcesWithContent += candidates.length;
+  extractBudget.funnel.sourcesExtracted += allowed.length;
+  extractBudget.funnel.sourcesSkippedForBudget += skippedForBudget;
   for (const result of allowed) {
     extractBudget.doneUrls.add(result.url);
   }
@@ -1851,6 +1893,12 @@ async function extractQuotes(
       const droppedEvidence =
         (extracted.verbatim_quotes.length - quotes.length) +
         (extracted.key_claims.length - claims.length);
+      const funnel = extractBudget.funnel;
+      funnel.quotesExtracted += extracted.verbatim_quotes.length;
+      funnel.quotesValidated += quotes.length;
+      funnel.claimsExtracted += extracted.key_claims.length;
+      funnel.claimsValidated += claims.length;
+      if (quotes.length === 0 && claims.length === 0) funnel.sourcesWithNoValidatedEvidence += 1;
       if (droppedEvidence > 0) {
         log.warn(
           { url: result.url.slice(0, 80), droppedEvidence },

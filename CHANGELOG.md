@@ -1,3 +1,21 @@
+## 2.2.0
+
+### Minor Changes
+
+- 9734a3c: Source validation no longer throws away real evidence from web pages. Fetched pages arrive as crawler Markdown (`**bold**`, `[anchor](url)`, bullets, headings), and the validator compared an extractor's plain-text quote against that raw Markdown. Measured 2026-09-26 on five real pages: 54 of 68 genuine prose lines were rejected. Since 2026-09-23, 13 of 17 paid runs in the on-demand ledger failed or came back thin; one run discovered 55 sources and kept none.
+
+  - Markdown presentation syntax is removed from both the quote and the source before comparison. Words are never changed, so a paraphrase, a changed word or a sentence fragment is still rejected.
+  - A quote may now be a run of up to four adjacent complete sentences inside one line. The contract always said "sentence or line", but a multi-sentence line could never match, even whole.
+  - New `evidenceFunnel` on `RunDeepResearchResult` and `KindResearchResult`: sources with content, extracted, skipped for budget, quotes and claims extracted versus validated, and sources that kept nothing. The internal runner writes it to metadata as `evidence_funnel` and includes it in the thin-report event, so a thin run names the stage that lost its evidence.
+
+  The same quick-tier query went from 0 cited sources (ungrounded, 7 of 7 sections empty) to 5 cited sources with grounding 0.8 at the same cost ($0.026).
+
+### Patch Changes
+
+- 7bac958: SearXNG's round-robin fallback now remembers a transport failure (timeout, HTTP error, bad response shape) for 5 minutes and skips that instance on later queries in the same process, instead of paying its full per-instance timeout again on every query. An empty-but-200 response never marks an instance dead — that stays a per-query content signal.
+
+  Measured 2026-09-24: `ora-cortex-worker` v704's research canary quarantined admission with `canary_transport_timeout`. `cortex-searxng-b`/`-c` have zero Fly machines (fully removed, not autostopped), so every fallback request to either blocked at Fly's edge for the full 12s default timeout instead of failing fast. `cortex-searxng-a`, the one live instance, also returns HTTP 200 with 0 results on many production query shapes, which forced the fallback loop through both dead instances on nearly every query. A full profile-driven research run issues dozens of queries; multiplied by up to 24s of dead-instance timeout per query, that exceeded the deploy canary's own timeout outright.
+
 ## 2.1.0
 
 ### Minor Changes

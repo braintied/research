@@ -5,9 +5,12 @@
  * grounding evidence merely because it shares vocabulary with fetched text.
  * This module therefore uses a deliberately fail-closed contract:
  *
- * - quotes must equal one complete fetched sentence/line;
- * - key claims must equal a complete fetched sentence/line and contain at
- *   least four tokens.
+ * - quotes must equal one complete fetched sentence, or a run of up to four
+ *   adjacent complete sentences inside one line;
+ * - key claims must meet the same test and contain at least four tokens.
+ *
+ * Markdown presentation syntax (links, emphasis, bullets, headings) is
+ * removed from both sides first; words are never changed.
  *
  * Semantic paraphrases remain unverified until a real entailment boundary is
  * introduced. Lower recall is preferable to circularly certifying a model's
@@ -39,6 +42,33 @@ function normalizeUnicodePresentation(text: string): string {
     .replace(/[\p{Zs}\t\f\v]+/gu, ' ');
 }
 
+/**
+ * Remove Markdown presentation syntax without touching a single word.
+ *
+ * Fetched pages arrive as crawler Markdown (`**bold**`, `[anchor](url)`,
+ * `* ` bullets, `# ` headings), while an extractor quotes the text a reader
+ * sees. Comparing the two raw rejected 54 of 68 genuine prose lines across
+ * five real pages (2026-09-26), which left most web runs with zero evidence.
+ * Both sides pass through this, so the contract is unchanged: the quote must
+ * still equal one complete source sentence or line, word for word.
+ */
+function stripMarkdownPresentation(text: string): string {
+  return text
+    .split(/\r?\n/u)
+    .map((line) => line
+      .replace(/!\[[^\]\n]*\]\([^)\n]*\)/gu, '')
+      .replace(/\[([^\]\n]*)\]\([^)\n]*\)/gu, '$1')
+      .replace(/<(https?:\/\/[^>\s]+)>/gu, '$1')
+      .replace(/(\*\*|__)(?=\S)([^\n]*?\S)\1/gu, '$2')
+      .replace(/(^|[^\p{L}\p{N}*_])([*_])(?=\S)([^\n*_]*?\S)\2(?![\p{L}\p{N}])/gu, '$1$3')
+      .replace(/~~(?=\S)([^\n]*?\S)~~/gu, '$1')
+      .replace(/`([^`\n]+)`/gu, '$1')
+      .replace(/^\s*(?:>\s*)+/u, '')
+      .replace(/^\s*#{1,6}\s+/u, '')
+      .replace(/^\s*(?:[-*+]|\d{1,3}[.)])\s+/u, ''))
+    .join('\n');
+}
+
 function evidenceTokens(text: string): string[] {
   return normalizeUnicodePresentation(text)
     .toLowerCase()
@@ -46,7 +76,7 @@ function evidenceTokens(text: string): string[] {
 }
 
 function normalizeExactText(text: string): string {
-  return normalizeUnicodePresentation(text)
+  return normalizeUnicodePresentation(stripMarkdownPresentation(text))
     .toLowerCase()
     .replace(/\s+/gu, ' ')
     .replace(/\s+([,.;:!?])/gu, '$1')
@@ -54,11 +84,33 @@ function normalizeExactText(text: string): string {
     .replace(/\.$/u, '');
 }
 
+/** Longest run of adjacent complete sentences one quote may span. */
+const MAX_SENTENCES_PER_QUOTE = 4;
+
+/**
+ * Every complete sentence, plus every run of up to four adjacent complete
+ * sentences inside one line. A multi-sentence line used to be unmatchable
+ * even whole, although the contract has always said "sentence or line", and
+ * extractors routinely quote two or three sentences together. A span never
+ * crosses a line break and never starts or ends mid-sentence.
+ */
 function sourceEvidenceUnits(sourceContent: string): string[] {
-  return normalizeUnicodePresentation(sourceContent)
-    .split(/(?:\r?\n)+|(?<=[.!?\u3002\uFF01\uFF1F])\s+/u)
-    .map(normalizeExactText)
-    .filter((unit) => unit.length > 0);
+  const units: string[] = [];
+  const lines = normalizeUnicodePresentation(stripMarkdownPresentation(sourceContent))
+    .split(/(?:\r?\n)+/u);
+  for (const line of lines) {
+    const sentences = line
+      .split(/(?<=[.!?\u3002\uFF01\uFF1F])\s+/u)
+      .filter((sentence) => sentence.trim().length > 0);
+    for (let start = 0; start < sentences.length; start++) {
+      const end = Math.min(sentences.length, start + MAX_SENTENCES_PER_QUOTE);
+      for (let stop = start + 1; stop <= end; stop++) {
+        const unit = normalizeExactText(sentences.slice(start, stop).join(' '));
+        if (unit.length > 0) units.push(unit);
+      }
+    }
+  }
+  return units;
 }
 
 /**

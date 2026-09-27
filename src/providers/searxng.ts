@@ -120,6 +120,70 @@ function pickPrimaryUrl(urls: string[]): string {
 }
 
 // =============================================================================
+// Cross-query dead-instance memory
+// =============================================================================
+//
+// `callOnce`'s AbortSignal.timeout bounds ONE instance for ONE query, but the
+// round-robin fallback below has no memory between calls: a research run that
+// issues N queries pays that same per-instance timeout again for every query
+// that lands on a genuinely unreachable instance, because `candidates` always
+// includes every configured URL.
+//
+// Measured 2026-09-24 (ora-cortex-worker v704 canary quarantine): SEARXNG_URLS
+// lists three instances; `cortex-searxng-b`/`-c` have zero Fly machines (fully
+// de-provisioned, not merely autostopped — `fly machines list` returns "No
+// machines are available"), so a request to either blocks at Fly's edge for
+// the full 12s default timeout instead of failing fast. `cortex-searxng-a`
+// (the one live instance) also returns HTTP 200 with 0 results on many
+// production query shapes (2026-09-18 investigation:
+// docs/changelog/2026-09-18-research-canary-tolerated-not-passed.md), which
+// forces the fallback loop through both dead instances on nearly every query.
+// A full profile-driven research run issues dozens of queries; multiplied by
+// up to 24s of dead-instance timeout per query, that exceeds the deploy
+// canary's own timeout outright (previously this only degraded content —
+// tolerated as a fast, content-poor "flake" — because the dead instances used
+// to be autostopped and failed in under a second, not fully removed).
+//
+// Remember a TRANSPORT failure (timeout, HTTP error, bad response shape) for
+// DEAD_INSTANCE_TTL_MS so later queries in the same process skip straight
+// past it. An empty-but-200 result does NOT mark an instance dead — that is a
+// content signal, not a reachability one, and the existing empty-result
+// fallback already handles it per query. If every configured instance is
+// currently marked dead, still try all of them (never return zero
+// candidates) so a genuine full outage is still observed and a recovered
+// instance is still discovered once its TTL lapses.
+const DEAD_INSTANCE_TTL_MS = 5 * 60 * 1000;
+const deadUntil = new Map<string, number>();
+
+function isMarkedDead(url: string, now: number): boolean {
+  const until = deadUntil.get(url);
+  return until !== undefined && until > now;
+}
+
+function markDead(url: string, now: number): void {
+  deadUntil.set(url, now + DEAD_INSTANCE_TTL_MS);
+}
+
+function markAlive(url: string): void {
+  deadUntil.delete(url);
+}
+
+/** Test-only: clear the dead-instance memory so tests do not leak into each other. */
+export function resetSearxngDeadInstanceMemoryForTests(): void {
+  deadUntil.clear();
+}
+
+/**
+ * Test-only: reset the module-level round-robin counter. Every test file
+ * shares this module, so a test asserting which URL is picked as primary
+ * across several calls needs a known starting index, not whatever the
+ * counter happens to be after earlier tests ran.
+ */
+export function resetSearxngRoundRobinForTests(): void {
+  rrCounter = 0;
+}
+
+// =============================================================================
 // Single-instance call
 // =============================================================================
 
@@ -210,13 +274,20 @@ export async function searxngSearch(
 
   const triedUrls: string[] = [];
   const primary = pickPrimaryUrl(urls);
-  const candidates = [primary, ...urls.filter((candidate) => candidate !== primary)];
+  const allCandidates = [primary, ...urls.filter((candidate) => candidate !== primary)];
+  const now = Date.now();
+  const liveCandidates = allCandidates.filter((candidate) => !isMarkedDead(candidate, now));
+  // Never fall through to zero candidates: a total outage still gets tried
+  // (slower, but observed), and a recovered instance is still found once its
+  // TTL lapses.
+  const candidates = liveCandidates.length > 0 ? liveCandidates : allCandidates;
   let lastError = 'All SearXNG instances returned no results';
 
   for (const candidate of candidates) {
     triedUrls.push(candidate);
     try {
       const results = await callOnce(candidate, query, opts);
+      markAlive(candidate);
       if (results.length > 0) {
         return { success: true, triedUrls, results };
       }
@@ -226,6 +297,7 @@ export async function searxngSearch(
         '[SearXNG] empty result set; trying fallback',
       );
     } catch (error) {
+      markDead(candidate, Date.now());
       lastError = error instanceof Error ? error.message : String(error);
       logger.warn(
         { url: candidate, error: lastError, query: query.slice(0, 60) },
