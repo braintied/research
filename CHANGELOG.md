@@ -1,3 +1,9 @@
+## 2.2.1
+
+### Patch Changes
+
+- a6dd6ec: Republish against `@braintied/cost@5.0.0`. Research's `@braintied/cost` dependency is `workspace:*`, resolved to whatever cost version sits in this workspace at publish time; the last research release (2.2.0) predated cost's 5.0.0 (pets' `estimateVendorCost` use forced that bump), so the published 2.2.0 packument still declares cost `4.2.0` exactly. Downstream, ora-ai's cortex-worker pins one exact cost version fleet-wide and could not raise it past `4.2.0` without research following. Patch because 5.0.0 only adds `trackSandbox`/`estimateSandboxCost`, which research does not call — no API surface of research changes.
+
 ## 2.2.0
 
 ### Minor Changes
