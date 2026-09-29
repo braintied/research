@@ -30,9 +30,16 @@ function cleanRunnerEnvironment(): NodeJS.ProcessEnv {
     'BRAINTIED_GITHUB_REQUIRE_AUTH',
     'GITHUB_TOKEN',
     'GH_TOKEN',
+    'DEEPSEEK_API_KEY',
+    'FIREWORKS_API_KEY',
+    'FLEET_MODEL_PROFILE',
+    'BRAINTIED_DATA_RESIDENCY',
   ]) {
     delete env[name];
   }
+  // Every model stage resolves DeepSeek V4.1 Flash under the fleet default, so
+  // a runnable pipeline needs this key whatever else a test is exercising.
+  env.DEEPSEEK_API_KEY = 'test-only-deepseek-key';  // git-secret-allow: fixture string in a unit test, not a credential
   return env;
 }
 
@@ -144,9 +151,8 @@ test('dotenv parser returns only allowlisted names using the documented single-l
   assert.equal(parsed.has('UNRELATED_PRIVATE_KEY'), false);
 });
 
-test('Gemini-backed standard research does not require Anthropic or Voyage', () => {
+test('standard research under the fleet default needs only the DeepSeek key, not Anthropic, Gemini or Voyage', () => {
   const env = cleanRunnerEnvironment();
-  env.GEMINI_API_KEY = 'test-only-key';
   env.SEARXNG_URLS = 'https://search.example';
 
   const result = spawnSync(process.execPath, [
@@ -154,15 +160,50 @@ test('Gemini-backed standard research does not require Anthropic or Voyage', () 
     '--check',
     '--kind', 'standard',
     '--max-cost-usd', '1',
-    '--synthesis-model', 'gemini-3.6-flash',
   ], { cwd: packageRoot, env, encoding: 'utf8' });
 
   assert.equal(result.status, 0, result.stderr);
-  const preflight = JSON.parse(result.stdout) as { ready: boolean; missing: string[]; warnings: string[] };
+  const preflight = JSON.parse(result.stdout) as {
+    ready: boolean;
+    missing: string[];
+    warnings: string[];
+    synthesis_model: string | null;
+    model_requirements: { stage: string; provider: string; model: string; credentialField: string }[];
+  };
   assert.equal(preflight.ready, true);
   assert.deepEqual(preflight.missing, []);
-  assert.ok(preflight.warnings.some((warning) => warning.includes('critique')));
+  // No runner-side default override: the package resolves the synthesis model.
+  assert.equal(preflight.synthesis_model, null);
+  assert.ok(preflight.model_requirements.length > 0);
+  for (const entry of preflight.model_requirements) {
+    assert.equal(entry.provider, 'deepseek', entry.stage);
+    assert.equal(entry.model, 'deepseek-flash', entry.stage);
+    assert.equal(entry.credentialField, 'deepseekApiKey', entry.stage);
+  }
   assert.ok(preflight.warnings.some((warning) => warning.includes('reranking')));
+});
+
+test('a pipeline run without the resolved model key is not ready and names the field', () => {
+  const env = cleanRunnerEnvironment();
+  delete env.DEEPSEEK_API_KEY;
+  env.GEMINI_API_KEY = 'test-only-key';
+  env.SEARXNG_URLS = 'https://search.example';
+
+  const result = spawnSync(process.execPath, [
+    runner,
+    '--check',
+    '--kind', 'quick',
+    '--max-cost-usd', '1',
+  ], { cwd: packageRoot, env, encoding: 'utf8' });
+
+  assert.equal(result.status, 2, result.stderr);
+  const preflight = JSON.parse(result.stdout) as { ready: boolean; missing: string[] };
+  assert.equal(preflight.ready, false);
+  // A Gemini key no longer satisfies extraction: the stage resolves DeepSeek.
+  assert.ok(
+    preflight.missing.some((entry) => entry.startsWith('ResearchCredentials.deepseekApiKey (research extract')),
+    preflight.missing.join('; '),
+  );
 });
 
 test('secure env file overrides stale inherited research settings and ignores unrelated names', () => {

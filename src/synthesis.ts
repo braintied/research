@@ -7,16 +7,13 @@
  *   3. assembleFinalReport — exec summary + bibliography + full markdown
  */
 
-import Anthropic from '@anthropic-ai/sdk';
-import OpenAI from 'openai';
 import { logger } from './logger.js';
+import type { ResearchCredentials } from './credentials.js';
 import {
-  requireAnthropicApiKey,
-  requireGeminiApiKey,
-  MissingCredentialError,
-  type ResearchCredentials,
-} from './credentials.js';
-import { recordGeminiUsage } from './cache-hit-measurement.js';
+  callModel as synthesisGenerate,
+  providerForModelId,
+  type ModelCallResult as SynthesisCallResult,
+} from './model-call.js';
 import { questionHeadingFor } from './decision-brief.js';
 import {
   canonicalizeUrl,
@@ -231,289 +228,36 @@ export function renderEvidenceBoundMarkdown(
 }
 
 // =============================================================================
-// Multi-provider synthesis dispatcher
+// Model transport — lives in model-call.ts; re-exported under the names this
+// module has always exported.
 // =============================================================================
 
-const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
-const GLM_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
-const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
-
-/**
- * Hard ceiling on a single provider synthesis call. Root-cause fix for the
- * 2026-07-20 synthesis-hang incident: 12/12 prompt runs froze in
- * status='synthesizing' for 90+ minutes because none of the provider SDK
- * clients had a request timeout — a wedged socket stalls the promise
- * forever and the run never advances, never fails, and never writes a
- * heartbeat. 15 minutes is far above the p99 for a Sonnet section call
- * (1-5 min at 4-16k max tokens); it is a death sentence for a wedged
- * request, not a performance target.
- */
-export const SYNTHESIS_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
-
-/** Thrown when gemini-* synthesis is requested but the host did not install the optional peer. */
-export class GeminiSdkMissingError extends Error {
-  constructor() {
-    super(
-      '@google/genai is required for gemini-* synthesis. Add it to the host package (it is an optional peer of @braintied/research so Watchtower and other non-Gemini hosts do not pull it into their image).',
-    );
-    this.name = 'GeminiSdkMissingError';
-  }
-}
-
-async function loadGoogleGenAI(): Promise<typeof import('@google/genai').GoogleGenAI> {
-  try {
-    const loaded = await import('@google/genai');
-    return loaded.GoogleGenAI;
-  } catch (cause) {
-    const error = new GeminiSdkMissingError();
-    error.cause = cause;
-    throw error;
-  }
-}
-
-/** Thrown when a provider synthesis call exceeds SYNTHESIS_REQUEST_TIMEOUT_MS. */
-export class SynthesisTimeoutError extends Error {
-  constructor(
-    public readonly model: string,
-    public readonly timeoutMs: number,
-  ) {
-    super(`Synthesis call to ${model} timed out after ${timeoutMs}ms`);
-    this.name = 'SynthesisTimeoutError';
-  }
-}
-
-/**
- * Race a provider call against a hard deadline with explicit timer cleanup.
- * Belt-and-suspenders alongside SDK-level `timeout` options: the observed
- * hang was an SDK-level wait that never fired, so the watchdog does not
- * trust any single SDK to bound its own sockets.
- */
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, model: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await new Promise<T>((resolve, reject) => {
-      timer = setTimeout(() => {
-        reject(new SynthesisTimeoutError(model, timeoutMs));
-      }, timeoutMs);
-      promise.then(resolve, reject);
-    });
-  } finally {
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-  }
-}
-
-/**
- * Phase 1.b — unified synthesis call that dispatches to the right provider
- * SDK based on model prefix and returns just the assembled text.
- *
- *   claude-*   → Anthropic SDK (ANTHROPIC_API_KEY)
- *   deepseek-* → Anthropic SDK with baseURL override (DEEPSEEK_API_KEY) —
- *                DeepSeek's Anthropic-compatible endpoint
- *   glm-*      → Anthropic SDK with baseURL override (ZAI_API_KEY) —
- *                z.ai's Anthropic-compatible endpoint
- *   gemini-*   → @google/genai SDK (GEMINI_API_KEY)
- *   qwen*      → OpenAI SDK with OpenRouter baseURL (OPENROUTER_API_KEY) —
- *                supports both `qwen-` short names and `qwen/qwen3-...`
- *                full OpenRouter model IDs
- */
-export interface SynthesisCallResult {
-  text: string;
-  /** Uncached input tokens — billed at the full input rate. */
-  inputTokens: number;
-  /**
-   * Cache-read input tokens — billed at the model's `cacheHitInputUsdPerM`
-   * if defined, otherwise the full input rate. Anthropic + DeepSeek-via-
-   * Anthropic-compat populate `usage.cache_read_input_tokens`. Gemini
-   * populates `usageMetadata.cachedContentTokenCount` (which represents the
-   * cached SLICE of `promptTokenCount`, not in addition to it).
-   */
-  cachedReadTokens: number;
-  outputTokens: number;
-}
-
-export async function synthesisGenerate(args: {
-  /** Host-resolved credentials; which key is required follows from `model`. */
-  credentials: ResearchCredentials;
-  system: string;
-  user: string;
-  model: string;
-  maxTokens: number;
-  /** Phase 1 Experiment 3 — when set, Gemini calls log cache-hit measurements. */
-  telemetry?: { functionName: string; organizationId?: string; promptRunId?: string };
-}): Promise<SynthesisCallResult> {
-  const { credentials, system, user, model, maxTokens, telemetry } = args;
-
-  if (model.startsWith('gemini-')) {
-    const apiKey = requireGeminiApiKey(credentials);
-    const GoogleGenAI = await loadGoogleGenAI();
-    const ai = new GoogleGenAI({ apiKey });
-    const response = await withTimeout(
-      ai.models.generateContent({
-        model,
-        contents: user,
-        config: {
-          systemInstruction: system,
-          maxOutputTokens: maxTokens,
-        },
-      }),
-      SYNTHESIS_REQUEST_TIMEOUT_MS,
-      model,
-    );
-    const text = response.text;
-    const usage = response.usageMetadata;
-    // Gemini reports `cachedContentTokenCount` as a SLICE of `promptTokenCount`,
-    // so the uncached portion is the difference (not the total). Mirror this
-    // in the result so cost calc treats input + cached as orthogonal.
-    const totalPromptTokens = usage?.promptTokenCount !== undefined ? usage.promptTokenCount : 0;
-    const cachedTokens = usage?.cachedContentTokenCount !== undefined ? usage.cachedContentTokenCount : 0;
-    const uncachedInputTokens = Math.max(0, totalPromptTokens - cachedTokens);
-    // Thinking tokens are DISJOINT from candidates and Google bills them as
-    // output, so billable output is candidates + thoughts. Counting candidates
-    // alone under-books every thinking-enabled call. Same semantics as
-    // `@braintied/cost` extractGeminiUsage.
-    const candidateTokens = usage?.candidatesTokenCount !== undefined ? usage.candidatesTokenCount : 0;
-    const thoughtsTokens = usage?.thoughtsTokenCount !== undefined ? usage.thoughtsTokenCount : 0;
-    const outputTokens = candidateTokens + thoughtsTokens;
-
-    if (telemetry !== undefined) {
-      await recordGeminiUsage({
-        model,
-        functionName: telemetry.functionName,
-        inputTokens: totalPromptTokens,
-        cachedTokens,
-        outputTokens,
-        organizationId: telemetry.organizationId,
-        promptRunId: telemetry.promptRunId,
-      });
-    }
-
-    return {
-      text: text !== undefined ? text : '',
-      inputTokens: uncachedInputTokens,
-      cachedReadTokens: cachedTokens,
-      outputTokens,
-    };
-  }
-
-  if (model.startsWith('qwen')) {
-    if (credentials.openrouterApiKey === undefined) {
-      throw new MissingCredentialError('openrouterApiKey', 'required for qwen-* synthesis models');
-    }
-    const apiKey = credentials.openrouterApiKey;
-    const openai = new OpenAI({ apiKey, baseURL: OPENROUTER_BASE_URL, timeout: SYNTHESIS_REQUEST_TIMEOUT_MS });
-    const response = await withTimeout(
-      openai.chat.completions.create({
-        model,
-        max_tokens: maxTokens,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-      }),
-      SYNTHESIS_REQUEST_TIMEOUT_MS,
-      model,
-    );
-    const content = response.choices[0]?.message.content;
-    return {
-      text: typeof content === 'string' ? content : '',
-      inputTokens: response.usage?.prompt_tokens !== undefined ? response.usage.prompt_tokens : 0,
-      cachedReadTokens: 0, // OpenRouter does not surface a cache-hit field
-      outputTokens: response.usage?.completion_tokens !== undefined ? response.usage.completion_tokens : 0,
-    };
-  }
-
-  // Anthropic OR DeepSeek-via-Anthropic (compatible endpoint)
-  let apiKey: string | undefined;
-  let baseURL: string | undefined;
-  if (model.startsWith('deepseek-')) {
-    if (credentials.deepseekApiKey === undefined) {
-      throw new MissingCredentialError(
-        'deepseekApiKey',
-        'required for deepseek-* models (compliance: the direct API is China-hosted; '
-          + 'use only for synthetic eval / non-customer-tagged data)',
-      );
-    }
-    apiKey = credentials.deepseekApiKey;
-    baseURL = DEEPSEEK_ANTHROPIC_BASE_URL;
-  } else if (model.startsWith('glm-')) {
-    if (credentials.zaiApiKey === undefined) {
-      throw new MissingCredentialError('zaiApiKey', 'required for glm-* models');
-    }
-    apiKey = credentials.zaiApiKey;
-    baseURL = GLM_ANTHROPIC_BASE_URL;
-  } else {
-    apiKey = requireAnthropicApiKey(credentials);
-  }
-  const client = baseURL !== undefined
-    ? new Anthropic({ apiKey, baseURL, timeout: SYNTHESIS_REQUEST_TIMEOUT_MS })
-    : new Anthropic({ apiKey, timeout: SYNTHESIS_REQUEST_TIMEOUT_MS });
-  const response = await withTimeout(
-    client.messages.create({
-      model,
-      max_tokens: maxTokens,
-      system,
-      messages: [{ role: 'user', content: user }],
-    }),
-    SYNTHESIS_REQUEST_TIMEOUT_MS,
-    model,
-  );
-  let text = '';
-  for (const block of response.content) {
-    if (block.type === 'text') {
-      text += block.text;
-    }
-  }
-  // Anthropic API and DeepSeek-via-Anthropic-compat both surface
-  // `cache_read_input_tokens` (and `cache_creation_input_tokens`) on the
-  // usage object. `input_tokens` already excludes both cache slices —
-  // mirror that here so cost calc treats them as orthogonal.
-  const usage = response.usage as unknown as {
-    input_tokens: number;
-    output_tokens: number;
-    cache_read_input_tokens?: number;
-    cache_creation_input_tokens?: number;
-  };
-  const cachedReadTokens = typeof usage.cache_read_input_tokens === 'number'
-    ? usage.cache_read_input_tokens
-    : 0;
-  return {
-    text,
-    inputTokens: usage.input_tokens,
-    cachedReadTokens,
-    outputTokens: usage.output_tokens,
-  };
-}
+export {
+  callModel as synthesisGenerate,
+  SYNTHESIS_REQUEST_TIMEOUT_MS,
+  GeminiSdkMissingError,
+  SynthesisTimeoutError,
+} from './model-call.js';
+export type { ModelCallResult as SynthesisCallResult } from './model-call.js';
 
 // =============================================================================
 // Phase 1 Experiment 1 — synthesis-model bake-off resolution
 // =============================================================================
 
 /**
- * Resolve a per-run override to a concrete model identifier. Phase 1.c wires
- * all four providers needed by the 7-model bake-off:
- *   - Anthropic (claude-*)              via Anthropic SDK
- *   - DeepSeek (deepseek-*)             via Anthropic-compatible endpoint
- *   - GLM / z.ai (glm-*)                via Anthropic-compatible endpoint
- *   - Gemini (gemini-*)                 via @google/genai
- *   - Qwen3 + any OpenRouter model      via OpenAI SDK + OpenRouter baseURL
+ * Resolve a per-run override to a concrete model identifier. Any catalog id
+ * is accepted, plus `qwen*` OpenRouter ids; the provider comes from the
+ * `@braintied/models` catalog (see model-call.ts), so an override is sent to
+ * the vendor that serves it rather than to one guessed from its name.
  *
- * The flag in admin.feature_flags['cortex_synthesis_model'] is intentionally
- * disabled by default so this codepath only fires by intentional bake-off
- * configuration.
+ * `runResearch` passes the kind's resolved default through this parameter,
+ * so it must accept every id the models package can resolve, including the
+ * US-hosted Fireworks ids a `us` residency selects.
  */
 function resolveSynthesisModel(override: string | undefined, fallback: string): string {
   if (override === undefined || override.length === 0) return fallback;
-  if (override.startsWith('claude-')) return override;
-  if (override.startsWith('deepseek-')) return override;
-  if (override.startsWith('glm-')) return override;
-  if (override.startsWith('gemini-')) return override;
-  if (override.startsWith('qwen')) return override;
-  throw new Error(
-    `synthesis_model_override='${override}' not recognized. Supported prefixes: `
-      + `claude-*, deepseek-*, glm-*, gemini-*, qwen* (or qwen/<openrouter-id>).`,
-  );
+  providerForModelId(override);
+  return override;
 }
 
 // =============================================================================

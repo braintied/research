@@ -137,8 +137,13 @@ export interface ResearchCredentials {
   readonly anthropicApiKey?: string;
   /** OpenRouter: `qwen-*` synthesis models. */
   readonly openrouterApiKey?: string;
-  /** DeepSeek via its Anthropic-compatible endpoint: `deepseek-*` models. */
+  /** DeepSeek direct (China-hosted), Anthropic-compatible wire. The fleet default for model stages. */
   readonly deepseekApiKey?: string;
+  /**
+   * Fireworks (US-hosted), Anthropic-compatible wire. What a `us` data
+   * residency (`BRAINTIED_DATA_RESIDENCY`) resolves the DeepSeek stages to.
+   */
+  readonly fireworksApiKey?: string;
   /** Z.ai via its Anthropic-compatible endpoint: `glm-*` models. */
   readonly zaiApiKey?: string;
   readonly crawl4ai?: Crawl4AiConfig;
@@ -161,10 +166,18 @@ export const GEMINI_KEY_ENV_NAMES = [
   'GEMINI_API_KEY',
 ] as const;
 
+/**
+ * Each setting has a neutral `RESEARCH_*` name, read first, and the original
+ * `BRAINTIED_*` name, read as a fallback so an existing deployment keeps
+ * working. The exported `*_ENV` constants stay the legacy names.
+ */
 export const GEMINI_KEY_NAME_ENV = 'BRAINTIED_GEMINI_KEY_NAME';
+export const NEUTRAL_GEMINI_KEY_NAME_ENV = 'RESEARCH_GEMINI_KEY_NAME';
 
 export const CRAWL4AI_ALLOWED_DOMAINS_ENV = 'BRAINTIED_CRAWL4AI_ALLOWED_DOMAINS';
+export const NEUTRAL_CRAWL4AI_ALLOWED_DOMAINS_ENV = 'RESEARCH_CRAWL4AI_ALLOWED_DOMAINS';
 export const CRAWL4AI_NETWORK_GUARD_ENV = 'BRAINTIED_CRAWL4AI_NETWORK_GUARD';
+export const NEUTRAL_CRAWL4AI_NETWORK_GUARD_ENV = 'RESEARCH_CRAWL4AI_NETWORK_GUARD';
 export const CRAWL4AI_NETWORK_GUARD_VALUE = 'enforced-v1';
 
 /**
@@ -197,17 +210,23 @@ export const RESEARCH_ENV_NAMES = [
   'BRIGHTDATA_LINKEDIN_DATASET_ID',
   'BRIGHTDATA_FB_GROUPS_DATASET_ID',
   'BRIGHTDATA_UNLOCKER_ZONE',
+  'RESEARCH_GITHUB_PUBLIC_TOKEN',
   'BRAINTIED_GITHUB_PUBLIC_TOKEN',
+  'RESEARCH_GITHUB_REQUIRE_AUTH',
   'BRAINTIED_GITHUB_REQUIRE_AUTH',
   ...GEMINI_KEY_ENV_NAMES,
+  NEUTRAL_GEMINI_KEY_NAME_ENV,
   GEMINI_KEY_NAME_ENV,
   'VOYAGE_API_KEY',
   'ANTHROPIC_API_KEY',
   'OPENROUTER_API_KEY',
   'DEEPSEEK_API_KEY',
+  'FIREWORKS_API_KEY',
   'ZAI_API_KEY',
   'CRAWL4AI_URL',
+  NEUTRAL_CRAWL4AI_ALLOWED_DOMAINS_ENV,
   CRAWL4AI_ALLOWED_DOMAINS_ENV,
+  NEUTRAL_CRAWL4AI_NETWORK_GUARD_ENV,
   CRAWL4AI_NETWORK_GUARD_ENV,
 ] as const;
 
@@ -233,8 +252,8 @@ function firstConfigured(env: ResearchEnvironment, names: readonly string[]): st
   return undefined;
 }
 
-function csv(env: ResearchEnvironment, name: string): string[] {
-  const raw = trimmed(env, name);
+function csv(env: ResearchEnvironment, names: readonly string[]): string[] {
+  const raw = firstConfigured(env, names);
   if (raw === undefined) return [];
   return raw
     .split(',')
@@ -252,11 +271,11 @@ function csv(env: ResearchEnvironment, name: string): string[] {
  * instead of inside an extraction call an hour later.
  */
 export function resolveGeminiApiKey(env: ResearchEnvironment): string | undefined {
-  const configuredName = trimmed(env, GEMINI_KEY_NAME_ENV);
+  const configuredName = firstConfigured(env, [NEUTRAL_GEMINI_KEY_NAME_ENV, GEMINI_KEY_NAME_ENV]);
   if (configuredName !== undefined
     && !GEMINI_KEY_ENV_NAMES.includes(configuredName as (typeof GEMINI_KEY_ENV_NAMES)[number])) {
     throw new Error(
-      `${GEMINI_KEY_NAME_ENV} must name one of: ${GEMINI_KEY_ENV_NAMES.join(', ')}`,
+      `${NEUTRAL_GEMINI_KEY_NAME_ENV} (or ${GEMINI_KEY_NAME_ENV}) must name one of: ${GEMINI_KEY_ENV_NAMES.join(', ')}`,
     );
   }
 
@@ -268,14 +287,14 @@ export function resolveGeminiApiKey(env: ResearchEnvironment): string | undefine
   if (configuredName !== undefined) {
     const selected = candidates.find((candidate) => candidate.name === configuredName);
     if (selected === undefined) {
-      throw new Error(`${GEMINI_KEY_NAME_ENV} selects ${configuredName}, but that variable is not configured`);
+      throw new Error(`${NEUTRAL_GEMINI_KEY_NAME_ENV} (or ${GEMINI_KEY_NAME_ENV}) selects ${configuredName}, but that variable is not configured`);
     }
     return selected.value;
   }
 
   if (new Set(candidates.map((candidate) => candidate.value)).size > 1) {
     throw new Error(
-      `Conflicting Gemini aliases are configured (${candidates.map((candidate) => candidate.name).join(', ')}); set ${GEMINI_KEY_NAME_ENV}`,
+      `Conflicting Gemini aliases are configured (${candidates.map((candidate) => candidate.name).join(', ')}); set ${NEUTRAL_GEMINI_KEY_NAME_ENV}`,
     );
   }
   if (candidates[0] !== undefined) return candidates[0].value;
@@ -283,12 +302,12 @@ export function resolveGeminiApiKey(env: ResearchEnvironment): string | undefine
 }
 
 function resolveGitHub(env: ResearchEnvironment): GitHubPublicAuthConfig {
-  const rawPolicy = env.BRAINTIED_GITHUB_REQUIRE_AUTH;
+  const rawPolicy = firstConfigured(env, ['RESEARCH_GITHUB_REQUIRE_AUTH', 'BRAINTIED_GITHUB_REQUIRE_AUTH']);
   const policy = rawPolicy === undefined || rawPolicy.trim() === '' ? 'false' : rawPolicy.trim();
   if (policy !== 'true' && policy !== 'false') {
-    throw new Error('BRAINTIED_GITHUB_REQUIRE_AUTH must be "true" or "false"');
+    throw new Error('RESEARCH_GITHUB_REQUIRE_AUTH (or BRAINTIED_GITHUB_REQUIRE_AUTH) must be "true" or "false"');
   }
-  const publicToken = trimmed(env, 'BRAINTIED_GITHUB_PUBLIC_TOKEN');
+  const publicToken = firstConfigured(env, ['RESEARCH_GITHUB_PUBLIC_TOKEN', 'BRAINTIED_GITHUB_PUBLIC_TOKEN']);
   return {
     ...(publicToken === undefined ? {} : { publicToken }),
     requireAuth: policy === 'true',
@@ -334,10 +353,16 @@ function resolveBrightData(env: ResearchEnvironment): BrightDataCredentials | un
 function resolveCrawl4Ai(env: ResearchEnvironment): Crawl4AiConfig | undefined {
   const baseUrl = trimmed(env, 'CRAWL4AI_URL');
   if (baseUrl === undefined) return undefined;
-  const networkGuard = trimmed(env, CRAWL4AI_NETWORK_GUARD_ENV);
+  const networkGuard = firstConfigured(env, [
+    NEUTRAL_CRAWL4AI_NETWORK_GUARD_ENV,
+    CRAWL4AI_NETWORK_GUARD_ENV,
+  ]);
   return {
     baseUrl: baseUrl.replace(/\/+$/, ''),
-    allowedDomains: csv(env, CRAWL4AI_ALLOWED_DOMAINS_ENV),
+    allowedDomains: csv(env, [
+      NEUTRAL_CRAWL4AI_ALLOWED_DOMAINS_ENV,
+      CRAWL4AI_ALLOWED_DOMAINS_ENV,
+    ]),
     networkGuard: networkGuard === undefined ? '' : networkGuard,
   };
 }
@@ -355,7 +380,7 @@ export function resolveResearchCredentials(env: ResearchEnvironment): ResearchCr
   const exaApiKey = trimmed(env, 'EXA_API_KEY');
   const serperApiKey = trimmed(env, 'SERPER_API_KEY');
   const serpapiKey = trimmed(env, 'SERPAPI_KEY');
-  const searxngUrls = csv(env, 'SEARXNG_URLS').map((url) => url.replace(/\/+$/, ''));
+  const searxngUrls = csv(env, ['SEARXNG_URLS']).map((url) => url.replace(/\/+$/, ''));
   const perplexityApiKey = trimmed(env, 'PERPLEXITY_API_KEY');
   const listennotesApiKey = trimmed(env, 'LISTENNOTES_API_KEY');
   const groqApiKey = trimmed(env, 'GROQ_API_KEY');
@@ -371,6 +396,7 @@ export function resolveResearchCredentials(env: ResearchEnvironment): ResearchCr
   const anthropicApiKey = trimmed(env, 'ANTHROPIC_API_KEY');
   const openrouterApiKey = trimmed(env, 'OPENROUTER_API_KEY');
   const deepseekApiKey = trimmed(env, 'DEEPSEEK_API_KEY');
+  const fireworksApiKey = trimmed(env, 'FIREWORKS_API_KEY');
   const zaiApiKey = trimmed(env, 'ZAI_API_KEY');
   const crawl4ai = resolveCrawl4Ai(env);
 
@@ -396,6 +422,7 @@ export function resolveResearchCredentials(env: ResearchEnvironment): ResearchCr
     ...(anthropicApiKey === undefined ? {} : { anthropicApiKey }),
     ...(openrouterApiKey === undefined ? {} : { openrouterApiKey }),
     ...(deepseekApiKey === undefined ? {} : { deepseekApiKey }),
+    ...(fireworksApiKey === undefined ? {} : { fireworksApiKey }),
     ...(zaiApiKey === undefined ? {} : { zaiApiKey }),
     ...(crawl4ai === undefined ? {} : { crawl4ai }),
   };
@@ -432,7 +459,7 @@ export class MissingCredentialError extends Error {
 
 export function requireGeminiApiKey(credentials: ResearchCredentials): string {
   if (credentials.geminiApiKey === undefined) {
-    throw new MissingCredentialError('geminiApiKey', 'required for quote extraction, planning, and gemini-* synthesis');
+    throw new MissingCredentialError('geminiApiKey', 'required when a research model stage resolves to google');
   }
   return credentials.geminiApiKey;
 }

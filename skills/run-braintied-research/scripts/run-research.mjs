@@ -18,13 +18,6 @@ const VALID_SOURCE_MODES = new Set([
   'web', 'x', 'reddit', 'youtube', 'github', 'community', 'instagram', 'tiktok',
   'facebook_groups', 'cortex', 'telegram', 'all_public', 'all_social', 'all',
 ]);
-const SYNTHESIS_DEFAULTS = new Map([
-  ['answer', 'gemini-3.6-flash'],
-  ['quick', 'gemini-3.6-flash'],
-  ['standard', 'claude-sonnet-4-6'],
-  ['deep', 'claude-sonnet-4-6'],
-  ['social', 'claude-sonnet-4-6'],
-]);
 const GEMINI_KEY_NAMES = [
   'GEMINI_RESEARCH_KEY',
   'GOOGLE_GEMINI_API_KEY',
@@ -43,6 +36,7 @@ const RESEARCH_ENV_NAMES = [
   'SERPAPI_KEY',
   'OPENROUTER_API_KEY',
   'DEEPSEEK_API_KEY',
+  'FIREWORKS_API_KEY',
   'REDDIT_CLIENT_ID',
   'REDDIT_CLIENT_SECRET',
   'REDDIT_USER_AGENT',
@@ -59,10 +53,19 @@ const RESEARCH_ENV_NAMES = [
   'BRAINTIED_CRAWL4AI_NETWORK_GUARD',
   'BRAINTIED_GITHUB_PUBLIC_TOKEN',
   'BRAINTIED_GITHUB_REQUIRE_AUTH',
+  'RESEARCH_CRAWL4AI_ALLOWED_DOMAINS',
+  'RESEARCH_CRAWL4AI_NETWORK_GUARD',
+  'RESEARCH_GITHUB_PUBLIC_TOKEN',
+  'RESEARCH_GITHUB_REQUIRE_AUTH',
 ];
 const SHARED_ENV_FILE_VARIABLE = 'BRAINTIED_RESEARCH_ENV_FILE';
 const GEMINI_KEY_NAME_VARIABLE = 'BRAINTIED_GEMINI_KEY_NAME';
-const IMPORTABLE_ENV_NAMES = [...RESEARCH_ENV_NAMES, GEMINI_KEY_NAME_VARIABLE];
+const NEUTRAL_GEMINI_KEY_NAME_VARIABLE = 'RESEARCH_GEMINI_KEY_NAME';
+const IMPORTABLE_ENV_NAMES = [
+  ...RESEARCH_ENV_NAMES,
+  NEUTRAL_GEMINI_KEY_NAME_VARIABLE,
+  GEMINI_KEY_NAME_VARIABLE,
+];
 const IMPORTABLE_ENV_NAME_SET = new Set(IMPORTABLE_ENV_NAMES);
 const SHELL_CAPTURE_NAME_SET = new Set([...IMPORTABLE_ENV_NAMES, SHARED_ENV_FILE_VARIABLE]);
 const BRAINTIED_SEARXNG_URLS = 'https://cortex-searxng-a.fly.dev,https://cortex-searxng-b.fly.dev';
@@ -374,7 +377,7 @@ function combineRuntimeEnvironments(...environments) {
 }
 
 function resolveGeminiEnvironment(cliKeyName, runtimeEnvironment) {
-  const configuredKeyName = cliKeyName ?? process.env[GEMINI_KEY_NAME_VARIABLE];
+  const configuredKeyName = cliKeyName ?? process.env[NEUTRAL_GEMINI_KEY_NAME_VARIABLE] ?? process.env[GEMINI_KEY_NAME_VARIABLE];
   if (configuredKeyName !== undefined && configuredKeyName.trim().length === 0) {
     throw new Error('--gemini-key-name must name a supported Gemini environment variable.');
   }
@@ -411,6 +414,7 @@ function resolveGeminiEnvironment(cliKeyName, runtimeEnvironment) {
   runtimeEnvironment.overriddenNames = [...new Set(runtimeEnvironment.overriddenNames)].sort();
   runtimeEnvironment.resolvedGeminiKeyName = selected.name;
   process.env[GEMINI_KEY_NAME_VARIABLE] = selected.name;
+  process.env[NEUTRAL_GEMINI_KEY_NAME_VARIABLE] = selected.name;
 }
 
 async function loadPackage() {
@@ -427,55 +431,67 @@ async function loadPackage() {
   return research;
 }
 
-function effectiveSynthesisModel(kind, override) {
+/**
+ * The caller's --synthesis-model, or null. Null lets the package resolve each
+ * kind's synthesis model from @braintied/models, so a fleet profile change
+ * reaches runs started from this skill. This runner used to pass its own
+ * table of defaults as the override, which pinned every skill run to the
+ * models named in the table no matter what the fleet resolved.
+ */
+function effectiveSynthesisModel(override) {
   if (override !== undefined && override.trim().length > 0) return override.trim();
-  return SYNTHESIS_DEFAULTS.get(kind) ?? null;
+  return null;
 }
 
 function addMissing(missing, name) {
   if (!missing.includes(name)) missing.push(name);
 }
 
-function requireSynthesisCredential(model, missing) {
-  if (model === null) return;
-  if (model.startsWith('gemini-')) {
-    if (!hasEnv('GEMINI_RESEARCH_KEY') && !hasEnv('GEMINI_API_KEY')
-      && !hasEnv('GOOGLE_GENERATIVE_AI_API_KEY') && !hasEnv('GOOGLE_GEMINI_API_KEY')) {
-      addMissing(missing, 'a supported Gemini API key');
-    }
-  } else if (model.startsWith('deepseek-')) {
-    if (!hasEnv('DEEPSEEK_API_KEY')) addMissing(missing, 'DEEPSEEK_API_KEY');
-  } else if (model.startsWith('qwen')) {
-    if (!hasEnv('OPENROUTER_API_KEY')) addMissing(missing, 'OPENROUTER_API_KEY');
-  } else if (!hasEnv('ANTHROPIC_API_KEY')) {
-    addMissing(missing, 'ANTHROPIC_API_KEY');
+/**
+ * Model credentials a run of `kind` needs, read from the package's own stage
+ * resolutions (researchModelRequirements) rather than a table kept here.
+ */
+function modelRequirements(research, credentials, kind, synthesisModel, missing, warnings) {
+  if (kind === 'managed') return [];
+  if (typeof research.researchModelRequirements !== 'function') {
+    addMissing(missing, 'built package does not export researchModelRequirements; run npm run build');
+    return [];
   }
+  const requirements = research.researchModelRequirements(kind, synthesisModel ?? undefined);
+  for (const entry of requirements) {
+    const what = `research ${entry.stage} runs ${entry.model} on ${entry.provider}`;
+    if (entry.credentialField === null) {
+      addMissing(missing, `${what}, which ResearchCredentials has no key field for`);
+      continue;
+    }
+    if (credentials[entry.credentialField] !== undefined) continue;
+    const need = `ResearchCredentials.${entry.credentialField} (${what})`;
+    if (entry.required) {
+      addMissing(missing, need);
+    } else if (entry.stage === 'critique') {
+      warnings.push(`${need} is absent; critique will use its permissive fallback.`);
+    } else {
+      warnings.push(`${need} is absent; a failed plan has no fallback.`);
+    }
+  }
+  return requirements;
 }
 
-function requiredConfiguration(kind, enabledProviders, synthesisModel) {
+function requiredConfiguration(research, credentials, kind, enabledProviders, synthesisModel) {
   const missing = [];
   const warnings = [];
-  const geminiPresent = hasEnv('GEMINI_RESEARCH_KEY') || hasEnv('GEMINI_API_KEY')
-    || hasEnv('GOOGLE_GENERATIVE_AI_API_KEY') || hasEnv('GOOGLE_GEMINI_API_KEY');
   const generalSearchPresent = enabledProviders.some((provider) => GENERAL_SEARCH_PROVIDERS.has(provider));
   const socialProviders = new Set(['reddit', 'youtube', 'x', 'tiktok', 'instagram', 'facebook_groups', 'podcasts']);
   const socialSearchPresent = enabledProviders.some((provider) => socialProviders.has(provider));
+  const models = modelRequirements(research, credentials, kind, synthesisModel, missing, warnings);
 
   if (kind === 'managed') {
     if (!hasEnv('PERPLEXITY_API_KEY')) addMissing(missing, 'PERPLEXITY_API_KEY');
   } else if (kind === 'answer') {
     if (!generalSearchPresent) addMissing(missing, 'at least one enabled general search provider');
-    requireSynthesisCredential(synthesisModel, missing);
   } else {
-    if (!geminiPresent) addMissing(missing, 'a supported Gemini API key');
-    requireSynthesisCredential(synthesisModel, missing);
     if (!hasEnv('VOYAGE_API_KEY')) {
       warnings.push('VOYAGE_API_KEY is absent; quote reranking will use stable provider order.');
-    }
-    if (!hasEnv('ANTHROPIC_API_KEY')) {
-      warnings.push(kind === 'quick'
-        ? 'ANTHROPIC_API_KEY is absent; Gemini planner retries have no Claude fallback.'
-        : 'ANTHROPIC_API_KEY is absent; critique will use its permissive fallback.');
     }
     if (kind === 'social') {
       if (!socialSearchPresent) addMissing(missing, 'at least one enabled social search provider');
@@ -485,7 +501,7 @@ function requiredConfiguration(kind, enabledProviders, synthesisModel) {
     }
   }
 
-  return { missing, warnings };
+  return { missing, warnings, models };
 }
 
 async function packageVersion() {
@@ -555,7 +571,7 @@ async function preflight(
   const enabledSearch = typeof research.getEnabledSearchProviders === 'function'
     ? Object.keys(research.getEnabledSearchProviders(credentials)).sort()
     : enabled.filter((provider) => provider !== 'crawl4ai');
-  const config = requiredConfiguration(kind, enabled, synthesisModel);
+  const config = requiredConfiguration(research, credentials, kind, enabled, synthesisModel);
   let sourcePlan = null;
   let effectiveRequiredProviders = [...requiredProviders];
   if ((sources.length > 0 || profileRef !== undefined) && asOf === undefined) {
@@ -623,6 +639,7 @@ async function preflight(
     kind,
     requested_max_cost_usd: maxCostUsd ?? null,
     synthesis_model: synthesisModel,
+    model_requirements: config.models,
     built_kinds: builtKinds,
     build_freshness: freshness,
     enabled_providers: enabled,
@@ -711,7 +728,7 @@ async function main() {
       throw new Error('--as-of must be YYYY-MM-DD or an RFC3339 timestamp with an explicit offset.');
     }
   }
-  const synthesisModel = effectiveSynthesisModel(kind, values['synthesis-model']);
+  const synthesisModel = effectiveSynthesisModel(values['synthesis-model']);
   if (PIPELINE_KINDS.has(kind) && maxCostUsd === undefined) {
     throw new Error(`--max-cost-usd is required for ${kind} research.`);
   }

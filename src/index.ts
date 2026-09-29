@@ -10,6 +10,7 @@
  */
 
 import { vendorUnitCostUsd } from '@braintied/cost';
+import { findCatalogModel } from '@braintied/models';
 import { z } from 'zod';
 import {
   hashUrl,
@@ -44,6 +45,7 @@ import type { ResearchDepth } from './depth-config.js';
 import { CostTracker } from './cost-tracker.js';
 import {
   researchModelRates,
+  researchStageResolution,
   resolveResearchCritiqueModel,
 } from './model-policy.js';
 import {
@@ -118,8 +120,11 @@ export {
   RESEARCH_ENV_NAMES,
   GEMINI_KEY_ENV_NAMES,
   GEMINI_KEY_NAME_ENV,
+  NEUTRAL_GEMINI_KEY_NAME_ENV,
   CRAWL4AI_ALLOWED_DOMAINS_ENV,
+  NEUTRAL_CRAWL4AI_ALLOWED_DOMAINS_ENV,
   CRAWL4AI_NETWORK_GUARD_ENV,
+  NEUTRAL_CRAWL4AI_NETWORK_GUARD_ENV,
   CRAWL4AI_NETWORK_GUARD_VALUE,
 } from './credentials.js';
 export type {
@@ -300,7 +305,19 @@ export {
   resolveResearchAssemblyModel,
   researchModelRates,
   researchStageCostFields,
+  researchStageResolution,
+  researchModelRequirements,
 } from './model-policy.js';
+export type { ResearchModelRequirement, ResearchModelStage } from './model-policy.js';
+
+// The one model transport every stage calls; routes by the resolution's provider.
+export {
+  callModel,
+  credentialFieldForProvider,
+  providerForModelId,
+  UnroutableModelError,
+} from './model-call.js';
+export type { ModelCallInput, ModelCallResult, ModelCallTarget } from './model-call.js';
 
 // Research kinds — semantic presets (quick/standard/deep/managed/social).
 export {
@@ -466,28 +483,21 @@ const SAFE_USAGE_SOURCE_MODES = new Set([
   'all', 'all_public', 'all_social', 'community', 'cortex', 'facebook_groups',
   'github', 'instagram', 'reddit', 'telegram', 'tiktok', 'web', 'x', 'youtube',
 ]);
-const SAFE_USAGE_MODELS = new Set([
-  'claude-haiku-4-5',
-  'claude-sonnet-4-6',
-  'claude-sonnet-5',
-  'deepseek-v4-flash',
-  'deepseek-v4-pro',
-  'gemini-2.5-flash',
-  // EXTRACTION_MODEL. Must be listed here or `sanitizeUsageValue` drops the
-  // model name from usage telemetry entirely (returns undefined for an
-  // unlisted value), which silently destroys per-model cost attribution.
-  // Any change to EXTRACTION_MODEL must add the new id to this set.
-  'gemini-2.5-flash-lite',
-  'gemini-3.6-flash',
-  'gemini-3.1-flash-lite',
-  'gemini-3.5-flash-lite',
-  'gemini-3.5-flash-lite',
-  'gemini-3.6-flash',
-  'glm-5.2',
+/**
+ * Model ids emitted in usage metadata that the `@braintied/models` catalog
+ * does not carry: the OpenRouter bake-off id. Every catalog id is accepted by
+ * `isSafeUsageModel`, so the model a stage resolves to is never dropped from
+ * telemetry. The hand-kept list this replaced did not name `deepseek-flash`,
+ * so under the fleet default every research cost event would have reached
+ * the ledger with no model at all.
+ */
+const SAFE_NON_CATALOG_USAGE_MODELS = new Set([
   'qwen/qwen3-235b-a22b-instruct-2507',
-  'sonar-deep-research',
-  'voyage-4-large',
 ]);
+
+function isSafeUsageModel(value: string): boolean {
+  return SAFE_NON_CATALOG_USAGE_MODELS.has(value) || findCatalogModel(value) !== null;
+}
 
 const SAFE_USAGE_NUMERIC_FIELDS = new Set([
   'actual_tokens',
@@ -503,7 +513,7 @@ function safeUsageString(key: string, value: string): string | undefined {
   if (key === 'operation') return SAFE_USAGE_OPERATIONS.has(value) ? value : undefined;
   if (key === 'sort') return SAFE_USAGE_SORTS.has(value) ? value : undefined;
   if (key === 'source_mode') return SAFE_USAGE_SOURCE_MODES.has(value) ? value : undefined;
-  if (key === 'model') return SAFE_USAGE_MODELS.has(value) ? value : undefined;
+  if (key === 'model') return isSafeUsageModel(value) ? value : undefined;
   return undefined;
 }
 
@@ -852,23 +862,17 @@ export async function runDeepResearch(
   // Planner spend → CostTracker 'plan' category (audit F8: previously never
   // recorded, so the hard cap under-counted by every plan + re-plan call).
   const plannerUsageSink = (usage: PlannerUsage): void => {
-    const isGemini = usage.model.startsWith('gemini-');
-    const extractRates = extractionRates();
-    const pricing = isGemini
-      ? { inputUsdPerM: extractRates.inputUsdPerM, outputUsdPerM: extractRates.outputUsdPerM, provider: 'google' }
-      : (() => {
-          const p = getModelPricing(usage.model);
-          return { inputUsdPerM: p.inputUsdPerM, outputUsdPerM: p.outputUsdPerM, provider: p.provider };
-        })();
+    // Rates for the model that ran; provider is the one that served it.
+    const pricing = getModelPricing(usage.model);
     costTracker.record({
-      provider: pricing.provider,
+      provider: usage.provider,
       category: 'plan',
       units: usage.inputTokens,
       unit_cost_usd: pricing.inputUsdPerM / 1_000_000,
       metadata: { model: usage.model, operation: 'plan-input' },
     });
     costTracker.record({
-      provider: pricing.provider,
+      provider: usage.provider,
       category: 'plan',
       units: usage.outputTokens,
       unit_cost_usd: pricing.outputUsdPerM / 1_000_000,
@@ -1781,7 +1785,8 @@ async function extractQuotes(
       const markdown = markdownByUrl[result.url];
       const providerName = result.provider;
       const provider = enabledProviders[providerName];
-      const modelId = extractionModelId();
+      const extractResolution = researchStageResolution('extract');
+      const modelId = extractResolution.apiModelId;
       const cacheKey = extractCacheKey(result.url, markdown, modelId);
 
       let extracted: ExtractedQuotes | null = null;
@@ -1843,7 +1848,7 @@ async function extractQuotes(
       // Cache hits do not re-bill the LLM (record $0 with operation tag).
       if (cacheHit) {
         costTracker.record({
-          provider: 'google',
+          provider: extractResolution.provider,
           category: 'extract',
           units: 0,
           unit_cost_usd: 0,
@@ -1852,14 +1857,14 @@ async function extractQuotes(
       } else if (extracted.usage !== undefined) {
         const rates = extractionRates();
         costTracker.record({
-          provider: 'google',
+          provider: extractResolution.provider,
           category: 'extract',
           units: extracted.usage.prompt_tokens,
           unit_cost_usd: rates.inputUsdPerM / 1_000_000,
           metadata: { model: modelId, operation: 'extract-input' },
         });
         costTracker.record({
-          provider: 'google',
+          provider: extractResolution.provider,
           category: 'extract',
           units: extracted.usage.candidate_tokens,
           unit_cost_usd: rates.outputUsdPerM / 1_000_000,
@@ -1869,7 +1874,7 @@ async function extractQuotes(
         const rates = extractionRates();
         const estimatedInputTokens = Math.ceil(Math.min(markdown.length, GEMINI_MAX_CONTENT_CHARS) / CHARS_PER_TOKEN);
         costTracker.record({
-          provider: 'google',
+          provider: extractResolution.provider,
           category: 'extract',
           units: estimatedInputTokens,
           unit_cost_usd: rates.inputUsdPerM / 1_000_000,

@@ -7,6 +7,7 @@ import {
   categorizeItems,
   type CategorizeTaxonomy,
 } from '../src/ingestion/categorize.js';
+import { MissingCredentialError } from '../src/credentials.js';
 import { KNOWLEDGE_CATEGORIES } from '../src/ingestion/types.js';
 import type { IngestedItem } from '../src/ingestion/types.js';
 
@@ -139,7 +140,8 @@ test('a missing API key throws instead of silently leaving everything uncategori
   };
   await assert.rejects(
     () => categorizeItems(NO_CREDENTIALS, [one], BALI_TAXONOMY),
-    (error: unknown) => error instanceof Error && /geminiApiKey/.test(error.message),
+    // The field is the key for whichever provider research-extract resolves to.
+    (error: unknown) => error instanceof MissingCredentialError && /ApiKey$/.test(error.field),
   );
   // And it threw before touching the item, rather than half-applying.
   assert.equal(one.category, 'other');

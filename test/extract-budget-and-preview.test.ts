@@ -86,7 +86,12 @@ test('quick is cheaper than standard on extract pages and hard cap', () => {
 test('EXTRACTION_MODEL is not a banned preview id', () => {
   assert.equal(EXTRACTION_MODEL.includes('preview'), false);
   assert.equal(extractionModelId().includes('preview'), false);
-  assert.equal(extractionModelId(), resolveGeminiRequestModel(EXTRACTION_MODEL));
+  // Research stages are provider-neutral (`research-extract` carries no
+  // `providers` filter), so the live pick is whatever the fleet profile
+  // resolves — DeepSeek Flash under the default, not always a Gemini id.
+  // Running it back through the Gemini preview-rewrite gate must be a no-op:
+  // it is not itself a banned preview id needing rewrite.
+  assert.equal(resolveGeminiRequestModel(extractionModelId()), extractionModelId());
 });
 
 test('resolveGeminiRequestModel rewrites the July tax id', () => {

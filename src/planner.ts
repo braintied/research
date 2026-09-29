@@ -4,33 +4,28 @@
  * Decomposes a research brief into 15–35 web-searchable subqueries,
  * grouped by section, with provider routing for each subquery.
  *
- * Primary model: extractionModelId() via @braintied/models (google cheap).
- * Fallback model: STRONG style from @braintied/models (if Gemini fails after 2 retries).
+ * Primary model: `research-extract` from @braintied/models.
+ * Fallback model: STRONG style from @braintied/models (if the primary fails after 2 retries).
  */
 
 import { z } from 'zod';
-import Anthropic from '@anthropic-ai/sdk';
-import { resolveForStyle } from '@braintied/models';
+import { resolveForStyle, type ModelResolution } from '@braintied/models';
 import { logger } from './logger.js';
-import { extractionModelId } from './pipeline-core.js';
-import {
-  requireAnthropicApiKey,
-  requireGeminiApiKey,
-  type ResearchCredentials,
-} from './credentials.js';
+import type { ResearchCredentials } from './credentials.js';
+import { callModel } from './model-call.js';
+import { researchStageResolution } from './model-policy.js';
 import { SubquerySchema } from './types.js';
 import type { Subquery } from './types.js';
 
-/** Planner Anthropic fallback — live STRONG pin from catalog, not a hardcoded id. */
-function plannerFallbackModelId(): string {
-  return resolveForStyle('STRONG', { moduleId: 'research' }).apiModelId;
+/** Planner fallback — the live STRONG pin from the catalog, not a hardcoded id. */
+function plannerFallbackResolution(): ModelResolution {
+  return resolveForStyle('STRONG', { moduleId: 'research' });
 }
 
 // =============================================================================
 // Constants
 // =============================================================================
 
-const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 const PLANNER_MAX_RETRIES = 2;
 
 /** Provider → the content need it serves, used to build the routing table. */
@@ -110,128 +105,47 @@ const PlannerOutputSchema = z.object({
   subqueries: z.array(SubquerySchema),
 });
 
-const GeminiResponseSchema = z.object({
-  candidates: z.array(
-    z.object({
-      content: z.object({
-        parts: z.array(
-          z.object({
-            text: z.string(),
-          }),
-        ),
-      }),
-    }),
-  ),
-  usageMetadata: z.object({
-    promptTokenCount: z.number().int().nonnegative().default(0),
-    candidatesTokenCount: z.number().int().nonnegative().default(0),
-    // Disjoint from candidates, billed as output. Undeclared here means zod
-    // strips it and every thinking-enabled call under-books.
-    thoughtsTokenCount: z.number().int().nonnegative().default(0),
-  }).optional(),
-});
-
 /** Token usage reported for one planner LLM call (audit F8). */
 export interface PlannerUsage {
+  /** Catalog provider that served the call. */
+  provider: string;
+  /** Wire model id that ran. */
   model: string;
   inputTokens: number;
   outputTokens: number;
 }
 
 // =============================================================================
-// Gemini call helper
+// Model call helper
 // =============================================================================
 
-async function callGemini(
+/**
+ * One planner call. Primary is `research-extract` (the cheap volume stage);
+ * the fallback is the STRONG style. Both come from `@braintied/models` and go
+ * through `callModel`, so each reaches whichever provider it resolved to.
+ */
+async function callPlannerModel(
   credentials: ResearchCredentials,
+  resolution: ModelResolution,
   userMessage: string,
   systemPrompt: string,
 ): Promise<{ text: string; usage: PlannerUsage }> {
-  const key = requireGeminiApiKey(credentials);
-  const wireModel = extractionModelId();
-  const url = `${GEMINI_API_BASE}/${wireModel}:generateContent`;
-
-  const body = {
-    system_instruction: { parts: [{ text: systemPrompt }] },
-    contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-    generationConfig: {
-      responseMimeType: 'application/json',
-      temperature: 0.2,
-      maxOutputTokens: 8192,
-    },
-  };
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': key,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Gemini API error: ${response.status}`);
-  }
-
-  const raw: unknown = await response.json();
-  const parsed = GeminiResponseSchema.parse(raw);
-
-  const firstCandidate = parsed.candidates[0];
-  if (firstCandidate === undefined) {
-    throw new Error('Gemini returned no candidates');
-  }
-  const firstPart = firstCandidate.content.parts[0];
-  if (firstPart === undefined) {
-    throw new Error('Gemini returned empty content parts');
-  }
-
-  const usageMeta = parsed.usageMetadata;
-  return {
-    text: firstPart.text,
-    usage: {
-      model: wireModel,
-      inputTokens: usageMeta !== undefined ? usageMeta.promptTokenCount : 0,
-      // candidates + thoughts: Google bills thinking tokens as output.
-      outputTokens: usageMeta !== undefined
-        ? usageMeta.candidatesTokenCount + usageMeta.thoughtsTokenCount
-        : 0,
-    },
-  };
-}
-
-// =============================================================================
-// Claude fallback call helper
-// =============================================================================
-
-async function callClaude(
-  credentials: ResearchCredentials,
-  userMessage: string,
-  systemPrompt: string,
-): Promise<{ text: string; usage: PlannerUsage }> {
-  const anthropic = new Anthropic({ apiKey: requireAnthropicApiKey(credentials) });
-  const modelId = plannerFallbackModelId();
-
-  const response = await anthropic.messages.create({
-    model: modelId,
-    max_tokens: 8192,
+  const result = await callModel({
+    credentials,
     system: systemPrompt,
-    messages: [{ role: 'user', content: userMessage }],
+    user: userMessage,
+    model: resolution,
+    maxTokens: 8192,
+    temperature: 0.2,
+    jsonResponse: true,
   });
-
-  let text = '';
-  for (const block of response.content) {
-    if (block.type === 'text') {
-      text += block.text;
-    }
-  }
-
   return {
-    text,
+    text: result.text,
     usage: {
-      model: modelId,
-      inputTokens: response.usage.input_tokens,
-      outputTokens: response.usage.output_tokens,
+      provider: result.provider,
+      model: result.model,
+      inputTokens: result.inputTokens + result.cachedReadTokens,
+      outputTokens: result.outputTokens,
     },
   };
 }
@@ -258,7 +172,7 @@ function extractJson(text: string): string {
 // =============================================================================
 
 export interface PlanSubqueriesInput {
-  /** Host-resolved credentials; planning needs the Gemini key, Claude on fallback. */
+  /** Host-resolved credentials; planning needs the key for whichever provider each stage resolves to. */
   credentials: ResearchCredentials;
   promptMd: string;
   targetWordCount: { min: number; max: number };
@@ -307,44 +221,46 @@ export async function planSubqueries(input: PlanSubqueriesInput): Promise<Subque
     }
   };
 
-  // Try Gemini up to PLANNER_MAX_RETRIES times
-  let geminiText: string | null = null;
+  // Try the primary model up to PLANNER_MAX_RETRIES times
+  const primary = researchStageResolution('extract');
+  let primaryText: string | null = null;
   for (let attempt = 0; attempt < PLANNER_MAX_RETRIES; attempt++) {
     try {
-      const geminiResult = await callGemini(credentials, userMessage, systemPrompt);
-      reportUsage(geminiResult.usage);
-      geminiText = geminiResult.text;
-      const jsonStr = extractJson(geminiText);
+      const primaryResult = await callPlannerModel(credentials, primary, userMessage, systemPrompt);
+      reportUsage(primaryResult.usage);
+      primaryText = primaryResult.text;
+      const jsonStr = extractJson(primaryText);
       const parsed = PlannerOutputSchema.parse(JSON.parse(jsonStr));
       logger.info(
-        { count: parsed.subqueries.length, attempt, subqueriesMin, subqueriesMax },
-        '[planner] Gemini subqueries produced',
+        { count: parsed.subqueries.length, attempt, subqueriesMin, subqueriesMax, model: primary.apiModelId },
+        '[planner] Subqueries produced',
       );
       return parsed.subqueries;
     } catch (err: unknown) {
       logger.warn(
-        { err: String(err), attempt },
-        '[planner] Gemini attempt failed, retrying',
+        { err: String(err), attempt, model: primary.apiModelId },
+        '[planner] Primary attempt failed, retrying',
       );
     }
   }
 
-  // Fallback: Claude Sonnet 4.6
-  logger.info('[planner] Falling back to Claude for subquery planning');
+  // Fallback: the STRONG style
+  const fallback = plannerFallbackResolution();
+  logger.info({ model: fallback.apiModelId }, '[planner] Falling back to the STRONG model for subquery planning');
   try {
-    const claudeResult = await callClaude(credentials, userMessage, systemPrompt);
-    reportUsage(claudeResult.usage);
-    const jsonStr = extractJson(claudeResult.text);
+    const fallbackResult = await callPlannerModel(credentials, fallback, userMessage, systemPrompt);
+    reportUsage(fallbackResult.usage);
+    const jsonStr = extractJson(fallbackResult.text);
     const parsed = PlannerOutputSchema.parse(JSON.parse(jsonStr));
     logger.info(
-      { count: parsed.subqueries.length, subqueriesMin, subqueriesMax },
-      '[planner] Claude fallback subqueries produced',
+      { count: parsed.subqueries.length, subqueriesMin, subqueriesMax, model: fallback.apiModelId },
+      '[planner] Fallback subqueries produced',
     );
     return parsed.subqueries;
   } catch (err: unknown) {
     logger.error(
-      { err: String(err), geminiText },
-      '[planner] Both Gemini and Claude failed to produce valid subqueries',
+      { err: String(err), primaryText },
+      '[planner] Primary and fallback models both failed to produce valid subqueries',
     );
     return [];
   }
@@ -354,45 +270,16 @@ export async function summarizePromptBrief(
   credentials: ResearchCredentials,
   promptMd: string,
 ): Promise<string> {
-  const key = requireGeminiApiKey(credentials);
-  const url = `${GEMINI_API_BASE}/${extractionModelId()}:generateContent`;
-
   const systemInstruction =
     'You are a research coordinator. Distill the following research brief into a single paragraph of 2–4 sentences that captures the core question, audience, and desired output. Be precise and concrete. Return only the paragraph text — no labels, no markdown.';
 
-  const body = {
-    system_instruction: { parts: [{ text: systemInstruction }] },
-    contents: [{ role: 'user', parts: [{ text: promptMd }] }],
-    generationConfig: {
-      temperature: 0.1,
-      maxOutputTokens: 512,
-    },
-  };
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': key,
-    },
-    body: JSON.stringify(body),
+  const result = await callModel({
+    credentials,
+    system: systemInstruction,
+    user: promptMd,
+    model: researchStageResolution('extract'),
+    maxTokens: 512,
+    temperature: 0.1,
   });
-
-  if (!response.ok) {
-    throw new Error(`Gemini summarize error: ${response.status}`);
-  }
-
-  const raw: unknown = await response.json();
-  const parsed = GeminiResponseSchema.parse(raw);
-
-  const firstCandidate = parsed.candidates[0];
-  if (firstCandidate === undefined) {
-    throw new Error('Gemini summarize returned no candidates');
-  }
-  const firstPart = firstCandidate.content.parts[0];
-  if (firstPart === undefined) {
-    throw new Error('Gemini summarize returned empty parts');
-  }
-
-  return firstPart.text.trim();
+  return result.text.trim();
 }

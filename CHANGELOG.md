@@ -1,3 +1,38 @@
+## 2.4.1
+
+### Patch Changes
+
+- Updated dependencies [9503674]
+  - @braintied/models@1.18.1
+
+## 2.4.0
+
+### Minor Changes
+
+- 9c924ba: Neutral env names, read first, with the old names kept as fallbacks: `RESEARCH_GEMINI_KEY_NAME`, `RESEARCH_CRAWL4AI_ALLOWED_DOMAINS`, `RESEARCH_CRAWL4AI_NETWORK_GUARD`, `RESEARCH_GITHUB_PUBLIC_TOKEN` and `RESEARCH_GITHUB_REQUIRE_AUTH` (were `BRAINTIED_*`). `RESEARCH_ENV_NAMES` lists both; the runner script imports and honours both. New exports `NEUTRAL_GEMINI_KEY_NAME_ENV`, `NEUTRAL_CRAWL4AI_ALLOWED_DOMAINS_ENV`, `NEUTRAL_CRAWL4AI_NETWORK_GUARD_ENV`. A deployment that changes nothing keeps working.
+
+### Patch Changes
+
+- Updated dependencies [6a9d932]
+- Updated dependencies [6a9d932]
+  - @braintied/cost@5.0.1
+  - @braintied/models@1.18.0
+
+## 2.3.0
+
+### Minor Changes
+
+- 2aeb411: Research model stages move to `deepseek-flash` under the fleet default. Planning, per-page extraction, categorisation, synthesis, critique and assembly now all go through one transport, `callModel`, which routes by the `@braintied/models` resolution's provider instead of by model-name prefix: google on its native generateContent, OpenRouter for `qwen*` overrides, and every other provider (DeepSeek, Fireworks, Anthropic, Z.ai) on its Anthropic-compatible Messages endpoint from `providerWires`. Under the `deepseek_flash` default every stage resolves DeepSeek V4.1 Flash and needs `DEEPSEEK_API_KEY`; under `BRAINTIED_DATA_RESIDENCY=us` it resolves the same weights on Fireworks and needs the new `ResearchCredentials.fireworksApiKey` (`FIREWORKS_API_KEY`). A host that does not supply the resolved provider's key gets `MissingCredentialError` naming that field, as it did for Gemini.
+
+  Cost attribution follows the model that ran: extraction and planner rows carry the resolved provider (they were hard-coded `google`), `getModelPricing` / `tryGetModelPricing` price any catalog id from `@braintied/models` (so `deepseek-flash` is no longer booked at the Sonnet fallback under `anthropic`), `ModelPricing.provider` widens to `string`, and usage telemetry keeps every catalog model id (the hand-kept allowlist dropped `deepseek-flash`). The extract stage runs with thinking off (its `effort: 'minimum'`); critique keeps the provider's default thinking and gets a 16k output ceiling so the thinking cannot truncate its JSON. New exports: `callModel`, `providerForModelId`, `UnroutableModelError`, `researchStageResolution`, and the `ModelCallInput` / `ModelCallResult` / `ModelCallTarget` types. `synthesisGenerate` remains as the same function.
+
+### Patch Changes
+
+- Updated dependencies [991cc18]
+- Updated dependencies [2aeb411]
+- Updated dependencies [761fd01]
+  - @braintied/models@1.17.0
+
 ## 2.2.1
 
 ### Patch Changes

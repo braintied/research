@@ -21,6 +21,8 @@
  * isn't truncated mid-flight.
  */
 
+import { findCatalogModel, pricing as catalogPricing } from '@braintied/models';
+
 export type ResearchDepth = 'quick' | 'blog' | 'standard' | 'wide';
 
 export interface DepthTunables {
@@ -201,8 +203,11 @@ export interface ModelPricing {
   outputUsdPerM: number;
   /** Optional: USD per 1,000,000 input tokens on a cache hit. */
   cacheHitInputUsdPerM?: number;
-  /** Provider tag — used as `CostEntry.provider`. */
-  provider: 'anthropic' | 'google' | 'deepseek' | 'openrouter';
+  /**
+   * Provider tag — used as `CostEntry.provider`. A `@braintied/models` catalog
+   * provider name for catalog-priced ids (`deepseek`, `fireworks`, ...).
+   */
+  provider: string;
 }
 
 export const MODEL_PRICING: Record<string, ModelPricing> = {
@@ -286,6 +291,16 @@ export function tryGetModelPricing(model: string, asOf?: Date): ModelPricing | n
       const datedMatch = MODEL_PRICING[undated];
       if (datedMatch !== undefined) return datedMatch;
     }
+  }
+
+  // Every id the models package can resolve a research stage to is in its
+  // catalog. The table above only adds cache-hit rates; without this lookup
+  // `deepseek-flash` (the fleet default) fell through to the Sonnet fallback
+  // and was booked at $3/$15 under provider 'anthropic'.
+  const row = findCatalogModel(model);
+  const rates = catalogPricing(model);
+  if (row !== null && rates !== null) {
+    return { inputUsdPerM: rates.inputPer1M, outputUsdPerM: rates.outputPer1M, provider: row.provider };
   }
 
   return null;

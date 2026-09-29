@@ -1,13 +1,17 @@
 /**
- * Gemini Extractor — shared verbatim-quote extraction helper for all providers.
+ * Shared verbatim-quote extraction helper for all providers.
  *
- * Calls Gemini 3.1 Flash Lite with mode-specific prompts and returns
- * Zod-validated ExtractedQuotes. Used by reddit, youtube, hn, crawl4ai, serpapi.
+ * Calls the `research-extract` model from `@braintied/models` through
+ * `callModel` with mode-specific prompts and returns Zod-validated
+ * ExtractedQuotes. Used by reddit, youtube, hn, crawl4ai, serpapi. The
+ * "Gemini" in the names is historical: the stage runs whichever provider the
+ * fleet profile resolves (DeepSeek V4.1 Flash under the default).
  */
 
 import { z } from 'zod';
-import { fetchWithRetry, extractionModelId } from '../pipeline-core.js';
-import { requireGeminiApiKey, type ResearchCredentials } from '../credentials.js';
+import { MissingCredentialError, type ResearchCredentials } from '../credentials.js';
+import { callModel, type ModelCallResult } from '../model-call.js';
+import { researchStageResolution } from '../model-policy.js';
 import {
   ExtractedQuotesSchema,
   type ExtractedQuotes,
@@ -33,25 +37,19 @@ export interface GeminiExtractInput {
 }
 
 // =============================================================================
-// Gemini response envelope schema (minimal — just what we need)
+// Model call settings
 // =============================================================================
 
-const GeminiResponseEnvelopeSchema = z.object({
-  candidates: z.array(z.object({
-    content: z.object({
-      parts: z.array(z.object({
-        text: z.string(),
-      })),
-    }),
-  })),
-  usageMetadata: z.object({
-    promptTokenCount: z.number().int().nonnegative().default(0),
-    candidatesTokenCount: z.number().int().nonnegative().default(0),
-    // Disjoint from candidates, billed as output. Undeclared here means zod
-    // strips it and every thinking-enabled call under-books.
-    thoughtsTokenCount: z.number().int().nonnegative().default(0),
-  }).optional(),
-});
+/** Per-page deadline. A page that has not extracted in a minute is skipped. */
+const EXTRACTION_TIMEOUT_MS = 60_000;
+
+/**
+ * The instructions live in the user turn (see buildPrompt). The system turn
+ * only pins the output format, which Gemini got from the prompt alone and a
+ * model without a JSON response mode needs said plainly.
+ */
+const EXTRACTION_SYSTEM_PROMPT =
+  'You extract verbatim evidence from source content. Reply with the single JSON object the instructions describe and nothing else: no markdown fences, no commentary.';
 
 // =============================================================================
 // Raw quote schema (what Gemini returns per quote in its JSON array)
@@ -349,69 +347,40 @@ function parseGeminiJsonObject(rawText: string): unknown {
 // =============================================================================
 
 export async function extractQuotesWithGemini(input: GeminiExtractInput): Promise<ExtractedQuotes> {
-  const geminiKey = requireGeminiApiKey(input.credentials);
   const prompt = buildPrompt(input);
 
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${extractionModelId()}:generateContent`;
-
-  let rawJson: unknown;
-
+  let result: ModelCallResult;
   try {
-    const response = await fetchWithRetry(
-      geminiUrl,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': geminiKey,
-        },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.2,
-            maxOutputTokens: 8192,
-          },
-        }),
-        signal: AbortSignal.timeout(60000),
-      },
-      3,
-      2000,
-    );
-
-    if (!response.ok) {
-      throw new Error(`Gemini API error: ${response.status}`);
-    }
-
-    rawJson = await response.json();
+    result = await callModel({
+      credentials: input.credentials,
+      system: EXTRACTION_SYSTEM_PROMPT,
+      user: prompt,
+      model: researchStageResolution('extract'),
+      maxTokens: 8192,
+      temperature: 0.2,
+      timeoutMs: EXTRACTION_TIMEOUT_MS,
+    });
   } catch (err) {
+    // A missing credential is a host configuration fault, not a bad page:
+    // swallowing it would extract zero quotes from every page of every run.
+    if (err instanceof MissingCredentialError) throw err;
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ url: input.url, mode: input.mode, error: msg }, '[GeminiExtractor] API call failed');
     return buildEmptyResult(input);
   }
 
-  const envelopeResult = GeminiResponseEnvelopeSchema.safeParse(rawJson);
-  if (!envelopeResult.success) {
-    logger.warn({ url: input.url, errors: envelopeResult.error.message }, '[GeminiExtractor] Invalid response envelope');
-    return buildEmptyResult(input);
-  }
-
-  const firstCandidate = envelopeResult.data.candidates[0];
-  if (firstCandidate === undefined) {
-    return buildEmptyResult(input);
-  }
-
-  const firstPart = firstCandidate.content.parts[0];
-  if (firstPart === undefined) {
-    return buildEmptyResult(input);
-  }
-
-  const parsed = parseGeminiJsonObject(firstPart.text);
+  const parsed = parseGeminiJsonObject(result.text);
   if (parsed === null) {
     logger.warn({ url: input.url }, '[GeminiExtractor] Could not parse JSON from response');
     return buildEmptyResult(input);
   }
 
-  return normalizeGeminiExtractionPayload(parsed, input, envelopeResult.data.usageMetadata);
+  return normalizeGeminiExtractionPayload(parsed, input, {
+    // Billed input is uncached plus cache-read; the cost row prices both at
+    // the input rate, which bounds spend from above.
+    promptTokenCount: result.inputTokens + result.cachedReadTokens,
+    candidatesTokenCount: result.outputTokens,
+  });
 }
 
 function buildEmptyResult(input: GeminiExtractInput): ExtractedQuotes {

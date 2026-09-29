@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { pricing as catalogPricing, resolveForUseCase } from '@braintied/models';
+
 import { MODEL_PRICING, getModelPricing, tryGetModelPricing } from '../src/depth-config.js';
+import { sanitizePipelineUsageMetadata } from '../src/index.js';
 
 // Regression: gemini-3.6-flash is the default synthesis model for the 'quick'
 // kind, and it was absent from MODEL_PRICING. Every call fell through to the
@@ -58,4 +61,32 @@ test('getModelPricing still bounds an unknown model so the spend cap holds', () 
 test('a dated model id resolves to its undated rates', () => {
   const dated = tryGetModelPricing('claude-haiku-4-5-20251001');
   assert.deepEqual(dated, tryGetModelPricing('claude-haiku-4-5'));
+});
+
+// Regression, same shape as the gemini-3.6-flash one above: `deepseek-flash`
+// (the fleet default every research stage resolves to) and the Fireworks ids a
+// `us` residency resolves to were absent from MODEL_PRICING, so every call fell
+// through to the Sonnet fallback and was booked at $3/$15 under 'anthropic'.
+test('every id a research stage can resolve to is priced from the catalog under its own provider', () => {
+  for (const residency of ['unrestricted', 'us'] as const) {
+    for (const useCase of ['research-extract', 'research-critique', 'research-synthesis', 'research-synthesis-deep'] as const) {
+      const pin = resolveForUseCase(useCase, { moduleId: 'research', residency });
+      const pricing = tryGetModelPricing(pin.apiModelId);
+      assert.notEqual(pricing, null, `${pin.apiModelId} (${useCase}, ${residency}) has no rates`);
+      const catalog = catalogPricing(pin.apiModelId);
+      assert.notEqual(catalog, null);
+      assert.equal(pricing?.inputUsdPerM, catalog?.inputPer1M, `${pin.apiModelId} input rate`);
+      assert.equal(pricing?.outputUsdPerM, catalog?.outputPer1M, `${pin.apiModelId} output rate`);
+      assert.equal(pricing?.provider, pin.provider, `${pin.apiModelId} provider tag`);
+    }
+  }
+});
+
+test('usage telemetry keeps the model name for every catalog id', () => {
+  const pin = resolveForUseCase('research-extract', { moduleId: 'research' });
+  assert.deepEqual(
+    sanitizePipelineUsageMetadata({ model: pin.apiModelId, operation: 'extract-input' }),
+    { model: pin.apiModelId, operation: 'extract-input' },
+  );
+  assert.deepEqual(sanitizePipelineUsageMetadata({ model: 'not-a-model' }), {});
 });

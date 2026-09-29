@@ -1,41 +1,36 @@
 /**
- * categorizeItems — ONE batched Gemini call that tags every ingested item with
+ * categorizeItems — ONE batched model call that tags every ingested item with
  * a contractor-relevant `category`, `tags`, and a one-line `whyItMatters`.
  *
- * Reuses the package's Gemini client conventions (GEMINI_RESEARCH_KEY +
- * EXTRACTION_MODEL via pipeline-core). Output is Zod-validated; when the Gemini
- * CALL fails or returns something unparseable, the items are returned unchanged
+ * Runs the `research-extract` model from `@braintied/models` through
+ * `callModel`, the same as per-page extraction. Output is Zod-validated; when
+ * the model CALL fails or returns something unparseable, the items are returned unchanged
  * with their default category, so the sweep never breaks on a categorizer
  * hiccup.
  *
  * Two failures deliberately do NOT behave that way, because swallowing them
  * hands back a knowledge base where every item is the fallback category with
- * nothing anywhere saying why: a missing Gemini credential, and a taxonomy that
+ * nothing anywhere saying why: a missing model credential, and a taxonomy that
  * cannot produce a coherent prompt. Both throw.
  *
  * The taxonomy is a PARAMETER — see CategorizeTaxonomy below for why.
  */
 
 import { z } from 'zod';
-import { fetchWithRetry, extractionModelId } from '../pipeline-core.js';
-import { requireGeminiApiKey, type ResearchCredentials } from '../credentials.js';
+import { MissingCredentialError, type ResearchCredentials } from '../credentials.js';
+import { callModel } from '../model-call.js';
+import { researchStageResolution } from '../model-policy.js';
 import { logger } from '../logger.js';
 import { KNOWLEDGE_CATEGORIES } from './types.js';
 import type { IngestedItem, KnowledgeCategory } from './types.js';
 
 // =============================================================================
-// Gemini response envelope + per-item result schemas
+// Model call settings + per-item result schemas
 // =============================================================================
 
-const GeminiEnvelopeSchema = z.object({
-  candidates: z.array(
-    z.object({
-      content: z.object({
-        parts: z.array(z.object({ text: z.string() })),
-      }),
-    }),
-  ),
-});
+/** The instructions are in the user turn; the system turn pins the format. */
+const CATEGORIZE_SYSTEM_PROMPT =
+  'You categorise research items. Reply with the single JSON object the instructions describe and nothing else: no markdown fences, no commentary.';
 
 const CategorizedEntrySchema = z.object({
   index: z.number().int().nonnegative(),
@@ -55,7 +50,7 @@ const CategorizedBatchSchema = z.object({
 // Constants
 // =============================================================================
 
-const MAX_BATCH = 40; // items per Gemini call
+const MAX_BATCH = 40; // items per model call
 const MAX_CONTENT_CHARS_PER_ITEM = 800;
 const MAX_TAGS = 6;
 const MAX_QUOTES = 2;
@@ -269,52 +264,33 @@ async function categorizeBatch<C extends string>(
   batch: IngestedItem<C>[],
   taxonomy: CategorizeTaxonomy<C>,
 ): Promise<void> {
-  const geminiKey = requireGeminiApiKey(credentials);
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${extractionModelId()}:generateContent`;
   const prompt = buildPrompt(batch, taxonomy);
 
-  let rawJson: unknown;
+  let text: string;
   try {
-    const response = await fetchWithRetry(
-      url,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': geminiKey,
-        },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: 4096 },
-        }),
-        signal: AbortSignal.timeout(60_000),
-      },
-      3,
-      2000,
-    );
-    if (!response.ok) {
-      throw new Error(`Gemini categorize error: ${response.status}`);
-    }
-    rawJson = await response.json();
+    const result = await callModel({
+      credentials,
+      system: CATEGORIZE_SYSTEM_PROMPT,
+      user: prompt,
+      model: researchStageResolution('extract'),
+      maxTokens: 4096,
+      temperature: 0.1,
+      jsonResponse: true,
+      timeoutMs: 60_000,
+    });
+    text = result.text;
   } catch (err) {
+    // A missing credential is a configuration fault: surface it rather than
+    // hand back a knowledge base where every item is the fallback category.
+    if (err instanceof MissingCredentialError) throw err;
     logger.warn(
       { error: err instanceof Error ? err.message : String(err), batchSize: batch.length },
-      '[categorizeItems] Gemini call failed — items keep default category',
+      '[categorizeItems] model call failed — items keep default category',
     );
     return;
   }
 
-  const envelope = GeminiEnvelopeSchema.safeParse(rawJson);
-  if (!envelope.success) {
-    logger.warn({ errors: envelope.error.message }, '[categorizeItems] invalid envelope');
-    return;
-  }
-  const firstCandidate = envelope.data.candidates[0];
-  if (firstCandidate === undefined) return;
-  const firstPart = firstCandidate.content.parts[0];
-  if (firstPart === undefined) return;
-
-  const parsed = parseJsonObject(firstPart.text);
+  const parsed = parseJsonObject(text);
   if (parsed === null) {
     logger.warn('[categorizeItems] could not parse JSON');
     return;

@@ -4,7 +4,7 @@ import test from 'node:test';
 import { critiqueDraft } from '../src/critique.js';
 import type { ResearchCredentials } from '../src/credentials.js';
 
-test('critique degrades safely when Anthropic is not configured', async () => {
+test('critique degrades safely when the critique model key is not configured', async () => {
   const credentials: ResearchCredentials = {};
   {
     const result = await critiqueDraft({

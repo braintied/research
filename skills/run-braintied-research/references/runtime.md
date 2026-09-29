@@ -158,11 +158,20 @@ paste the value into a brief or log.
 
 | Kind | Required runtime configuration |
 |---|---|
-| `answer` | Gemini key; at least one enabled general search provider |
-| `quick` | Gemini key; at least one enabled general search provider |
-| `standard`, `deep` | Gemini key for planning/extraction; the credential required by the selected synthesis model; at least one enabled general search provider |
+| `answer` | the key for the synthesis model; at least one enabled general search provider |
+| `quick`, `standard`, `deep` | the key for each model stage (extract, synthesis, assembly); at least one enabled general search provider |
 | `social` | Standard pipeline keys plus the appropriate social-source credentials |
 | `managed` | `PERPLEXITY_API_KEY` |
+
+Which key a model stage needs follows from what `@braintied/models` resolves
+for it, and the preflight reads that from the package
+(`researchModelRequirements`) and lists it under `model_requirements`. Under
+the fleet default (`deepseek_flash`) every stage is DeepSeek V4.1 Flash and
+needs `DEEPSEEK_API_KEY`; under `BRAINTIED_DATA_RESIDENCY=us` it is the same
+model on Fireworks and needs `FIREWORKS_API_KEY`. A missing critique key or
+planner-fallback key is a warning, not a failure: those calls degrade.
+`--synthesis-model` is an explicit override; leave it off to run what the
+fleet resolves.
 
 General search providers are enabled by one of `SEARXNG_URLS`,
 `SERPER_API_KEY`, `TAVILY_API_KEY`, `EXA_API_KEY`, or `SERPAPI_KEY`. Specialist
@@ -194,7 +203,7 @@ The Gemini resolver accepts `GEMINI_RESEARCH_KEY`, `GOOGLE_GEMINI_API_KEY`,
 different values, the shared package resolver fails without printing them.
 Direct package consumers must set `BRAINTIED_GEMINI_KEY_NAME=NAME`; the runner
 also accepts `--gemini-key-name NAME`. The chosen value becomes the canonical
-planning/extraction/synthesis key for that process. Preflight reports only the
+Gemini key for that process, used by any stage that resolves to google. Preflight reports only the
 selected variable name, and the runner never persists the value.
 
 `VOYAGE_API_KEY` is optional: without it, reranking preserves provider order.
@@ -291,14 +300,12 @@ node skills/run-braintied-research/scripts/run-research.mjs \
   --check \
   --kind quick \
   --max-cost-usd 0.25 \
-  --synthesis-model gemini-3-flash-preview \
   --load-shell-env
 
 node skills/run-braintied-research/scripts/run-research.mjs \
   --check \
   --kind quick \
   --max-cost-usd 0.25 \
-  --synthesis-model gemini-3-flash-preview \
   --research-env-file /absolute/path/owned-by-this-project/.env \
   --gemini-key-name GOOGLE_GEMINI_API_KEY
 

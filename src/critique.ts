@@ -7,19 +7,19 @@
  * - Sections missing primary evidence from key providers
  * - Factual gaps warranting new subqueries
  *
- * Routes through the unified synthesisGenerate() dispatcher, so the critique
- * model is prefix-routed like every other synthesis call: gemini-3.6-flash is
- * the working default today; glm-5.2 (z.ai) and claude-* become premium options
- * by editing CRITIQUE_MODEL once their quota/credits restore.
+ * Routes through `callModel` with the `research-critique` resolution from
+ * `@braintied/models`, so the critic runs whatever the fleet profile resolves
+ * (DeepSeek V4.1 Flash under the default, with its default thinking on) and
+ * is reached at the provider that resolution names.
  */
 
 import { z } from 'zod';
-import { synthesisGenerate } from './synthesis.js';
+import { callModel } from './model-call.js';
 import type { ResearchCredentials } from './credentials.js';
 import { logger } from './logger.js';
 import { CritiqueSchema } from './types.js';
 import type { Critique, SectionDraft, ProviderName } from './types.js';
-import { resolveResearchCritiqueModel } from './model-policy.js';
+import { researchStageResolution } from './model-policy.js';
 
 // =============================================================================
 // Permissive fallback critique (no gaps, never loop)
@@ -108,12 +108,16 @@ export async function critiqueDraft(input: CritiqueDraftInput): Promise<Critique
 
   let rawText = '';
   try {
-    const result = await synthesisGenerate({
+    const result = await callModel({
       credentials,
       system: systemPrompt,
       user: userMessage,
-      model: resolveResearchCritiqueModel(),
-      maxTokens: 4096,
+      model: researchStageResolution('critique'),
+      // Headroom for the critic's thinking: on the Anthropic wire DeepSeek's
+      // thinking tokens come out of max_tokens, and a truncated reply parses
+      // as no JSON, which returns the permissive critique (no gaps, loop
+      // exits). The JSON itself is small; unused headroom costs nothing.
+      maxTokens: 16384,
     });
     rawText = result.text;
   } catch (err: unknown) {
