@@ -69,6 +69,40 @@ function stripMarkdownPresentation(text: string): string {
     .join('\n');
 }
 
+/**
+ * Caption lines are an artefact of video timing, not of the speaker's
+ * sentences. A transcript arrives as `[t=12] right in` / `[t=12] i got the
+ * set of three`, so a sentence the speaker finished is split over several
+ * lines and no extractor quote of it could ever sit on one line (measured
+ * 2026-09-30: 0 of 7 to 4 of 15 quotes survived on real transcripts). Each
+ * run of consecutive timestamped lines is rejoined into one line with the
+ * timestamps removed; no word is added, removed or reordered. Captions with
+ * no punctuation at all still form a single unterminated unit, which no
+ * quote can equal, so that case stays fail-closed.
+ */
+const CAPTION_LINE = /^\s*\[t=\d+(?:\.\d+)?\]\s?(.*)$/u;
+
+function joinCaptionLines(text: string): string {
+  const out: string[] = [];
+  let run: string[] = [];
+  const flush = (): void => {
+    if (run.length > 0) out.push(run.join(' '));
+    run = [];
+  };
+  for (const line of text.split(/\r?\n/u)) {
+    const caption = CAPTION_LINE.exec(line);
+    if (caption === null) {
+      flush();
+      out.push(line);
+    } else {
+      const words = (caption[1] ?? '').trim();
+      if (words.length > 0) run.push(words);
+    }
+  }
+  flush();
+  return out.join('\n');
+}
+
 function evidenceTokens(text: string): string[] {
   return normalizeUnicodePresentation(text)
     .toLowerCase()
@@ -96,7 +130,7 @@ const MAX_SENTENCES_PER_QUOTE = 4;
  */
 function sourceEvidenceUnits(sourceContent: string): string[] {
   const units: string[] = [];
-  const lines = normalizeUnicodePresentation(stripMarkdownPresentation(sourceContent))
+  const lines = normalizeUnicodePresentation(stripMarkdownPresentation(joinCaptionLines(sourceContent)))
     .split(/(?:\r?\n)+/u);
   for (const line of lines) {
     const sentences = line
@@ -146,4 +180,14 @@ export function isKeyClaimSupportedBySource(
   const normalizedClaim = normalizeExactText(claim);
   if (evidenceTokens(claim).length < MIN_KEY_CLAIM_TOKENS) return false;
   return sourceEvidenceUnits(sourceContent).includes(normalizedClaim);
+}
+
+/**
+ * True when the source holds at least one sentence that ends in terminal
+ * punctuation. A page with none (a video page stub, a nav-only shell, an
+ * unpunctuated transcript) cannot yield a quote the contract would accept, so
+ * paying to extract from it only spends the run's page budget.
+ */
+export function hasVerifiableSentence(sourceContent: string): boolean {
+  return /[.!?\u3002\uFF01\uFF1F]["')\]\u2019\u201D]*(?:\s|$)/u.test(joinCaptionLines(sourceContent));
 }

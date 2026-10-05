@@ -24,7 +24,9 @@ import {
   extractCacheKey,
   EXTRACT_CACHE_TTL_SECONDS,
 } from './extract-cache.js';
+import { selectUrlsToFetch, resultsForSubquery } from './fetch-selection.js';
 import {
+  hasVerifiableSentence,
   isKeyClaimSupportedBySource,
   isVerbatimQuoteSupportedBySource,
 } from './evidence-validation.js';
@@ -410,6 +412,8 @@ export interface EvidenceFunnel {
   sourcesExtracted: number;
   /** Pages with content that the extract budget skipped. */
   sourcesSkippedForBudget: number;
+  /** Pages with no complete sentence at all; nothing on them could be quoted, so they were not extracted. */
+  sourcesWithoutVerifiableText: number;
   quotesExtracted: number;
   quotesValidated: number;
   claimsExtracted: number;
@@ -423,6 +427,7 @@ function emptyEvidenceFunnel(): EvidenceFunnel {
     sourcesWithContent: 0,
     sourcesExtracted: 0,
     sourcesSkippedForBudget: 0,
+    sourcesWithoutVerifiableText: 0,
     quotesExtracted: 0,
     quotesValidated: 0,
     claimsExtracted: 0,
@@ -990,9 +995,12 @@ export async function runDeepResearch(
   recordSourceMeta(allSearchResults);
 
   // Depth-aware fetch cap with global ceiling.
-  const naturalCap = subqueries.length * depthConfig.urlsPerSubquery;
-  const cappedCount = Math.min(naturalCap, CUMULATIVE_URL_CEILING);
-  const urlsToFetch = allSearchResults.slice(0, Math.min(allSearchResults.length, cappedCount));
+  const urlsToFetch = selectUrlsToFetch(
+    subqueries,
+    allSearchResults,
+    depthConfig.urlsPerSubquery,
+    CUMULATIVE_URL_CEILING,
+  );
 
   // ---------------------------------------------------------------------------
   // Step 3: fetch content
@@ -1684,28 +1692,7 @@ async function extractQuotes(
   // across all of a section's subqueries (per-subquery cap preserved).
   const sectionToUrls = new Map<string, string[]>();
   for (const subquery of subqueries) {
-    const sectionUrls: string[] = [];
-    for (const result of allSearchResults) {
-      if (result.retrieved_for.includes(subquery.section_path)) {
-        sectionUrls.push(result.url);
-        if (sectionUrls.length >= urlsPerSubquery) {
-          break;
-        }
-      }
-    }
-    // Legacy fallback for callers composing their own untagged SearchResults
-    // (retrieved_for defaults to []): the old provider heuristic, better than
-    // an evidence-empty section.
-    if (sectionUrls.length === 0) {
-      for (const result of allSearchResults) {
-        if (result.retrieved_for.length === 0 && subquery.providers.includes(result.provider)) {
-          sectionUrls.push(result.url);
-          if (sectionUrls.length >= urlsPerSubquery) {
-            break;
-          }
-        }
-      }
-    }
+    const sectionUrls = resultsForSubquery(subquery, allSearchResults, urlsPerSubquery).map((result) => result.url);
     const existing = sectionToUrls.get(subquery.section_path);
     if (existing === undefined) {
       sectionToUrls.set(subquery.section_path, sectionUrls);
@@ -1723,9 +1710,13 @@ async function extractQuotes(
   const sourceQuotesByUrl: Record<string, VerbatimQuote[]> = {};
   const providerCoverageBySection: Record<string, ProviderName[]> = {};
 
-  const resultsWithContent = allSearchResults.filter(
+  const resultsFetched = allSearchResults.filter(
     (r) => markdownByUrl[r.url] !== undefined && markdownByUrl[r.url].length > 0,
   );
+  // A page with no complete sentence cannot produce a quote the evidence
+  // contract accepts. Drop it before it takes a slot in the extract budget.
+  const resultsWithContent = resultsFetched.filter((r) => hasVerifiableSentence(markdownByUrl[r.url] ?? ''));
+  extractBudget.funnel.sourcesWithoutVerifiableText += resultsFetched.length - resultsWithContent.length;
 
   // Dedup by URL, skip already-extracted, then hard-cap to remaining budget.
   const seen = new Set<string>();

@@ -32,7 +32,10 @@ test('Bright Data scrape follows an accepted asynchronous snapshot to records', 
       credentials,
       'dataset-test',
       [{ url: 'https://example.com/video' }],
-      { initialIntervalMs: 1, maxIntervalMs: 1, maxWaitMs: 100 },
+      // The budget is wall-clock, and the first poll answers `ready`, so a large
+      // value costs nothing. 100 ms flaked under machine load ("not ready after 0s"):
+      // a slow scheduler tick alone spent it before the first progress request.
+      { initialIntervalMs: 1, maxIntervalMs: 1, maxWaitMs: 60_000 },
     );
     assert.equal(records.length, 1);
     assert.equal(records[0]?.title, 'Collected record');

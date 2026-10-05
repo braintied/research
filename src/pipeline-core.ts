@@ -604,6 +604,56 @@ async function crawlWithCrawl4AIDiagnosed(
   }
 }
 
+const NAMED_HTML_ENTITIES: Record<string, string> = {
+  nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+  lsquo: '\u2018', rsquo: '\u2019', ldquo: '\u201C', rdquo: '\u201D',
+  ndash: '\u2013', mdash: '\u2014', hellip: '\u2026',
+};
+
+function decodeHtmlEntities(text: string): string {
+  // One pass, so `&amp;lt;` decodes to the literal text `&lt;`, not `<`.
+  return text.replace(/&(?:#(\d{1,7})|#x([0-9a-f]{1,6})|([a-z]{2,8}));/giu, (match, dec, hex, name) => {
+    if (dec !== undefined || hex !== undefined) {
+      const code = dec !== undefined ? Number.parseInt(dec, 10) : Number.parseInt(hex, 16);
+      return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : '';
+    }
+    return NAMED_HTML_ENTITIES[String(name).toLowerCase()] ?? match;
+  });
+}
+
+/**
+ * Plain HTML to text that keeps the page's block structure.
+ *
+ * The direct-fetch lane used to replace every tag and every newline with one
+ * space, so a whole article became a single line. Sentence-level evidence
+ * validation works per line, so a heading glued to the sentence after it
+ * ("Why Is My Tent Stove Smoking? 7 Common Causes A wood stove can ...") made
+ * that sentence unmatchable, and `</p><p>` joined sentences with no space at
+ * all ("efficiently.For a cleaner"). Measured 2026-09-30 on a luggage brief:
+ * 21 of 25 verbatim quotes the extractor copied exactly from such a page were
+ * rejected. Block-level tags now become line breaks; inline tags vanish.
+ */
+export function htmlToStructuredText(html: string): string {
+  const withBreaks = html
+    .replace(/<script[\s\S]*?<\/script>/giu, '')
+    .replace(/<style[\s\S]*?<\/style>/giu, '')
+    .replace(/<head\b[\s\S]*?<\/head>/giu, '')
+    .replace(/<nav[\s\S]*?<\/nav>/giu, '')
+    .replace(/<header[\s\S]*?<\/header>/giu, '')
+    .replace(/<footer[\s\S]*?<\/footer>/giu, '')
+    .replace(/<!--[\s\S]*?-->/gu, '')
+    .replace(
+      /<\/?(?:p|div|section|article|main|aside|ul|ol|li|dl|dt|dd|table|thead|tbody|tr|th|td|blockquote|pre|figure|figcaption|form|details|summary|h[1-6]|br|hr)\b[^>]*>/giu,
+      '\n',
+    )
+    .replace(/<[^>]+>/gu, ' ');
+  return decodeHtmlEntities(withBreaks)
+    .split(/\r?\n/u)
+    .map((line) => line.replace(/[ \t\f\v\u00A0]+/gu, ' ').trim())
+    .filter((line) => line.length > 0)
+    .join('\n\n');
+}
+
 /**
  * Simple direct HTTP fetch for plain HTML sites (paulgraham.com, blogs, etc.)
  * Strips HTML tags and returns clean text. Used as fallback when Crawl4AI fails.
@@ -628,21 +678,7 @@ export async function directFetchAsText(url: string): Promise<string | null> {
     const titleMatch = html.match(/<title>([^<]*)<\/title>/i);
     const title = titleMatch !== null && titleMatch[1] !== undefined ? titleMatch[1].trim() : '';
 
-    const cleaned = html
-      .replace(/<script[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[\s\S]*?<\/style>/gi, '')
-      .replace(/<nav[\s\S]*?<\/nav>/gi, '')
-      .replace(/<header[\s\S]*?<\/header>/gi, '')
-      .replace(/<footer[\s\S]*?<\/footer>/gi, '')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#\d+;/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
+    const cleaned = htmlToStructuredText(html);
 
     if (cleaned.length < 200) return null;
 

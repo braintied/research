@@ -184,6 +184,11 @@ test('empty HN does not fail community coverage on a culture job', () => {
   const coverage = evaluateSourceModeCoverage(plan, [], {}, { question: '# Burning Man culture' });
   assert.equal(coverage.passed, true);
   assert.deepEqual(coverage.missingModes, []);
+  // Passing on nothing must not be reported as coverage.
+  const entry = coverage.entries[0];
+  assert.equal(entry?.required, false);
+  assert.equal(entry?.discoveryCount, 0);
+  assert.match(entry?.reasons[0] ?? '', /not applicable/);
 });
 
 test('recencyDays 0 drops the 365-day source-mode default', () => {

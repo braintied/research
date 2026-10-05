@@ -232,6 +232,12 @@ Return ONLY valid JSON matching this exact schema — no prose, no markdown fenc
   "themes": []
 }
 
+QUOTE CONTRACT (enforced by code; anything that breaks it is discarded):
+- Copy each quote character for character from the source. Never paraphrase, summarize, reorder, correct, or trim it.
+- A quote is ONE complete sentence, or up to four consecutive complete sentences from the same paragraph. Start at the sentence's first word and end at its closing punctuation.
+- Never join text across paragraphs, list items, headings, or comments. Never quote a heading or a fragment.
+- Each key_claims entry must likewise be one complete sentence copied exactly from the source, with at least four words. Do not write your own summary sentences there.
+
 For sentiment, emit exactly one of "positive", "negative", "neutral", or "mixed". Omit sentiment when it cannot be classified confidently.
 
 Source URL: ${url}`;
@@ -300,7 +306,7 @@ ${truncated}`;
   return `${baseInstruction}
 
 MODE: Long-form article/blog/essay analysis
-- Extract verbatim pull-quotes (meaningful paragraphs or sentences) from the main content
+- Extract verbatim pull-quotes (single sentences, or a few consecutive sentences from one paragraph) from the main content
 - Focus on key arguments, data points, and memorable assertions
 - Maximum 30 verbatim quotes
 - Author from byline/metadata

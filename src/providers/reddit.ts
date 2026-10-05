@@ -312,6 +312,108 @@ async function searchRedditListing(
   return results;
 }
 
+// =============================================================================
+// Topic gate
+// =============================================================================
+
+const TOPIC_STOP = new Set([
+  'the', 'and', 'for', 'with', 'from', 'this', 'that', 'are', 'was', 'were', 'you', 'your',
+  'what', 'which', 'when', 'how', 'why', 'who', 'not', 'but', 'has', 'have', 'had', 'can',
+  'will', 'best', 'vs', 'about', 'into', 'over', 'than', 'then', 'them', 'their', 'there',
+  'review', 'reviews', 'reddit',
+]);
+/** Below this many query tokens a query is too short to judge a thread against. */
+const TOPIC_GATE_MIN_QUERY_TOKENS = 3;
+/** A thread must share at least this many distinct query tokens. One word is never a topic. */
+const TOPIC_GATE_MIN_SHARED = 2;
+
+function topicTokens(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const raw of text.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw.length < 3 || TOPIC_STOP.has(raw)) continue;
+    out.add(raw.length > 4 && raw.endsWith('s') && !raw.endsWith('ss') ? raw.slice(0, -1) : raw);
+  }
+  return out;
+}
+
+/**
+ * Drop threads that match the query on a single incidental word. Reddit's
+ * relevance sort is keyword-driven: a luggage brief that mentions "wheels"
+ * returned a Mars-rover post and a wheeled-robot post, and both reached the
+ * bibliography of a deep run (2026-09-30, run research-run-1790781140597).
+ * Same rule the `research free` hit gate uses: at least two distinct query
+ * tokens must appear in the title or the selftext excerpt.
+ */
+export function filterRedditByTopic(query: string, results: SearchResult[]): SearchResult[] {
+  const wanted = topicTokens(query);
+  if (wanted.size < TOPIC_GATE_MIN_QUERY_TOKENS) return results;
+  return results.filter((result) => {
+    const have = topicTokens(`${result.title} ${result.snippet}`);
+    let shared = 0;
+    for (const token of wanted) if (have.has(token)) shared += 1;
+    return shared >= TOPIC_GATE_MIN_SHARED;
+  });
+}
+
+/**
+ * Subreddits that exist to rank one brand's products are not audience voice.
+ * A luggage query returned threads from r/monos_reviews, r/Monosreviews and
+ * r/Monosluggagereviews (2026-09-30), tiny brand-named review feeds posted by
+ * a few accounts. Two signals, both on the subreddit name:
+ *
+ * - the name is a query word plus an optional short qualifier plus
+ *   `review(s)` (`monosreviews`, `monosluggagereviews`, `awayreviews`);
+ * - any review-named subreddit whose threads in one result batch all come
+ *   from a single author.
+ *
+ * General communities (r/BuyItForLife, r/onebag, r/travel) and general review
+ * subs whose name does not start with a query word are untouched.
+ */
+const REVIEW_SUFFIX = /reviews?$/u;
+const MAX_BRAND_QUALIFIER_CHARS = 14;
+
+function subredditKey(subreddit: string): string {
+  return subreddit.toLowerCase().replace(/[^a-z0-9]/gu, '');
+}
+
+export function isBrandReviewSpamSubreddit(subreddit: string, query: string): boolean {
+  const key = subredditKey(subreddit);
+  if (!REVIEW_SUFFIX.test(key)) return false;
+  const stem = key.replace(REVIEW_SUFFIX, '');
+  for (const token of topicTokens(query)) {
+    if (token.length < 4 || !stem.startsWith(token)) continue;
+    if (stem.length - token.length <= MAX_BRAND_QUALIFIER_CHARS) return true;
+  }
+  return false;
+}
+
+export function dropBrandReviewSpam(query: string, results: SearchResult[]): SearchResult[] {
+  const authorsBySub = new Map<string, Set<string>>();
+  const countBySub = new Map<string, number>();
+  const subOf = (result: SearchResult): string => {
+    const sub = result.raw_metadata['subreddit'];
+    return typeof sub === 'string' ? subredditKey(sub) : '';
+  };
+  for (const result of results) {
+    const sub = subOf(result);
+    if (sub === '') continue;
+    countBySub.set(sub, (countBySub.get(sub) ?? 0) + 1);
+    const authors = authorsBySub.get(sub) ?? new Set<string>();
+    authors.add(result.author ?? '');
+    authorsBySub.set(sub, authors);
+  }
+  return results.filter((result) => {
+    const raw = result.raw_metadata['subreddit'];
+    if (typeof raw !== 'string') return true;
+    if (isBrandReviewSpamSubreddit(raw, query)) return false;
+    const sub = subredditKey(raw);
+    const singleAuthorFeed = REVIEW_SUFFIX.test(sub)
+      && (countBySub.get(sub) ?? 0) >= 2
+      && (authorsBySub.get(sub)?.size ?? 0) === 1;
+    return !singleAuthorFeed;
+  });
+}
+
 function interleaveRedditResults(groups: SearchResult[][], limit: number): SearchResult[] {
   const results: SearchResult[] = [];
   const seen = new Set<string>();
@@ -361,10 +463,11 @@ export function createRedditProvider(credentials: ResearchCredentials): SearchPr
       for (const sort of sorts) {
         groups.push(await searchRedditListing(query, opts, token, userAgent, sort, perSortLimit));
       }
-      const results = interleaveRedditResults(groups, limit);
+      const interleaved = interleaveRedditResults(groups, limit);
+      const results = filterRedditByTopic(query, dropBrandReviewSpam(query, interleaved));
 
       logger.info(
-        { query: query.slice(0, 60), count: results.length, sorts, timeFilter: recencyToTimeFilter(opts.recency_days) },
+        { query: query.slice(0, 60), count: results.length, offTopicDropped: interleaved.length - results.length, sorts, timeFilter: recencyToTimeFilter(opts.recency_days) },
         '[Reddit] Search complete',
       );
 

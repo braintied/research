@@ -602,8 +602,14 @@ export function evaluateSourceModeCoverage(
     if (!communityEmptyOk && sources.size < entry.minimumUniqueSources) {
       reasons.push(`needs ${entry.minimumUniqueSources} unique sources; found ${sources.size}`);
     }
+    const passed = reasons.length === 0;
+    // HN/RSS/podcasts legitimately return nothing for a non-software job, so
+    // the lane still passes. It must not read as coverage: report it as not
+    // required, with the reason on the entry, instead of `required: true,
+    // passed: true` over 0 discoveries and 0 providers.
+    if (communityEmptyOk) reasons.push('not applicable: non-software job and HN/RSS/podcasts returned nothing');
     return {
-      mode: entry.mode, required: true, passed: reasons.length === 0,
+      mode: entry.mode, required: !communityEmptyOk, passed,
       discoveryCount: matching.length, uniqueSourceCount: sources.size,
       providers, reasons,
     };

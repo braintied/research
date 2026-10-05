@@ -1,3 +1,61 @@
+## 2.4.8
+
+### Patch Changes
+
+- Updated dependencies [eafd4f3]
+  - @braintied/models@1.20.1
+
+## 2.4.7
+
+### Patch Changes
+
+- Updated dependencies [4a4f670]
+  - @braintied/cost@6.2.0
+
+## 2.4.6
+
+### Patch Changes
+
+- Updated dependencies [bcc4032]
+- Updated dependencies [db08949]
+  - @braintied/cost@6.1.0
+  - @braintied/models@1.20.0
+
+## 2.4.5
+
+### Patch Changes
+
+- Updated dependencies [03fbeef]
+- Updated dependencies [03fbeef]
+- Updated dependencies [03fbeef]
+- Updated dependencies [03fbeef]
+- Updated dependencies [03fbeef]
+- Updated dependencies [03fbeef]
+- Updated dependencies [03fbeef]
+- Updated dependencies [00b31e6]
+- Updated dependencies [03fbeef]
+  - @braintied/cost@6.0.0
+  - @braintied/models@1.19.0
+
+## 2.4.4
+
+### Patch Changes
+
+- 55eee22: The internal research runner accepts `sourceKeySha256` on private-manifest evidence. research.run's `privateManifest()` has emitted this one-way digest of the canonical source URL since 2026-07-24 (ora-ai 4c6580d78), but the runner's allow-list never included it, so every live profile run that returned private Cortex evidence failed validation after Cortex had done (and billed) the work. Measured 2026-09-25 on travel-intelligence@1. The value, when present, must be a 64-character lowercase hex digest. This fix sat uncommitted in the `research-main` install worktree since 2026-09-25 and is moved here so the worktree can be refreshed.
+
+## 2.4.3
+
+### Patch Changes
+
+- 1308086: Paid runs stopped dropping almost every quote before synthesis. Four causes, each measured on a real luggage brief (2026-09-30): the fetch window was the first `subqueries x urlsPerSubquery` entries of the merged result list, so later sections' pages were never fetched and read "no source-validated evidence" (now each subquery's own top results are fetched); the direct-fetch lane flattened a page to one line, fusing headings to sentences and joining `</p><p>` with no space (now block tags become line breaks and entities decode once), which had rejected 21 of 25 quotes copied exactly; the extractor prompt asked for "paragraphs" while validation accepts one to four sentences (the prompt now states the contract); and caption lines of a video transcript are rejoined before validation. Pages with no complete sentence are no longer extracted, so they stop spending the run's page budget (`EvidenceFunnel.sourcesWithoutVerifiableText`). Section synthesis is asked to draw on every distinct source before repeating one.
+- 0de46f6: Reddit search drops brand review-spam subreddits: a query word plus an optional short qualifier plus `review(s)` (`monos_reviews`, `Monosluggagereviews`), and any review-named subreddit whose threads in a batch all come from one author. New exports `isBrandReviewSpamSubreddit` and `dropBrandReviewSpam`. The `brightdata-async` test no longer flakes under load: its wall-clock poll budget was 100 ms.
+
+## 2.4.2
+
+### Patch Changes
+
+- d4af2f1: Reddit search drops threads that share only one incidental query word (a luggage brief returned Mars-rover and robot posts into the bibliography). The community coverage entry for a non-software job with no HN/RSS/podcast results now reports `required: false` with a reason instead of `required: true, passed: true` over zero discoveries.
+
 ## 2.4.1
 
 ### Patch Changes

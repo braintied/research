@@ -473,9 +473,15 @@ function validatePrivateManifest(manifest) {
     'failures',
   ]), 'private manifest');
 
+  // sourceKeySha256 is the one-way digest of the canonical source URL that
+  // research.run's privateManifest() has emitted since 2026-07-24 (ora-ai
+  // 4c6580d78). The runner never allowed it, so every live profile run that
+  // returned private Cortex evidence failed here after Cortex had done (and
+  // billed) the work. Measured 2026-09-25 on travel-intelligence@1.
   const evidenceKeys = new Set([
     'id',
     'contentSha256',
+    'sourceKeySha256',
     'sourceRef',
     'contentRef',
     'publishedAt',
@@ -501,6 +507,9 @@ function validatePrivateManifest(manifest) {
     if (!boundedString(evidence.id, 200)
         || typeof evidence.contentSha256 !== 'string'
         || !/^[a-f0-9]{64}$/.test(evidence.contentSha256)
+        || (evidence.sourceKeySha256 !== undefined
+          && (typeof evidence.sourceKeySha256 !== 'string'
+            || !/^[a-f0-9]{64}$/.test(evidence.sourceKeySha256)))
         || !boundedString(evidence.sourceRef, 2_000)
         || !boundedString(evidence.contentRef, 2_000)
         || (evidence.publishedAt !== null
