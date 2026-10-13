@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: read
+  # @braintied/cost and @braintied/models are on GitHub Packages only, not npmjs.
+  packages: read
 
 jobs:
   validate:
@@ -24,9 +26,13 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          registry-url: https://npm.pkg.github.com
+          scope: '@braintied'
 
       - name: Install locked dependencies
         run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Typecheck
         run: npm run typecheck
