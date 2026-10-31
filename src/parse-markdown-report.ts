@@ -206,16 +206,16 @@ function parseBibliography(bibSection: string): Map<string, BibEntry> {
     const url = m[2];
     const trailing = m[3] !== undefined ? m[3].trim() : '';
 
-    // trailing: "u/foo, 2026-04-29, 442 upvotes"
-    // Split on first two commas to get author / date / rest
-    const parts = trailing.split(',');
-    const author = parts.length > 0 ? parts[0].trim() : '';
-    const rawDate = parts.length > 1 ? parts[1].trim() : '';
-    const rawEngagement = parts.length > 2 ? parts.slice(2).join(',').trim() : '';
-
-    // Validate date — must be YYYY-MM-DD
-    const dateValid = /^\d{4}-\d{2}-\d{2}$/.test(rawDate);
-    const published_at = dateValid ? rawDate : undefined;
+    // trailing: "u/foo, 2026-04-29, 442 upvotes" (author, date, engagement),
+    // or "2026-04-29" alone, which formatBibliographyLine writes for a source
+    // with a date and no author. The date is read from whichever part holds it.
+    const parts = trailing === '' ? [] : trailing.split(',').map((p) => p.trim());
+    const dateIdx = parts.findIndex((p) => /^\d{4}-\d{2}-\d{2}$/.test(p));
+    const published_at = dateIdx >= 0 ? parts[dateIdx] : undefined;
+    const author = dateIdx === 0 || parts.length === 0 ? '' : parts[0];
+    const rawEngagement = dateIdx >= 0
+      ? parts.slice(dateIdx + 1).join(',').trim()
+      : (parts.length > 2 ? parts.slice(2).join(',').trim() : '');
 
     map.set(anchor, {
       citation_anchor: anchor,

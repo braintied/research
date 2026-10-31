@@ -369,7 +369,10 @@ const TRAVEL_RE =
 const TRAVEL_COMMUNITIES = ['travel', 'solotravel', 'TravelHacks', 'digitalnomad'] as const;
 const FLIGHT_RE = /\b(flights?|airfare|airline|layover|stopover|business class|premium economy|upgrade)\b/i;
 const POINTS_RE = /\b(miles|points|award|status match|transfer partner)\b/i;
-const DESTINATION_COMMUNITIES: ReadonlyArray<readonly [RegExp, readonly string[]]> = [
+export type DestinationCommunities = ReadonlyArray<readonly [RegExp, readonly string[]]>;
+
+/** Destination keyword to subreddit routing. A host with other destinations passes its own table. */
+export const DESTINATION_COMMUNITIES: DestinationCommunities = [
   [/\bgoa\b|mandrem|anjuna|arambol|panjim|\bmopa\b/i, ['goa', 'india']],
   [/\bmumbai\b|\bbombay\b/i, ['mumbai', 'india']],
   [/\bindia\b|delhi|bangalore|bengaluru|rajasthan|kerala|jaipur/i, ['india']],
@@ -381,10 +384,13 @@ const DESTINATION_COMMUNITIES: ReadonlyArray<readonly [RegExp, readonly string[]
   [/\bportugal\b|lisbon|porto/i, ['portugal']],
 ];
 
-export function inferredTravelCommunities(question: string): string[] | undefined {
+export function inferredTravelCommunities(
+  question: string,
+  destinations: DestinationCommunities = DESTINATION_COMMUNITIES,
+): string[] | undefined {
   if (!TRAVEL_RE.test(question)) return undefined;
   const communities: string[] = [];
-  for (const [re, subs] of DESTINATION_COMMUNITIES) if (re.test(question)) communities.push(...subs);
+  for (const [re, subs] of destinations) if (re.test(question)) communities.push(...subs);
   communities.push(...TRAVEL_COMMUNITIES);
   if (FLIGHT_RE.test(question)) communities.push('Flights');
   if (POINTS_RE.test(question)) communities.push('awardtravel');

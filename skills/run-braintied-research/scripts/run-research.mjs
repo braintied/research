@@ -839,6 +839,11 @@ async function main() {
     grounding: result.grounding,
     grounding_quality: groundingAssessment.quality,
     grounding_passed: groundingAssessment.passed,
+    // Did the report answer the brief (asked facts found, primary source
+    // cited)? Grounding alone cannot say: a 2026-10-12 run scored grounding
+    // 1.0 with an executive summary that never stated the asked version or
+    // date. Null when the package or engine predates the answer check.
+    answer_quality: result.report.answer_quality ?? null,
     discovery_count: Array.isArray(result.discoveries) ? result.discoveries.length : 0,
     source_program_status: programResult?.status ?? null,
     source_plan: programResult?.sourcePlan ?? null,
@@ -863,6 +868,9 @@ async function main() {
     grounding_check_status: metadata.grounding?.status ?? null,
     grounding_ratio: groundingAssessment.ratio,
     grounding_passed: metadata.grounding_passed,
+    answer_quality_status: metadata.answer_quality?.status ?? null,
+    answer_quality_passed: metadata.answer_quality?.passed ?? null,
+    answer_check: metadata.answer_quality?.summary_line ?? null,
     source_program_status: metadata.source_program_status,
     source_coverage_passed: metadata.source_coverage?.passed ?? null,
     profile_coverage_passed: metadata.profile_coverage?.passed ?? null,

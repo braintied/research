@@ -10,6 +10,7 @@
  */
 
 import { z } from 'zod';
+import { AnswerQualitySchema } from './answer-quality-schema.js';
 import { createHash } from 'node:crypto';
 
 // =============================================================================
@@ -231,6 +232,8 @@ export type SearchSort =
 
 export interface SearchOpts {
   limit?: number;                                   // top-N results
+  /** Search-engine language and region (Google `hl` / `gl`). Providers that take one default to en / us. */
+  search_locale?: { language: string; region: string };
   recency_days?: number;                            // restrict to last N days
   /** Requested evidence kinds; specialist providers use this to avoid unrelated result classes. */
   expected_source_types?: ExpectedSourceType[];
@@ -340,9 +343,18 @@ export const FinalReportSchema = z.object({
     author: z.string().default(''),
     provider: ProviderNameSchema,
     published_at: z.string().optional(),
+    /** ISO timestamp the run obtained this source's content. */
+    scraped_at: z.string().optional(),
   })),
   gaps: z.array(z.string()).default([]),
   word_count: z.number().int().nonnegative(),
+  /**
+   * Did the report answer the brief? Grounding proves cited sentences are in
+   * their sources; this says which asked facts (version, date, price...)
+   * have evidence and whether a named primary source was cited. Optional:
+   * reports assembled without a brief analysis carry none.
+   */
+  answer_quality: AnswerQualitySchema.optional(),
 });
 
 export type FinalReport = z.infer<typeof FinalReportSchema>;

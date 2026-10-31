@@ -10,7 +10,7 @@
 
 import { z } from 'zod';
 import { MissingCredentialError, type ResearchCredentials } from '../credentials.js';
-import { callModel, type ModelCallResult } from '../model-call.js';
+import { callModel, isProviderAccountFailure, type ModelCallResult } from '../model-call.js';
 import { researchStageResolution } from '../model-policy.js';
 import {
   ExtractedQuotesSchema,
@@ -34,6 +34,12 @@ export interface GeminiExtractInput {
   url: string;
   content: string;
   mode: 'reddit' | 'youtube' | 'serp' | 'longform' | 'hn';
+  /**
+   * The research questions this page is read for. Without them the extractor
+   * pulled "memorable assertions" from any page, and a run asked for a
+   * release's version and date extracted neither.
+   */
+  focusQuestions?: string[];
 }
 
 // =============================================================================
@@ -206,6 +212,16 @@ export function normalizeGeminiExtractionPayload(
 // Mode-specific prompt builders
 // =============================================================================
 
+function focusBlock(questions: string[] | undefined): string {
+  if (questions === undefined || questions.length === 0) return '';
+  return `
+RESEARCH QUESTIONS this page is being read to answer:
+${questions.map((q) => `- ${q}`).join('\n')}
+- Extract first every sentence or line that states a fact these questions ask for, such as a version number, a release date, a price, a person's name or role, a command or a setting. A short line that states such a fact (for example a changelog heading like "Bot API 10.3" or a date line like "August 24, 2026") may be quoted exactly as one line, as a verbatim_quotes entry.
+- Then extract context that directly helps answer them. Skip material about other subjects, site navigation, cookie or browser notices, and error messages.
+`;
+}
+
 function buildPrompt(input: GeminiExtractInput): string {
   const { mode, url, content } = input;
   const truncated = content.slice(0, 12000);
@@ -239,7 +255,7 @@ QUOTE CONTRACT (enforced by code; anything that breaks it is discarded):
 - Each key_claims entry must likewise be one complete sentence copied exactly from the source, with at least four words. Do not write your own summary sentences there.
 
 For sentiment, emit exactly one of "positive", "negative", "neutral", or "mixed". Omit sentiment when it cannot be classified confidently.
-
+${focusBlock(input.focusQuestions)}
 Source URL: ${url}`;
 
   if (mode === 'reddit') {
@@ -367,9 +383,10 @@ export async function extractQuotesWithGemini(input: GeminiExtractInput): Promis
       timeoutMs: EXTRACTION_TIMEOUT_MS,
     });
   } catch (err) {
-    // A missing credential is a host configuration fault, not a bad page:
-    // swallowing it would extract zero quotes from every page of every run.
-    if (err instanceof MissingCredentialError) throw err;
+    // A missing credential or an account the provider refuses (every host
+    // 402, or a 401/403) is a host fault, not a bad page: swallowing it
+    // extracts zero quotes from every page of every run.
+    if (err instanceof MissingCredentialError || isProviderAccountFailure(err)) throw err;
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ url: input.url, mode: input.mode, error: msg }, '[GeminiExtractor] API call failed');
     return buildEmptyResult(input);

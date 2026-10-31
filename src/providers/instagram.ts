@@ -28,6 +28,7 @@ import {
   type SearchOpts,
 } from '../types.js';
 import { extractQuotesWithGemini } from './gemini-extractor.js';
+import { waitForBrightDataSnapshot } from './brightdata-snapshot.js';
 
 const BRIGHTDATA_BASE_URL = 'https://api.brightdata.com/datasets/v3';
 export const BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID = 'gd_lk5ns7kz21pck8jpis';
@@ -64,10 +65,14 @@ const PROFILE_DISCOVERY_MAX_WAIT_MS = 20 * 60_000;
  */
 export class InstagramSnapshotPendingError extends Error {
   readonly snapshotId: string;
-  constructor(snapshotId: string, waitedMs: number) {
-    super(`Bright Data Instagram snapshot ${snapshotId} still running after ${Math.round(waitedMs / 1000)}s; resume it with resumeSnapshotId`);
+  /** The last retryable poll failure inside the wait, when the ceiling was hit through one. */
+  readonly lastTransientError: string | undefined;
+  constructor(snapshotId: string, waitedMs: number, lastTransientError?: string) {
+    const lastPoll = lastTransientError === undefined ? '' : ` (last poll: ${lastTransientError})`;
+    super(`Bright Data Instagram snapshot ${snapshotId} still running after ${Math.round(waitedMs / 1000)}s${lastPoll}; resume it with resumeSnapshotId`);
     this.name = 'InstagramSnapshotPendingError';
     this.snapshotId = snapshotId;
+    this.lastTransientError = lastTransientError;
   }
 }
 const MAX_SEARCH_RESULTS = 25;
@@ -75,10 +80,6 @@ const MAX_HASHTAGS_PER_SEARCH = 2;
 
 const TriggerResponseSchema = z.object({
   snapshot_id: z.string().min(1),
-}).passthrough();
-
-const ProgressResponseSchema = z.object({
-  status: z.string().min(1),
 }).passthrough();
 
 const RecordSchema = z.record(z.string(), z.unknown());
@@ -535,6 +536,42 @@ function normalizeInstagramRecord(
   };
 }
 
+export interface InstagramBioLink {
+  url: string;
+  /** Link label as the profile shows it; undefined when Instagram has none. */
+  title: string | undefined;
+}
+
+/**
+ * Every link the profile publishes in its bio, first-listed first. Bright Data
+ * carries them in up to three shapes on one record (`external_urls` objects
+ * with titles, an `external_url` string array, and `external_url_title`), so
+ * they are merged and deduplicated by URL, keeping a title when any shape has one.
+ */
+function extractBioLinks(record: InstagramRecord): InstagramBioLink[] {
+  const ordered: string[] = [];
+  const titles = new Map<string, string | undefined>();
+  const add = (rawUrl: string | null, title: string | null): void => {
+    if (rawUrl === null) return;
+    const url = normalizeMediaUrl(rawUrl);
+    if (url === null) return;
+    if (!titles.has(url)) {
+      ordered.push(url);
+      titles.set(url, title ?? undefined);
+      return;
+    }
+    if (titles.get(url) === undefined && title !== null) titles.set(url, title);
+  };
+  for (const entry of readRecordArray(record, 'external_urls', 'bio_links')) {
+    add(readString(entry, 'url', 'link'), readString(entry, 'title', 'label'));
+  }
+  const titled = RecordSchema.safeParse(record.external_url_title);
+  if (titled.success) add(readString(titled.data, 'url'), readString(titled.data, 'title'));
+  for (const url of readStringArray(record, 'external_url')) add(url, null);
+  add(readString(record, 'external_url', 'externalUrl', 'website', 'bio_link'), null);
+  return ordered.map(url => ({ url, title: titles.get(url) }));
+}
+
 function normalizeInstagramProfileRecord(
   record: InstagramRecord,
   expectedUrl: string,
@@ -557,10 +594,12 @@ function normalizeInstagramProfileRecord(
   )?.toLowerCase();
   if (username === undefined || username !== expectedUsername) return null;
 
-  const fullName = readString(record, 'full_name', 'fullName', 'name') ?? undefined;
+  const fullName = readString(record, 'full_name', 'fullName', 'profile_name', 'name') ?? undefined;
   const biography = readString(record, 'biography', 'bio') ?? undefined;
-  const externalUrl = readString(record, 'external_url', 'externalUrl', 'website', 'bio_link')
-    ?? undefined;
+  // Bright Data's profiles dataset returns external_url as an ARRAY of strings
+  // (measured 2026-10-18), so a readString on it alone silently dropped the
+  // website. extractBioLinks reads every shape the record carries.
+  const externalUrl = extractBioLinks(record)[0]?.url;
   const profileImageUrl = readString(
     record,
     'profile_image_link',
@@ -697,28 +736,20 @@ async function waitForSnapshot(
   signal?: AbortSignal,
   maxWaitMs: number = POLL_MAX_WAIT_MS,
 ): Promise<void> {
-  const endpoint = `${BRIGHTDATA_BASE_URL}/progress/${encodeURIComponent(snapshotId)}`;
-  const startedAt = Date.now();
-
-  while (Date.now() - startedAt < maxWaitMs) {
-    const response = await fetchWithTimeout(endpoint, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${token}` },
-    }, PROGRESS_TIMEOUT_MS, signal);
-    const raw = await readJsonResponse(response, 'Instagram snapshot progress');
-    const parsed = ProgressResponseSchema.safeParse(raw);
-    if (!parsed.success) {
-      throw new Error('Bright Data Instagram snapshot progress failed validation');
-    }
-    const status = parsed.data.status.toLowerCase();
-    if (status === 'ready') return;
-    if (['failed', 'error', 'aborted', 'cancelled', 'canceled'].includes(status)) {
-      throw new Error(`Bright Data Instagram snapshot ended with status "${status}"`);
-    }
-    await abortableSleep(POLL_INTERVAL_MS, signal);
+  const result = await waitForBrightDataSnapshot({
+    snapshotId,
+    token,
+    maxWaitMs,
+    progressTimeoutMs: PROGRESS_TIMEOUT_MS,
+    initialDelayMs: 0,
+    intervalMs: POLL_INTERVAL_MS,
+    signal,
+    label: 'Instagram',
+    subject: 'Bright Data Instagram snapshot',
+  });
+  if (!result.ready) {
+    throw new InstagramSnapshotPendingError(snapshotId, result.waitedMs, result.lastTransientError);
   }
-
-  throw new InstagramSnapshotPendingError(snapshotId, maxWaitMs);
 }
 
 async function downloadSnapshotRecords(
@@ -928,6 +959,229 @@ async function scrapeProfile(
     throw new Error('Bright Data Instagram profile scrape returned no usable matching content');
   }
   return profile;
+}
+
+// =============================================================================
+// One-call profile read (profile + bio links + recent posts)
+// =============================================================================
+
+/** One recent post as the profiles dataset lists it. */
+export interface InstagramProfilePost {
+  /** Instagram media id, when the record carries it. */
+  id: string | undefined;
+  shortcode: string;
+  /** Canonical permalink, https://www.instagram.com/{p|reel|tv}/{shortcode}/. */
+  url: string;
+  /** Empty string when the post has no caption. */
+  caption: string;
+  /** Bright Data content_type, e.g. "Image", "Video", "Carousel". */
+  mediaType: string | undefined;
+  /** Display image (and any video) URLs; Instagram CDN links expire. */
+  mediaUrls: string[];
+  publishedAt: string | undefined;
+  hashtags: string[];
+}
+
+export interface InstagramProfile {
+  url: string;
+  username: string;
+  displayName: string | undefined;
+  biography: string | undefined;
+  bioLinks: InstagramBioLink[];
+  /** The first bio link; undefined when the profile publishes none. */
+  externalUrl: string | undefined;
+  followersCount: number | undefined;
+  followingCount: number | undefined;
+  postsCount: number | undefined;
+  profileImageUrl: string | undefined;
+  businessCategory: string | undefined;
+  verified: boolean | undefined;
+  private: boolean | undefined;
+  highlightsCount: number | undefined;
+  /** Newest first, as the profiles dataset returns them (12 on 2026-10-18). */
+  recentPosts: InstagramProfilePost[];
+  /**
+   * Whether the record carried a `posts` array at all. false means Bright Data
+   * omitted it (a private account, or a dataset change), which is not the same
+   * fact as an account with no posts; the caller must not read [] as "none".
+   */
+  recentPostsIncluded: boolean;
+  /** When Bright Data collected the record. */
+  collectedAt: string | undefined;
+  snapshotId: string;
+}
+
+export type InstagramProfileFetchResult =
+  | { status: 'ok'; profile: InstagramProfile }
+  | {
+    /**
+     * The snapshot was still running at the wait budget. It keeps running and
+     * is billed once: call again with `resumeSnapshotId: snapshotId` to collect it.
+     */
+    status: 'pending';
+    snapshotId: string;
+    username: string;
+    url: string;
+    waitedMs: number;
+  };
+
+export interface FetchInstagramProfileOptions {
+  signal?: AbortSignal;
+  /** How long to wait for the snapshot before answering pending. Default INSTAGRAM_PROFILE_WAIT_MS. */
+  maxWaitMs?: number;
+  /** A snapshot id from an earlier pending answer; collects it without a second (billed) trigger. */
+  resumeSnapshotId?: string;
+}
+
+/**
+ * Wait budget for one profile read. A profiles-dataset collection took about
+ * 90 s end to end on 2026-10-18 (the sync /scrape endpoint held the request
+ * 60 s and then answered 202), so a tool call cannot always finish inside
+ * one request; it answers pending with the snapshot id instead of blocking.
+ */
+export const INSTAGRAM_PROFILE_WAIT_MS = 45_000;
+
+function normalizeProfilePost(record: InstagramRecord): InstagramProfilePost | null {
+  const rawUrl = readString(record, 'url', 'post_url', 'permalink');
+  const url = rawUrl !== null ? canonicalizeInstagramPostUrl(rawUrl) : null;
+  if (url === null) return null;
+  const shortcode = shortcodeFromInstagramUrl(url);
+  if (shortcode === null) return null;
+  const caption = readString(record, 'caption', 'description', 'text') ?? '';
+  const explicitHashtags = readStringArray(record, 'post_hashtags', 'hashtags')
+    .map(value => value.replace(/^#/, '').toLowerCase())
+    .filter(value => value.length > 0);
+  return {
+    id: readString(record, 'id', 'pk') ?? undefined,
+    shortcode,
+    url,
+    caption,
+    mediaType: readString(record, 'content_type', 'type', 'product_type') ?? undefined,
+    mediaUrls: extractMediaUrls(record),
+    publishedAt: toIsoString(readString(record, 'datetime', 'date_posted', 'timestamp', 'taken_at')),
+    hashtags: uniqueStrings([...explicitHashtags, ...hashtagsFromCaption(caption)]),
+  };
+}
+
+/**
+ * Map one Bright Data profiles-dataset record to an InstagramProfile. Returns
+ * null when the record is for a different account or carries no profile data.
+ * Exported for fixture tests; callers use fetchInstagramProfile.
+ */
+export function normalizeInstagramProfileSnapshot(
+  record: Record<string, unknown>,
+  expectedUrl: string,
+  snapshotId: string,
+): InstagramProfile | null {
+  const base = normalizeInstagramProfileRecord(record, expectedUrl);
+  if (base === null) return null;
+  const bioLinks = extractBioLinks(record);
+  const recentPosts = readRecordArray(record, 'posts')
+    .map(normalizeProfilePost)
+    .filter((post): post is InstagramProfilePost => post !== null);
+  return {
+    url: base.url,
+    username: base.username,
+    displayName: base.fullName,
+    biography: base.biography,
+    bioLinks,
+    externalUrl: base.externalUrl,
+    followersCount: base.followersCount,
+    followingCount: base.followingCount,
+    postsCount: base.postsCount,
+    profileImageUrl: base.profileImageUrl,
+    businessCategory: base.businessCategory,
+    verified: base.verified,
+    private: base.private,
+    highlightsCount: readNumber(record, 'highlights_count', 'highlightsCount'),
+    recentPosts,
+    recentPostsIncluded: Array.isArray(record.posts),
+    collectedAt: toIsoString(readString(record, 'timestamp')),
+    snapshotId,
+  };
+}
+
+async function triggerProfileCollection(
+  canonicalUrl: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  // /trigger, not the sync /scrape: /scrape held the connection 60 s and then
+  // answered 202 anyway (2026-10-18), which outlives a tool call's budget.
+  const endpoint = `${BRIGHTDATA_BASE_URL}/trigger`
+    + `?dataset_id=${BRIGHTDATA_INSTAGRAM_PROFILES_DATASET_ID}`
+    + '&format=json&include_errors=true';
+  const response = await fetchWithTimeout(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify([{ url: canonicalUrl }]),
+  }, TRIGGER_TIMEOUT_MS, signal);
+  const raw = await readJsonResponse(response, 'Instagram profile trigger');
+  const parsed = TriggerResponseSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new Error('Bright Data Instagram profile trigger returned no snapshot_id');
+  }
+  return parsed.data.snapshot_id;
+}
+
+/**
+ * Read one public Instagram profile in a single call: display name, bio, bio
+ * links, counts, profile image, and the recent posts (caption, media URLs,
+ * permalink, timestamp) the Bright Data profiles dataset carries on the same
+ * record. One billed record per profile; no post discovery crawl.
+ *
+ * Answers `{status:'pending', snapshotId}` when the collection outlives
+ * `maxWaitMs`; pass that id back as `resumeSnapshotId`. Throws for a bad
+ * identifier, a missing credential, a provider error, or a record that is
+ * not the requested account. Never returns an empty success.
+ */
+export async function fetchInstagramProfile(
+  credentials: ResearchCredentials,
+  handleOrUrl: string,
+  options: FetchInstagramProfileOptions = {},
+): Promise<InstagramProfileFetchResult> {
+  const token = requireBrightDataToken(credentials);
+  const username = usernameFromIdentifier(handleOrUrl);
+  if (username === null) {
+    throw new Error(`Instagram profile identifier is not a username or profile URL: ${handleOrUrl.slice(0, 80)}`);
+  }
+  const canonicalUrl = `https://www.instagram.com/${username}/`;
+  const maxWaitMs = options.maxWaitMs !== undefined ? options.maxWaitMs : INSTAGRAM_PROFILE_WAIT_MS;
+  if (!Number.isFinite(maxWaitMs) || maxWaitMs < 0) {
+    throw new RangeError('Instagram profile maxWaitMs must be a non-negative number');
+  }
+  const resuming = options.resumeSnapshotId !== undefined && options.resumeSnapshotId.length > 0;
+  const snapshotId = resuming && options.resumeSnapshotId !== undefined
+    ? options.resumeSnapshotId
+    : await triggerProfileCollection(canonicalUrl, token, options.signal);
+
+  const wait = await waitForBrightDataSnapshot({
+    snapshotId,
+    token,
+    maxWaitMs,
+    progressTimeoutMs: PROGRESS_TIMEOUT_MS,
+    initialDelayMs: 0,
+    intervalMs: POLL_INTERVAL_MS,
+    signal: options.signal,
+    label: 'Instagram',
+    subject: 'Bright Data Instagram profile snapshot',
+  });
+  if (!wait.ready) {
+    logger.info({ username, snapshotId, waitedMs: wait.waitedMs }, '[Instagram] Profile snapshot still running; answering pending');
+    return { status: 'pending', snapshotId, username, url: canonicalUrl, waitedMs: wait.waitedMs };
+  }
+
+  const records = await downloadSnapshotRecords(snapshotId, token, options.signal);
+  const profile = records
+    .map(record => normalizeInstagramProfileSnapshot(record, canonicalUrl, snapshotId))
+    .find(candidate => candidate !== null);
+  if (profile === undefined || profile === null) {
+    throw new Error(`Bright Data Instagram profile snapshot ${snapshotId} returned no usable record for @${username}`);
+  }
+  return { status: 'ok', profile };
 }
 
 function postToSearchResult(

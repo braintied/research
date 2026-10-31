@@ -399,3 +399,153 @@ test('Instagram stories URL parser accepts watch and story permalinks', async ()
   assert.equal(parseInstagramStoriesUrl('https://www.instagram.com/p/abc/'), null);
   assert.equal(parseInstagramStoriesUrl('https://www.instagram.com/stories/'), null);
 });
+
+// Snapshot progress polling. A snapshot is billed at trigger time, so one bad
+// poll must not abandon it: on 2026-10-12 sd_mv53pox21s8ltw4a99 and
+// sd_mv53pozfqe4eux0dh both reached `ready` while the search had already
+// failed on a single 15 s progress timeout under CPU load.
+
+function progressStep(kind) {
+  return async (_url, init) => {
+    switch (kind) {
+      case 'hang':
+        // Never answers; only the poller's own timeout (or the caller) ends it.
+        return new Promise((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => {
+            reject(new DOMException('This operation was aborted', 'AbortError'));
+          }, { once: true });
+        });
+      case 'network':
+        throw new TypeError('fetch failed');
+      case 'http503':
+        return jsonResponse({ error: 'unavailable' }, 503);
+      case 'http429':
+        return jsonResponse({ error: 'rate limited' }, 429);
+      case 'http401':
+        return jsonResponse({ error: 'unauthorized' }, 401);
+      case 'running':
+        return jsonResponse({ status: 'running' });
+      case 'ready':
+        return jsonResponse({ status: 'ready' });
+      case 'failed':
+        return jsonResponse({ status: 'failed' });
+      default:
+        throw new Error(`unknown progress step: ${kind}`);
+    }
+  };
+}
+
+function scriptedFetch(steps, onCall) {
+  const calls = [];
+  const fake = async (input, init = {}) => {
+    calls.push(String(input));
+    if (onCall !== undefined) onCall(calls.length);
+    const kind = steps[Math.min(calls.length - 1, steps.length - 1)];
+    return progressStep(kind)(input, init);
+  };
+  return { fake, calls };
+}
+
+const POLL_TIMINGS = {
+  token: 'test-brightdata-token',  // git-secret-allow: fake fixture value, never a live credential
+  progressTimeoutMs: 25,
+  initialDelayMs: 0,
+  intervalMs: 1,
+  label: 'Instagram',
+  subject: 'Bright Data Instagram snapshot',
+};
+
+const pollCases = [
+  { name: 'one timed-out poll, then ready', steps: ['hang', 'ready'], maxWaitMs: 10_000, expect: { ready: true, transientFailures: 1, calls: 2 } },
+  { name: 'one network error, then ready', steps: ['network', 'ready'], maxWaitMs: 10_000, expect: { ready: true, transientFailures: 1, calls: 2 } },
+  { name: 'HTTP 503 then 429, then ready', steps: ['http503', 'http429', 'running', 'ready'], maxWaitMs: 10_000, expect: { ready: true, transientFailures: 2, calls: 4 } },
+  { name: 'terminal status fails at once', steps: ['running', 'failed', 'ready'], maxWaitMs: 10_000, expect: { rejects: /snapshot ended with status "failed"/, calls: 2 } },
+  { name: 'HTTP 401 fails at once', steps: ['http401', 'ready'], maxWaitMs: 10_000, expect: { rejects: /progress failed with HTTP 401/, calls: 1 } },
+  { name: 'caller abort mid-poll fails at once', steps: ['hang', 'ready'], maxWaitMs: 10_000, abortOnCall: 1, progressTimeoutMs: 5_000, expect: { rejects: /^Error: Instagram request aborted$/, calls: 1 } },
+  { name: 'only transient failures until the ceiling stays pending', steps: ['network'], maxWaitMs: 60, expect: { ready: false, lastTransientError: /request failed \(TypeError\)/ } },
+];
+
+for (const pollCase of pollCases) {
+  test(`waitForBrightDataSnapshot: ${pollCase.name}`, async () => {
+    const { waitForBrightDataSnapshot } = await import('../dist/index.mjs');
+    const controller = new AbortController();
+    const { fake, calls } = scriptedFetch(pollCase.steps, (n) => {
+      if (pollCase.abortOnCall === n) setTimeout(() => controller.abort(), 5);
+    });
+    const run = waitForBrightDataSnapshot({
+      ...POLL_TIMINGS,
+      ...(pollCase.progressTimeoutMs === undefined ? {} : { progressTimeoutMs: pollCase.progressTimeoutMs }),
+      snapshotId: 'sd_mv53pox21s8ltw4a99',
+      maxWaitMs: pollCase.maxWaitMs,
+      signal: controller.signal,
+      fetch: fake,
+    });
+
+    if (pollCase.expect.rejects !== undefined) {
+      await assert.rejects(run, (error) => {
+        assert.match(String(error), pollCase.expect.rejects);
+        return true;
+      });
+    } else {
+      const result = await run;
+      assert.equal(result.ready, pollCase.expect.ready);
+      if (pollCase.expect.transientFailures !== undefined) {
+        assert.equal(result.transientFailures, pollCase.expect.transientFailures);
+      }
+      if (pollCase.expect.lastTransientError !== undefined) {
+        assert.match(result.lastTransientError, pollCase.expect.lastTransientError);
+      }
+    }
+    if (pollCase.expect.calls !== undefined) assert.equal(calls.length, pollCase.expect.calls);
+    assert.ok(calls.every(url => url === 'https://api.brightdata.com/datasets/v3/progress/sd_mv53pox21s8ltw4a99'));
+  });
+}
+
+test('Instagram profile discovery throws a resumable InstagramSnapshotPendingError at the ceiling', async () => {
+  const { discoverInstagramProfilePosts, InstagramSnapshotPendingError } = await import('../dist/index.mjs');
+  let triggers = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes('/trigger?')) triggers += 1;
+    if (url.includes('/progress/')) throw new TypeError('fetch failed');
+    throw new Error(`unexpected test URL: ${url}`);
+  };
+  await assert.rejects(
+    discoverInstagramProfilePosts(brightDataCredentials, {
+      username: 'creator',
+      limit: 3,
+      resumeSnapshotId: 'sd_mv53pozfqe4eux0dh',
+      maxWaitMs: 50,
+    }),
+    (error) => {
+      assert.ok(error instanceof InstagramSnapshotPendingError);
+      assert.equal(error.snapshotId, 'sd_mv53pozfqe4eux0dh');
+      assert.match(error.lastTransientError, /Instagram request failed \(TypeError\)/);
+      return true;
+    },
+  );
+  assert.equal(triggers, 0);
+});
+
+test('tolerant pollSnapshot retries a failed poll and throws BrightDataSnapshotPendingError at the ceiling', async () => {
+  const { pollSnapshot, BrightDataSnapshotPendingError } = await import('../dist/index.mjs');
+  let polls = 0;
+  globalThis.fetch = async () => {
+    polls += 1;
+    if (polls === 1) return jsonResponse({ error: 'bad gateway' }, 502);
+    return jsonResponse({ status: 'ready' });
+  };
+  await pollSnapshot(brightDataCredentials, 'snapshot-retry', { initialIntervalMs: 1, maxIntervalMs: 1, maxWaitMs: 10_000 });
+  assert.equal(polls, 2);
+
+  globalThis.fetch = async () => { throw new TypeError('fetch failed'); };
+  await assert.rejects(
+    pollSnapshot(brightDataCredentials, 'snapshot-pending', { initialIntervalMs: 1, maxIntervalMs: 1, maxWaitMs: 40 }),
+    (error) => {
+      assert.ok(error instanceof BrightDataSnapshotPendingError);
+      assert.equal(error.snapshotId, 'snapshot-pending');
+      assert.match(error.message, /tolerated timeout/);
+      return true;
+    },
+  );
+});

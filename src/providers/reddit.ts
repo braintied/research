@@ -1,14 +1,12 @@
 /**
  * Reddit Search Provider
  *
- * Uses Reddit OAuth2 client_credentials for search + JSON comment fetching.
- * Token cached for 1 hour. Rate limit: 60 req/min.
+ * Search + thread fetch over the shared Reddit client (./reddit-client.ts),
+ * which owns OAuth, the per-client-id rate limiter and the 429/401 handling.
  */
 
-import { z } from 'zod';
 import { logger } from '../logger.js';
 import { MissingCredentialError, type RedditCredentials, type ResearchCredentials } from '../credentials.js';
-import { sleep } from '../pipeline-core.js';
 import {
   SearchResultSchema,
   FetchResultSchema,
@@ -19,35 +17,28 @@ import {
   type SearchOpts,
 } from '../types.js';
 import { extractQuotesWithGemini } from './gemini-extractor.js';
+import {
+  createRedditClient,
+  redditThreadApiUrl,
+  RedditApiError,
+  type RedditClient,
+  type RedditComment,
+  type RedditThread,
+  type RedditTimeFilter,
+} from './reddit-client.js';
 
 // =============================================================================
-// Rate limiter — 60 req/min = 1 req per ~1000ms
+// Helpers
 // =============================================================================
 
-const REDDIT_RATE_LIMIT_MS = 1050;
-let lastRedditCallAt = 0;
-
-async function rateLimit(): Promise<void> {
-  const now = Date.now();
-  const elapsed = now - lastRedditCallAt;
-  if (elapsed < REDDIT_RATE_LIMIT_MS) {
-    await sleep(REDDIT_RATE_LIMIT_MS - elapsed);
-  }
-  lastRedditCallAt = Date.now();
+function recencyToTimeFilter(recencyDays: number | undefined): RedditTimeFilter {
+  if (recencyDays === undefined || recencyDays <= 0) return 'all';
+  if (recencyDays <= 1) return 'day';
+  if (recencyDays <= 7) return 'week';
+  if (recencyDays <= 30) return 'month';
+  if (recencyDays <= 365) return 'year';
+  return 'all';
 }
-
-// =============================================================================
-// OAuth2 token cache
-// =============================================================================
-
-interface TokenCache {
-  /** Cached per client id: one process may be handed different credentials. */
-  clientId: string;
-  accessToken: string;
-  expiresAt: number;
-}
-
-let tokenCache: TokenCache | null = null;
 
 function requireReddit(credentials: ResearchCredentials): RedditCredentials {
   if (credentials.reddit === undefined) {
@@ -59,117 +50,8 @@ function requireReddit(credentials: ResearchCredentials): RedditCredentials {
   return credentials.reddit;
 }
 
-async function getAccessToken(credentials: ResearchCredentials): Promise<string> {
-  const { clientId, clientSecret, userAgent } = requireReddit(credentials);
-  const now = Date.now();
-
-  if (tokenCache !== null && tokenCache.clientId === clientId && now < tokenCache.expiresAt - 60_000) {
-    return tokenCache.accessToken;
-  }
-
-  const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-
-  const response = await fetch('https://www.reddit.com/api/v1/access_token', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Basic ${basicAuth}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': userAgent,
-    },
-    body: 'grant_type=client_credentials',
-    signal: AbortSignal.timeout(15000),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Reddit OAuth2 token error: ${response.status}`);
-  }
-
-  const TokenResponseSchema = z.object({
-    access_token: z.string(),
-    expires_in: z.number(),
-  });
-
-  const rawJson: unknown = await response.json();
-  const parsed = TokenResponseSchema.safeParse(rawJson);
-
-  if (!parsed.success) {
-    throw new Error(`Reddit token response invalid: ${parsed.error.message}`);
-  }
-
-  tokenCache = {
-    clientId,
-    accessToken: parsed.data.access_token,
-    expiresAt: now + parsed.data.expires_in * 1000,
-  };
-
-  logger.info({}, '[Reddit] OAuth2 token refreshed');
-  return tokenCache.accessToken;
-}
-
 // =============================================================================
-// Reddit API response schemas
-// =============================================================================
-
-const RedditPostDataSchema = z.object({
-  id: z.string().default(''),
-  title: z.string().default(''),
-  selftext: z.string().default(''),
-  permalink: z.string().default(''),
-  author: z.string().default(''),
-  created_utc: z.number().default(0),
-  ups: z.number().default(0),
-  num_comments: z.number().default(0),
-  url: z.string().optional(),
-  subreddit: z.string().default(''),
-}).passthrough();
-
-const RedditChildSchema = z.object({
-  kind: z.string(),
-  data: RedditPostDataSchema,
-});
-
-const RedditListingSchema = z.object({
-  data: z.object({
-    children: z.array(RedditChildSchema).default([]),
-    after: z.string().nullable().optional(),
-  }),
-});
-
-// Comment schema (recursive-ish — we only go 2 levels deep for simplicity)
-const RedditCommentDataSchema = z.object({
-  id: z.string().default(''),
-  author: z.string().default(''),
-  body: z.string().default(''),
-  ups: z.number().default(0),
-  created_utc: z.number().default(0),
-  permalink: z.string().default(''),
-  replies: z.unknown().optional(),
-}).passthrough();
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-function unixToIso(utc: number): string {
-  return new Date(utc * 1000).toISOString();
-}
-
-function recencyToTimeFilter(recencyDays: number | undefined): string {
-  if (recencyDays === undefined || recencyDays <= 0) return 'all';
-  if (recencyDays <= 1) return 'day';
-  if (recencyDays <= 7) return 'week';
-  if (recencyDays <= 30) return 'month';
-  if (recencyDays <= 365) return 'year';
-  return 'all';
-}
-
-function permalinkToUrl(permalink: string): string {
-  if (permalink.startsWith('http')) return permalink;
-  return `https://www.reddit.com${permalink}`;
-}
-
-// =============================================================================
-// Comment tree flattening
+// Comment tree flattening (markdown keeps depth 0..3, top 30 by upvotes)
 // =============================================================================
 
 interface FlatComment {
@@ -180,48 +62,23 @@ interface FlatComment {
   permalink: string;
 }
 
-function flattenCommentTree(children: unknown[], maxDepth: number, currentDepth: number): FlatComment[] {
-  if (currentDepth > maxDepth) return [];
+const MARKDOWN_MAX_COMMENT_DEPTH = 3;
 
+function flattenCommentTree(comments: readonly RedditComment[]): FlatComment[] {
   const flat: FlatComment[] = [];
-
-  for (const child of children) {
-    if (child === null || child === undefined || typeof child !== 'object') continue;
-
-    // Use Zod to parse the comment child — validates kind + data fields
-    const ChildSchema = z.object({ kind: z.string(), data: z.unknown() });
-    const childParsed = ChildSchema.safeParse(child);
-    if (!childParsed.success) continue;
-    if (childParsed.data.kind !== 't1') continue;
-
-    const parsed = RedditCommentDataSchema.safeParse(childParsed.data.data);
-    if (!parsed.success) continue;
-
-    const comment = parsed.data;
+  for (const comment of comments) {
+    if (comment.depth > MARKDOWN_MAX_COMMENT_DEPTH) continue;
     if (comment.body !== '[deleted]' && comment.body !== '[removed]' && comment.body.length > 0) {
       flat.push({
         id: comment.id,
         author: comment.author,
         body: comment.body,
         ups: comment.ups,
-        permalink: comment.permalink.length > 0 ? permalinkToUrl(comment.permalink) : '',
+        permalink: comment.permalink,
       });
     }
-
-    // Recurse into replies — parse with Zod to avoid casts
-    if (comment.replies !== undefined && comment.replies !== null) {
-      const RepliesSchema = z.object({
-        data: z.object({
-          children: z.array(z.unknown()).default([]),
-        }),
-      });
-      const repliesParsed = RepliesSchema.safeParse(comment.replies);
-      if (repliesParsed.success) {
-        flat.push(...flattenCommentTree(repliesParsed.data.data.children, maxDepth, currentDepth + 1));
-      }
-    }
+    flat.push(...flattenCommentTree(comment.replies));
   }
-
   return flat;
 }
 
@@ -232,19 +89,10 @@ function redditSort(sort: SearchOpts['sort']): 'relevance' | 'top' | 'new' | 'co
   return 'relevance';
 }
 
-function redditSearchEndpoint(opts: SearchOpts): string {
-  const communities = (opts.communities ?? [])
-    .map((community) => community.replace(/^r\//, '').trim())
-    .filter((community) => /^[A-Za-z0-9_]+$/.test(community));
-  if (communities.length === 0) return 'https://oauth.reddit.com/search.json';
-  return `https://oauth.reddit.com/r/${communities.join('+')}/search.json`;
-}
-
 async function searchRedditListing(
+  client: RedditClient,
   query: string,
   opts: SearchOpts,
-  token: string,
-  userAgent: string,
   sort: 'relevance' | 'top' | 'new' | 'comments',
   target: number,
 ): Promise<SearchResult[]> {
@@ -254,51 +102,29 @@ async function searchRedditListing(
   let after: string | null = null;
 
   for (let page = 0; page < maxPages && results.length < target; page++) {
-    await rateLimit();
-    const params = new URLSearchParams({
-      q: query,
+    const listing = await client.search(query, {
+      ...(opts.communities === undefined ? {} : { subreddits: opts.communities }),
       sort,
-      limit: String(perPage),
       t: recencyToTimeFilter(opts.recency_days),
-      type: 'link',
-      raw_json: '1',
+      limit: perPage,
+      ...(after === null ? {} : { after }),
+      ...(opts.signal === undefined ? {} : { signal: opts.signal }),
     });
-    if ((opts.communities ?? []).length > 0) params.set('restrict_sr', 'on');
-    if (after !== null) params.set('after', after);
-
-    const response = await fetch(`${redditSearchEndpoint(opts)}?${params.toString()}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'User-Agent': userAgent,
-      },
-      signal: opts.signal !== undefined ? opts.signal : AbortSignal.timeout(20_000),
-    });
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`Reddit search error: ${response.status} ${body.slice(0, 200)}`);
-    }
-
-    const rawJson: unknown = await response.json();
-    const parsed = RedditListingSchema.safeParse(rawJson);
-    if (!parsed.success) {
-      throw new Error(`Reddit search response invalid: ${parsed.error.message}`);
-    }
-    for (const child of parsed.data.data.children) {
-      const post = child.data;
+    for (const post of listing.posts) {
       if (post.permalink.length === 0) continue;
       const candidate = SearchResultSchema.safeParse({
         provider: 'reddit',
-        url: permalinkToUrl(post.permalink),
+        url: post.url,
         canonical_id: post.id.length > 0 ? post.id : undefined,
         title: post.title,
         snippet: post.selftext.slice(0, 500),
         author: post.author.length > 0 ? `u/${post.author}` : undefined,
-        published_at: post.created_utc > 0 ? unixToIso(post.created_utc) : undefined,
-        engagement: { upvotes: post.ups, comment_count: post.num_comments },
+        published_at: post.created,
+        engagement: { upvotes: post.ups, comment_count: post.numComments },
         raw_metadata: {
           backend: 'reddit_oauth_api',
           subreddit: post.subreddit,
-          external_url: post.url,
+          external_url: post.externalUrl,
           search_sort: sort,
           page: page + 1,
         },
@@ -306,7 +132,7 @@ async function searchRedditListing(
       if (candidate.success) results.push(candidate.data);
       if (results.length >= target) break;
     }
-    after = parsed.data.data.after ?? null;
+    after = listing.after;
     if (after === null) break;
   }
   return results;
@@ -438,7 +264,22 @@ function interleaveRedditResults(groups: SearchResult[][], limit: number): Searc
 // Provider
 // =============================================================================
 
+function failedFetch(url: string, fetchError: string): FetchResult {
+  return FetchResultSchema.parse({
+    provider: 'reddit',
+    url,
+    fetch_status: 'failed',
+    fetch_error: fetchError,
+  });
+}
+
 export function createRedditProvider(credentials: ResearchCredentials): SearchProvider {
+  let client: RedditClient | undefined;
+  function redditClient(): RedditClient {
+    if (client === undefined) client = createRedditClient(requireReddit(credentials));
+    return client;
+  }
+
   return {
     name: 'reddit',
 
@@ -452,8 +293,7 @@ export function createRedditProvider(credentials: ResearchCredentials): SearchPr
     enabled: credentials.reddit !== undefined,
 
     async search(query: string, opts: SearchOpts): Promise<SearchResult[]> {
-      const token = await getAccessToken(credentials);
-      const userAgent = requireReddit(credentials).userAgent;
+      const reddit = redditClient();
       const limit = opts.limit !== undefined ? Math.min(opts.limit, 100) : 25;
       const sorts: Array<'relevance' | 'top' | 'new' | 'comments'> = opts.sort === 'mixed'
         ? ['relevance', 'top', 'new', 'comments']
@@ -461,7 +301,7 @@ export function createRedditProvider(credentials: ResearchCredentials): SearchPr
       const groups: SearchResult[][] = [];
       const perSortLimit = Math.max(2, Math.ceil(limit / sorts.length));
       for (const sort of sorts) {
-        groups.push(await searchRedditListing(query, opts, token, userAgent, sort, perSortLimit));
+        groups.push(await searchRedditListing(reddit, query, opts, sort, perSortLimit));
       }
       const interleaved = interleaveRedditResults(groups, limit);
       const results = filterRedditByTopic(query, dropBrandReviewSpam(query, interleaved));
@@ -475,140 +315,32 @@ export function createRedditProvider(credentials: ResearchCredentials): SearchPr
     },
 
     async fetch(url: string, signal?: AbortSignal): Promise<FetchResult> {
-      let parsedUrl: URL;
-      try {
-        parsedUrl = new URL(url);
-      } catch {
-        return FetchResultSchema.parse({
-          provider: 'reddit',
-          url,
-          fetch_status: 'failed',
-          fetch_error: 'Reddit fetch requires a valid Reddit HTTPS URL',
-        });
-      }
-      const redditHosts = new Set([
-        'reddit.com',
-        'www.reddit.com',
-        'old.reddit.com',
-        'np.reddit.com',
-        'oauth.reddit.com',
-      ]);
-      if (parsedUrl.protocol !== 'https:'
-          || parsedUrl.username !== ''
-          || parsedUrl.password !== ''
-          || parsedUrl.port !== ''
-          || !redditHosts.has(parsedUrl.hostname.toLowerCase())) {
-        return FetchResultSchema.parse({
-          provider: 'reddit',
-          url,
-          fetch_status: 'failed',
-          fetch_error: 'Reddit fetch requires a canonical Reddit HTTPS URL',
-        });
-      }
-      parsedUrl.hostname = 'oauth.reddit.com';
-      if (!parsedUrl.pathname.endsWith('.json')) parsedUrl.pathname += '.json';
-      parsedUrl.searchParams.set('limit', '200');
-
-      // Resolve credentials only after the destination is proven canonical. A
+      // Prove the destination canonical before any credential is resolved. A
       // caller-controlled URL must never cause a bearer token to be attached to
       // an unreviewed origin, even if fetch/redirect behavior changes later.
-      const token = await getAccessToken(credentials);
-      const userAgent = requireReddit(credentials).userAgent;
-      await rateLimit();
+      const target = redditThreadApiUrl(url);
+      if (!target.ok) return failedFetch(url, target.reason);
 
-      const response = await fetch(parsedUrl, {
-        redirect: 'error',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'User-Agent': userAgent,
-        },
-        signal: signal !== undefined ? signal : AbortSignal.timeout(20000),
-      });
-
-      if (!response.ok) {
-        const result = FetchResultSchema.parse({
-          provider: 'reddit',
-          url,
-          fetch_status: 'failed',
-          fetch_error: `Reddit fetch error: ${response.status}`,
+      let thread: RedditThread;
+      try {
+        thread = await redditClient().fetchThread(url, {
+          limit: 200,
+          ...(signal === undefined ? {} : { signal }),
         });
-        return result;
-      }
-
-      const rawJson: unknown = await response.json();
-
-      // Reddit returns an array: [post_listing, comments_listing]
-      if (!Array.isArray(rawJson) || rawJson.length < 2) {
-        return FetchResultSchema.parse({
-          provider: 'reddit',
-          url,
-          fetch_status: 'failed',
-          fetch_error: 'Unexpected Reddit JSON structure',
-        });
-      }
-
-      // Parse post
-      const PostListingSchema = z.array(z.object({
-        data: z.object({
-          children: z.array(z.object({
-            kind: z.string(),
-            data: RedditPostDataSchema,
-          })).default([]),
-        }),
-      }));
-
-      const listingParsed = PostListingSchema.safeParse(rawJson);
-      if (!listingParsed.success) {
-        return FetchResultSchema.parse({
-          provider: 'reddit',
-          url,
-          fetch_status: 'failed',
-          fetch_error: `Parse error: ${listingParsed.error.message.slice(0, 200)}`,
-        });
-      }
-
-      const postListing = listingParsed.data[0];
-      const commentsListing = listingParsed.data[1];
-
-      if (postListing === undefined || commentsListing === undefined) {
-        return FetchResultSchema.parse({
-          provider: 'reddit',
-          url,
-          fetch_status: 'failed',
-          fetch_error: 'Missing post or comments listing',
-        });
-      }
-
-      const postChild = postListing.data.children[0];
-      if (postChild === undefined) {
-        return FetchResultSchema.parse({
-          provider: 'reddit',
-          url,
-          fetch_status: 'failed',
-          fetch_error: 'No post found',
-        });
-      }
-
-      const post = postChild.data;
-
-      // Flatten comments
-      const CommentListingChildrenSchema = z.array(z.object({
-        data: z.object({
-          children: z.array(z.unknown()).default([]),
-        }),
-      }));
-
-      const commentsParsed = CommentListingChildrenSchema.safeParse(rawJson);
-      let allComments: FlatComment[] = [];
-
-      if (commentsParsed.success && commentsParsed.data.length >= 2) {
-        const commentSection = commentsParsed.data[1];
-        if (commentSection !== undefined) {
-          allComments = flattenCommentTree(commentSection.data.children, 3, 0);
+      } catch (error) {
+        if (error instanceof RedditApiError && error.stage === 'api') {
+          return failedFetch(
+            url,
+            error.status !== undefined ? `Reddit fetch error: ${error.status}` : `Reddit fetch failed: ${error.reason.slice(0, 200)}`,
+          );
         }
+        throw error;
       }
+
+      const post = thread.post;
 
       // Sort comments by upvotes desc, take top 30
+      const allComments = flattenCommentTree(thread.comments);
       allComments.sort((a, b) => b.ups - a.ups);
       const topComments = allComments.slice(0, 30);
 
@@ -617,7 +349,7 @@ export function createRedditProvider(credentials: ResearchCredentials): SearchPr
       const lines: string[] = [
         `# ${post.title}`,
         '',
-        `**Author:** u/${post.author} | **Subreddit:** r/${post.subreddit} | **Upvotes:** ${post.ups} | **Comments:** ${post.num_comments}`,
+        `**Author:** u/${post.author} | **Subreddit:** r/${post.subreddit} | **Upvotes:** ${post.ups} | **Comments:** ${post.numComments}`,
         '',
       ];
 
@@ -645,12 +377,12 @@ export function createRedditProvider(credentials: ResearchCredentials): SearchPr
         canonical_id: post.id.length > 0 ? post.id : undefined,
         title: post.title,
         author: post.author.length > 0 ? `u/${post.author}` : undefined,
-        published_at: post.created_utc > 0 ? unixToIso(post.created_utc) : undefined,
+        published_at: post.created,
         raw_content: postBody,
         markdown,
         engagement: {
           upvotes: post.ups,
-          comment_count: post.num_comments,
+          comment_count: post.numComments,
         },
         fetch_status: 'ok',
         raw_metadata: {
@@ -661,7 +393,7 @@ export function createRedditProvider(credentials: ResearchCredentials): SearchPr
       });
 
       logger.info(
-        { url: url.slice(0, 60), title: post.title.slice(0, 40), comments: topComments.length },
+        { url: url.slice(0, 60), title: post.title.slice(0, 40), comments: topComments.length, moreUnexpanded: thread.moreCount },
         '[Reddit] Fetch complete',
       );
 

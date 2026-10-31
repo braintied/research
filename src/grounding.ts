@@ -16,7 +16,7 @@
  */
 
 import { resolveSameSourceCitationUrl } from './types.js';
-import { isKeyClaimSupportedBySource } from './evidence-validation.js';
+import { isKeyClaimSupportedBySource, isVerbatimQuoteSupportedBySource } from './evidence-validation.js';
 import type {
   FinalReport,
   ProviderName,
@@ -216,12 +216,32 @@ function normalizeForMatch(text: string): string {
     .trim();
 }
 
-function evidenceMatchRatio(claimText: string, evidenceText: string): number {
+/**
+ * Shortest citation a verbatim quote may support. A changelog's version and
+ * date live in short heading lines ("Bot API 10.3", "August 24, 2026"); an
+ * executive summary that answers "which version, which date" has to cite
+ * exactly those lines. They are accepted only as an exact match of a quote
+ * that already passed extraction validation against its fetched page, never
+ * against a key claim or as a substring.
+ */
+const MIN_SHORT_QUOTE_TOKENS = 2;
+
+function evidenceMatchRatio(claimText: string, chunk: ReportChunkInput): number {
+  const evidenceText = chunk.content;
   const claimWithoutCitations = claimText.replace(/\[\^\d+\]/gu, ' ');
   const claimTokens = normalizeForMatch(claimWithoutCitations).split(' ').filter(Boolean);
   const evidenceTokens = normalizeForMatch(evidenceText).split(' ').filter(Boolean);
-  if (claimTokens.length < 4 || evidenceTokens.length < 4) return 0;
-  return isKeyClaimSupportedBySource(claimWithoutCitations, evidenceText) ? 1 : 0;
+  if (claimTokens.length >= 4 && evidenceTokens.length >= 4
+      && isKeyClaimSupportedBySource(claimWithoutCitations, evidenceText)) {
+    return 1;
+  }
+  if (chunk.metadata['grounding_basis'] === 'verbatim_quote'
+      && claimTokens.length >= MIN_SHORT_QUOTE_TOKENS
+      && normalizeForMatch(claimWithoutCitations) === normalizeForMatch(evidenceText)
+      && isVerbatimQuoteSupportedBySource(claimWithoutCitations, evidenceText)) {
+    return 1;
+  }
+  return 0;
 }
 
 /**
@@ -307,7 +327,7 @@ export function validateGrounding(input: ValidateGroundingInput): GroundingResul
       let foundMatch = false;
       let bestRatio = 0;
       for (const chunk of matchingChunks) {
-        const matchRatio = evidenceMatchRatio(citationUse.window, chunk.content);
+        const matchRatio = evidenceMatchRatio(citationUse.window, chunk);
         if (matchRatio > bestRatio) {
           bestRatio = matchRatio;
         }

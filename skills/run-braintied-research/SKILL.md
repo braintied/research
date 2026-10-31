@@ -21,6 +21,37 @@ model providers; treat every brief as outbound data.
 > not proof the engine is down. Check `ora_core.internal_tool_runs` and
 > `ai_usage_events` before concluding anything.
 
+## Reddit: the authenticated corpus runner comes first
+
+Any Reddit ask (threads, comments, "what do people say on Reddit about X")
+starts here, not with a research run and not with WebSearch:
+
+```bash
+R=~/.claude/skills/run-braintied-research/scripts/reddit-corpus.mjs
+E=~/Development/ora-ai/platform/.env.local   # owner-only; only REDDIT_* is read
+node $R check --research-env-file $E
+node $R discover --research-env-file $E --topic "aging parents" --topic caregiving --min-subscribers 3000 --out subs.json
+node $R collect --research-env-file $E --subs AgingParents,CaregiverSupport \
+  --queries-file queries.txt --since 2023-10-13 --sort relevance,top \
+  --per-query 25 --comments full --more-cap 25 --out <dir>
+```
+
+- Output: `<dir>/threads/<id>.json` (post metadata plus the full comment tree,
+  `parentId` + `depth`, `/api/morechildren` and continue-thread expansion up to
+  `--more-cap` calls per thread, truncation counted in `commentStats`),
+  `<dir>/errors.jsonl` (every failed request with stage and HTTP status), and a
+  `run-*.json` summary. Rerun the same command to resume: stored threads and
+  cached search pages are skipped.
+- No usernames by default. `--include-authors` is an explicit opt-in.
+- **Unauthenticated Reddit is dead (HTTP 403 since 2026-10-11).** Never scrape
+  `www.reddit.com`/`old.reddit.com` JSON or HTML, never `curl` it, and never fall
+  back to WebSearch for Reddit content. Missing `REDDIT_CLIENT_ID` /
+  `REDDIT_CLIENT_SECRET` / `REDDIT_USER_AGENT` makes the runner exit 2; fix the
+  credentials instead of switching doors.
+- In code, the same surface is `collectRedditCorpus`, `fetchExpandedThread`,
+  `discoverSubreddits` and `createDirectoryThreadStore` from `@braintied/research`.
+- Bright Data or Apify Reddit backfill is paid: estimate and get G's approval first.
+
 This file in `packages/research` is the only source.
 `~/.claude/skills/run-braintied-research` is a symlink into a worktree pinned to
 `origin/main` (`~/Development/.worktrees/research-main`), not a copy. After
@@ -211,6 +242,12 @@ worktree with local edits.
    is `strong`. Measured 2026-09-24: two `strong` standard runs had 13 of 20
    sections as `Evidence gap` notices. Do not present or capture a thin
    report as research; say which sections are empty.
+   Read `answer_quality` (stdout `answer_check`) as well: it lists each fact
+   the brief asked for (version, date, price, name...) and whether evidence
+   states it, plus whether a named or implied primary source was cited.
+   `answer_quality.passed: false` means the report did not answer the brief;
+   name the missing facts instead of presenting it as an answer. Measured
+   2026-10-12: a `strong` grounding run never stated the asked version or date.
    Treat prose explicitly labeled `Editorial synthesis — inference, not
    source-validated` as analysis, never as a supported source claim. Profile
    coverage counts only fetched, exact evidence; search snippets cannot satisfy

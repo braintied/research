@@ -401,19 +401,27 @@ function createResearchCheckpoint({
   asOf,
   sourceModes,
   timeoutSeconds,
+  terminal = null,
 }) {
+  let checkpointStatus = 'awaiting_terminal_result';
+  if (terminal !== null) checkpointStatus = 'terminal_failure';
+  else if (run === null) checkpointStatus = 'submission_pending';
   return {
     artifact_type: 'braintied_internal_research_checkpoint',
     schema_version: CHECKPOINT_SCHEMA_VERSION,
     mode: 'internal',
     package_version: currentPackageVersion,
     request_id: requestId,
-    durable_run_id: run?.id ?? null,
+    durable_run_id: terminal === null ? run?.id ?? null : terminal.runId,
     execution_protocol: protocolVersion,
-    checkpoint_status: run === null
-      ? 'submission_pending'
-      : 'awaiting_terminal_result',
-    durable_run_status: run?.status ?? null,
+    // `awaiting_terminal_result` tells bt-research the server run is alive and
+    // to resume the same request id. A terminal failure must never leave that
+    // value behind, or the caller resumes a dead run until its wait budget ends.
+    checkpoint_status: checkpointStatus,
+    durable_run_status: terminal === null ? run?.status ?? null : terminal.runStatus,
+    ...(terminal === null
+      ? {}
+      : { error_code: terminal.errorCode, error_reason: terminal.reason }),
     started_at: startedAt.toISOString(),
     updated_at: new Date().toISOString(),
     kind,
@@ -923,6 +931,116 @@ async function submitDurableResearch({
   );
 }
 
+const PROGRESS_EVERY_MS = 60_000;
+/** A server that heartbeats touches updated_at every minute; 10 min of silence is a stall. */
+const HEARTBEAT_STALL_MS = 10 * 60_000;
+
+/**
+ * One progress line for a polled durable run.
+ * @param {{ id: string, status: string, updatedAt?: string, createdAt?: string }} run
+ * @param {string} requestId
+ * @param {number} nowMs
+ */
+function progressEvent(run, requestId, nowMs) {
+  const updated = typeof run.updatedAt === 'string' ? Date.parse(run.updatedAt) : Number.NaN;
+  const created = typeof run.createdAt === 'string' ? Date.parse(run.createdAt) : Number.NaN;
+  const heartbeatAgeS = Number.isFinite(updated) ? Math.round((nowMs - updated) / 1000) : null;
+  return {
+    event: 'braintied_internal_research_progress',
+    request_id: requestId,
+    run_id: run.id,
+    status: run.status,
+    elapsed_s: Number.isFinite(created) ? Math.round((nowMs - created) / 1000) : null,
+    server_heartbeat_age_s: heartbeatAgeS,
+    stalled: heartbeatAgeS !== null && run.status === 'running' && heartbeatAgeS * 1000 > HEARTBEAT_STALL_MS,
+  };
+}
+
+/*
+ * A TERMINAL STATUS IS TERMINAL.
+ *
+ * The worker's status route (cortex-worker internal-tools/router.ts,
+ * GET /runs/:runId) answers a `failed` run with HTTP 500
+ * `{ ok: false, error: { code: <run error_code> }, runId }` and an expired one
+ * with HTTP 410 `RUN_EXPIRED`. Neither will ever produce a result.
+ *
+ * Measured 2026-10-23: a deep run sent with --max-cost-usd 6 was refused one
+ * second after creation (`RESEARCH_INPUT_REJECTED`, the worker caps the ceiling
+ * at INTERNAL_RESEARCH_MAX_COST_USD = $5). The runner exited on the 500 but left
+ * its checkpoint at `awaiting_terminal_result`, so bt-research read "server
+ * still working" and resumed the same dead request for 3 hours.
+ *
+ * Codes mirror ResearchRunErrorCodeSchema in cortex-worker research-runs.ts.
+ */
+const TERMINAL_RUN_REASONS = {
+  RESEARCH_INPUT_REJECTED:
+    'the worker refused the run input after admission: the cost ceiling '
+    + '(--max-cost-usd above the worker cap, INTERNAL_RESEARCH_MAX_COST_USD) or an input rule',
+  TOOL_EXECUTION_FAILED: 'the research executor threw while running the brief',
+  INVALID_PERSISTED_INPUT: 'the stored run input failed its integrity check',
+  RUN_EXPIRED: 'the run passed its retention window before a result was collected',
+  DISPATCH_FAILED: 'the worker could not dispatch the run to its executor',
+  RESULT_PERSISTENCE_FAILED: 'the run finished but the worker could not store its result',
+  STALE_EXECUTION_CLAIM: 'the run stopped heartbeating and the reconciler closed it',
+  EXECUTION_DEADLINE_EXCEEDED: "the run hit the worker's hard execution deadline",
+};
+
+class ResearchRunTerminalError extends Error {
+  /**
+   * @param {{ runId: string, requestId: string, runStatus: 'failed' | 'expired',
+   *   errorCode: string, reason: string }} details
+   */
+  constructor({ runId, requestId, runStatus, errorCode, reason }) {
+    super(
+      `research run ${runId} ${runStatus} (${errorCode}): ${reason}. `
+        + 'Resuming will not help; fix the cause and submit with a new --request-id '
+        + `(request ${requestId} is bound to this run).`,
+    );
+    this.name = 'ResearchRunTerminalError';
+    this.runId = runId;
+    this.requestId = requestId;
+    this.runStatus = runStatus;
+    this.errorCode = errorCode;
+    this.reason = reason;
+  }
+}
+
+/** The cap the worker names in its executor message, when the body carries one. */
+function serverCostCapFromMessage(message) {
+  if (typeof message !== 'string') return null;
+  const match = /INTERNAL_RESEARCH_MAX_COST_USD=\$(\d+(?:\.\d+)?)/.exec(message);
+  return match === null ? null : Number(match[1]);
+}
+
+/**
+ * Classify a status response as a terminal run failure, or null when it is not one.
+ * @returns {ResearchRunTerminalError | null}
+ */
+function terminalRunFailure(response, payload, runId, requestId) {
+  if (payload === null || typeof payload !== 'object' || payload.ok !== false) return null;
+  const errorCode = payload.error?.code;
+  if (typeof errorCode !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/.test(errorCode)) return null;
+  const isFailedRun = response.status === 500 && payload.runId === runId;
+  const isExpiredRun = response.status === 410 && errorCode === 'RUN_EXPIRED';
+  if (!isFailedRun && !isExpiredRun) return null;
+
+  const knownReason = Object.hasOwn(TERMINAL_RUN_REASONS, errorCode)
+    ? TERMINAL_RUN_REASONS[errorCode]
+    : null;
+  let reason = knownReason === null ? 'the worker marked the run failed' : knownReason;
+  if (errorCode === 'RESEARCH_INPUT_REJECTED') {
+    const cap = serverCostCapFromMessage(payload.error.message);
+    if (cap !== null) reason = `${reason}; the server cap is $${cap.toFixed(2)}`;
+  }
+  return new ResearchRunTerminalError({
+    runId,
+    requestId,
+    runStatus: isExpiredRun ? 'expired' : 'failed',
+    errorCode,
+    reason,
+  });
+}
+
 async function pollDurableResearch({
   endpoint,
   token,
@@ -933,6 +1051,7 @@ async function pollDurableResearch({
 }) {
   let attempt = 0;
   let lastDiagnostic = 'UnknownError';
+  let lastProgressAt = 0;
   while (Date.now() < deadlineMs) {
     const outcome = await fetchDurableJson({
       url: endpoint,
@@ -950,6 +1069,13 @@ async function pollDurableResearch({
           && payload?.ok === true
           && payload?.run?.id === runId
           && ['queued', 'running'].includes(payload.run.status)) {
+        // Progress every minute: the server's own heartbeat age, so a hung run
+        // is visible in minutes instead of at the one-hour client deadline
+        // (2026-10-10: two deep runs sat 90+ minutes with nothing to show).
+        if (Date.now() - lastProgressAt >= PROGRESS_EVERY_MS) {
+          lastProgressAt = Date.now();
+          await writeStderrLine(JSON.stringify(progressEvent(payload.run, requestId, Date.now())));
+        }
         await waitForRetry(
           retryDelayMs(attempt, payload.run.pollAfterMs ?? pollAfterMs),
           deadlineMs,
@@ -957,6 +1083,8 @@ async function pollDurableResearch({
         attempt = 0;
         continue;
       }
+      const terminal = terminalRunFailure(response, payload, runId, requestId);
+      if (terminal !== null) throw terminal;
       if (!retryableHttpStatus(response.status)) {
         throw new Error(boundedServerMessage(response, payload));
       }
@@ -985,6 +1113,7 @@ async function executeResearch({
   input,
   probe,
   onSubmitted,
+  onTerminal,
 }) {
   const durable = resolveDurableEndpoints(endpoint, probe);
   const deadlineMs = Date.now() + timeoutSeconds * 1000;
@@ -995,16 +1124,23 @@ async function executeResearch({
     input,
     deadlineMs,
   });
+  // A resubmitted request id whose run already failed comes back here as
+  // status `failed` with no error code; the status read below supplies it.
   await onSubmitted(run);
-  const result = await pollDurableResearch({
-    endpoint: durable.status(run.id),
-    token,
-    requestId,
-    runId: run.id,
-    pollAfterMs: durable.pollAfterMs,
-    deadlineMs,
-  });
-  return { result, runId: run.id };
+  try {
+    const result = await pollDurableResearch({
+      endpoint: durable.status(run.id),
+      token,
+      requestId,
+      runId: run.id,
+      pollAfterMs: durable.pollAfterMs,
+      deadlineMs,
+    });
+    return { result, runId: run.id };
+  } catch (error) {
+    if (error instanceof ResearchRunTerminalError) await onTerminal(error);
+    throw error;
+  }
 }
 
 async function main() {
@@ -1167,6 +1303,14 @@ async function main() {
     requestId,
     probe: liveProbe,
     onSubmitted: persistCheckpoint,
+    onTerminal: async (terminal) => atomicWrite(
+      values.metadata,
+      `${JSON.stringify(createResearchCheckpoint({
+        ...checkpointContext,
+        run: null,
+        terminal,
+      }), null, 2)}\n`,
+    ),
     input: {
       brief,
       kind,
@@ -1224,6 +1368,11 @@ async function main() {
     grounding: result.grounding ?? null,
     grounding_quality: groundingAssessment.quality,
     grounding_passed: groundingAssessment.passed,
+    // Did the report answer the brief (asked facts found, primary source
+    // cited)? Grounding alone cannot say: a 2026-10-12 run scored grounding
+    // 1.0 with an executive summary that never stated the asked version or
+    // date. Null when the package or engine predates the answer check.
+    answer_quality: result.report.answer_quality ?? null,
     evidence_coverage: evidenceCoverage,
     program_status: result.programStatus ?? null,
     source_coverage: result.sourceCoverage ?? null,
@@ -1273,6 +1422,9 @@ async function main() {
     grounding_check_status: metadata.grounding?.status ?? null,
     grounding_ratio: groundingAssessment.ratio,
     grounding_passed: metadata.grounding_passed,
+    answer_quality_status: metadata.answer_quality?.status ?? null,
+    answer_quality_passed: metadata.answer_quality?.passed ?? null,
+    answer_check: metadata.answer_quality?.summary_line ?? null,
     evidence_coverage_status: evidenceCoverage.status,
     evidence_coverage_ratio: evidenceCoverage.ratio,
     evidence_gap_sections: evidenceCoverage.evidence_gap_sections,

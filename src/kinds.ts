@@ -30,6 +30,7 @@ import type { Logger } from './logger.js';
 import type { FinalReport, ProviderName, VerbatimQuote } from './types.js';
 import type { SearchOpts, SearchResult, Subquery } from './types.js';
 import type { GroundingResult } from './grounding.js';
+import type { AnswerQuality } from './answer-quality-schema.js';
 import type { ResearchCredentials } from './credentials.js';
 import { resolveResearchSynthesisModel } from './model-policy.js';
 
@@ -193,6 +194,11 @@ export interface KindResearchResult {
    * Absent for managed and answer engines, which do no quote extraction.
    */
   evidenceFunnel?: EvidenceFunnel;
+  /**
+   * Did the report answer the brief? Pipeline runs only; also on
+   * `report.answer_quality`. Absent for managed and answer engines.
+   */
+  answerQuality?: AnswerQuality;
 }
 
 /**
@@ -284,5 +290,6 @@ export async function runResearch(input: RunResearchInput): Promise<KindResearch
     discoveries: result.discoveries,
     validatedEvidence: result.validatedEvidence,
     evidenceFunnel: result.evidenceFunnel,
+    answerQuality: result.answerQuality,
   };
 }

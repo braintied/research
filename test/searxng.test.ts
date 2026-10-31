@@ -185,3 +185,32 @@ test('when every instance is marked dead, all are still tried rather than none',
     resetSearxngDeadInstanceMemoryForTests();
   }
 });
+
+test('SearXNG image search sends categories=images and returns the image URL', async () => {
+  const originalFetch = globalThis.fetch;
+  const seen: string[] = [];
+  const credentials: ResearchCredentials = { searxngUrls: ['https://searx.example'] };
+  resetSearxngDeadInstanceMemoryForTests();
+  resetSearxngRoundRobinForTests();
+
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
+    seen.push(url.searchParams.get('categories') ?? '');
+    return Response.json({
+      results: [
+        { title: 'Hampi boulders', url: 'https://www.flickr.com/photos/x/1', img_src: 'https://live.staticflickr.com/1.jpg', engine: 'flickr' },
+        { title: 'A page with no image', url: 'https://blog.example/hampi', img_src: '' },
+      ],
+    });
+  }) as typeof fetch;
+
+  try {
+    const outcome = await searxngSearch(credentials, 'Hampi India', { category: 'images' });
+    assert.deepEqual(seen, ['images']);
+    assert.equal(outcome.results[0]?.image, 'https://live.staticflickr.com/1.jpg');
+    assert.equal(outcome.results[0]?.url, 'https://www.flickr.com/photos/x/1');
+    assert.equal(outcome.results[1]?.image, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

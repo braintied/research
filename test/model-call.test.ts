@@ -13,10 +13,16 @@
 import assert from 'node:assert/strict';
 import test, { afterEach, describe } from 'node:test';
 
-import { resolveForStyle, resolveForUseCase } from '@braintied/models';
+import { FailoverExhaustedError, resolveForStyle, resolveForUseCase } from '@braintied/models';
 
 import { MissingCredentialError, type ResearchCredentials } from '../src/credentials.js';
-import { callModel, providerForModelId, UnroutableModelError } from '../src/model-call.js';
+import {
+  callModel,
+  isProviderAccountFailure,
+  providerForModelId,
+  UnroutableModelError,
+} from '../src/model-call.js';
+import { extractQuotesWithGemini } from '../src/providers/gemini-extractor.js';
 import { researchStageResolution } from '../src/model-policy.js';
 import { synthesisGenerate } from '../src/synthesis.js';
 
@@ -197,5 +203,83 @@ describe('callModel refuses what it cannot route', () => {
 
   test('qwen override ids keep their OpenRouter route', () => {
     assert.equal(providerForModelId('qwen/qwen3-235b-a22b-instruct-2507'), 'openrouter');
+  });
+});
+
+/** DeepSeek answers 402 Insufficient Balance; every other host answers 200. */
+function stubDeepSeekEmptyBalance(): void {
+  captured = [];
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    const url = input instanceof Request ? input.url : String(input);
+    captured.push({ url, headers: new Headers(init?.headers), body: readBody(init) });
+    if (url.startsWith('https://api.deepseek.com/')) {
+      return new Response(
+        JSON.stringify({ error: { message: 'Insufficient Balance', type: 'unknown_error', code: 'invalid_request_error' } }),
+        { status: 402, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    const body = readBody(init);
+    return new Response(JSON.stringify(messagesReply(String(body.model))), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as typeof globalThis.fetch;
+}
+
+describe('callModel fails over when the provider account cannot pay (2026-10-07 PT)', () => {
+  test('DeepSeek 402 moves the call to the same model on Fireworks', async () => {
+    stubDeepSeekEmptyBalance();
+    const result = await callModel({
+      credentials,
+      system: 's',
+      user: 'u',
+      model: researchStageResolution('extract'),
+      maxTokens: 64,
+    });
+    assert.deepEqual(captured.map((request) => new URL(request.url).host), [
+      'api.deepseek.com',
+      'api.fireworks.ai',
+    ]);
+    assert.equal(result.provider, 'fireworks');
+    assert.equal(result.model, 'accounts/fireworks/models/deepseek-v4p1-flash-1017');
+  });
+
+  test('without a Fireworks key the call throws a named account failure, not an empty reply', async () => {
+    stubDeepSeekEmptyBalance();
+    await assert.rejects(
+      () => callModel({
+        credentials: { deepseekApiKey: 'test-deepseek-key' }, // git-secret-allow: fake fixture value
+        system: 's',
+        user: 'u',
+        model: researchStageResolution('extract'),
+        maxTokens: 64,
+      }),
+      (error: unknown) =>
+        error instanceof FailoverExhaustedError
+        && isProviderAccountFailure(error)
+        && /deepseek#0 HTTP 402/.test(error.message)
+        && /fireworks#1 skipped \(missing_credential\)/.test(error.message),
+    );
+    assert.equal(captured.length, 1, 'the keyless host is skipped, not sent');
+  });
+
+  test('the extractor rethrows an account failure instead of returning zero quotes', async () => {
+    stubDeepSeekEmptyBalance();
+    await assert.rejects(
+      () => extractQuotesWithGemini({
+        credentials: { deepseekApiKey: 'test-deepseek-key' }, // git-secret-allow: fake fixture value
+        provider: 'crawl4ai',
+        url: 'https://example.com/page',
+        content: 'SearXNG is a free metasearch engine. It aggregates results from many services.',
+        mode: 'longform',
+      }),
+      (error: unknown) => isProviderAccountFailure(error),
+    );
+  });
+
+  test('a page the model cannot read still returns an empty result (not an account failure)', () => {
+    assert.equal(isProviderAccountFailure(new Error('Could not parse JSON')), false);
+    assert.equal(isProviderAccountFailure({ status: 400 }), false);
+    assert.equal(isProviderAccountFailure({ status: 401 }), true);
   });
 });

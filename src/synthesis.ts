@@ -28,6 +28,14 @@ import type {
   ProviderName,
 } from './types.js';
 import {
+  buildAnswerQuality,
+  type AnswerQuality,
+  type BriefRequirements,
+  type FacetAnswer,
+  type FetchQualityCounts,
+  type GateCounts,
+} from './answer-quality.js';
+import {
   resolveResearchAssemblyModel,
   resolveResearchSynthesisModel,
 } from './model-policy.js';
@@ -57,7 +65,7 @@ export const SECTION_SYNTHESIS_SYSTEM_PROMPT =
   'You are a research editor. Write a well-structured markdown section using only the supplied evidence units for factual claims. ' +
   'Insert an evidence unit with its exact token, such as {{EVIDENCE:E1}}. The renderer replaces that token with the exact source sentence and its citation; never copy, paraphrase, combine, or add [^N] citation syntax yourself. ' +
   'Put each evidence token on its own line between paragraphs. Use each token at most once and never invent an evidence ID. ' +
-  'Draw on as many different sources as the evidence units offer: use a unit from every distinct Source that bears on the section before you use a second unit from the same Source. ' +
+  'Choose evidence by how directly it answers the research questions: lead with units that state an asked fact (a version, a date, a price, a name), then supporting context. Leave out units that do not bear on the questions, even if that makes the section short. Among equally relevant units, prefer an official or first-party source, then spread across distinct Sources. ' +
   'You may add concise connective analysis, but it must not introduce new names, numbers, dates, product capabilities, prices, legal terms, benchmarks, or other externally verifiable facts. The renderer visibly labels every word of that connective prose as editorial inference rather than source-validated evidence. ' +
   'This evidence-token contract makes every cited sentence source-near and mechanically traceable while preserving every number, percentage, date, named entity, standard identifier, protocol or status code, and technical term exactly as stated. ' +
   'Write in concise, non-repetitive paragraphs. Do not output a heading; the renderer assigns the section heading deterministically. ' +
@@ -78,6 +86,32 @@ export class SynthesisEvidenceBindingError extends Error {
     super(message);
     this.name = 'SynthesisEvidenceBindingError';
   }
+}
+
+/**
+ * One bibliography line: `[^n]: url`, then ` — author, YYYY-MM-DD` with
+ * whichever of the two is known.
+ *
+ * The date is what lets a reader (and the Cortex ingest, which parses this
+ * trailer) tell how old the evidence is. Before 2026-10-10 the line was the
+ * bare URL, so every published_at the pipeline had resolved was dropped from
+ * the report: 20,281 of 20,299 indexed report chunks carried no source date.
+ */
+export function formatBibliographyLine(entry: {
+  citation_anchor: string;
+  source_url: string;
+  author: string;
+  published_at?: string;
+}): string {
+  const parts: string[] = [];
+  const author = entry.author.replace(/[,\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (author !== '') parts.push(author);
+  if (entry.published_at !== undefined) {
+    const m = /(\d{4}-\d{2}-\d{2})/.exec(entry.published_at);
+    if (m !== null) parts.push(m[1]);
+  }
+  const head = `${entry.citation_anchor}: ${entry.source_url}`;
+  return parts.length === 0 ? head : `${head} — ${parts.join(', ')}`;
 }
 
 function normalizeEvidenceText(text: string): string {
@@ -323,6 +357,8 @@ export interface SynthesizeSectionInput {
    * a question-derived heading instead of the ordinal fallback.
    */
   sectionTitles?: Record<string, string>;
+  /** The brief's explicit questions; evidence is chosen for how it answers them. */
+  briefQuestions?: string[];
 }
 
 export interface SynthesizeSectionResult {
@@ -402,7 +438,11 @@ export async function synthesizeSection(
       `### ${unit.id}\nSource: ${unit.sourceUrl}\nExact evidence: ${unit.text}`)
     .join('\n\n');
 
+  const questionsBlock = input.briefQuestions !== undefined && input.briefQuestions.length > 0
+    ? `Research questions the report must answer:\n${input.briefQuestions.map((q) => `- ${q}`).join('\n')}\n`
+    : '';
   const userMessage =
+    questionsBlock +
     `Section: ${sectionPath}\n` +
     `Goal: ${sectionGoal}\n` +
     `Target length: ~${targetWords} words\n\n` +
@@ -569,6 +609,8 @@ export interface SynthesizeAllInput {
    * a question-derived heading instead of the ordinal fallback.
    */
   sectionTitles?: Record<string, string>;
+  /** The brief's explicit questions, forwarded to every section. */
+  briefQuestions?: string[];
 }
 
 const PARALLEL_CHUNK_SIZE = 2;
@@ -616,6 +658,7 @@ export async function synthesizeAllSections(
           kind,
           telemetry,
           sectionTitles: input.sectionTitles,
+          briefQuestions: input.briefQuestions,
         });
       }),
     );
@@ -671,12 +714,28 @@ export interface AssembleFinalReportInput {
     title?: string;
     author?: string;
     published_at?: string;
+    scraped_at?: string;
   }>;
   /**
    * Decision-brief question texts keyed by `q{n}` — lets q{n}.* sections render
    * a question-derived heading instead of the ordinal fallback.
    */
   sectionTitles?: Record<string, string>;
+  /**
+   * The answer check. When present, the executive summary answers each of the
+   * brief's questions fact by fact from the selected evidence (or says which
+   * fact is missing), and the report carries `answer_quality`.
+   */
+  answerCheck?: AnswerCheckInput;
+}
+
+export interface AnswerCheckInput {
+  requirements: BriefRequirements | null;
+  /** Why the brief could not be analyzed, when requirements is null. */
+  analysisError?: string;
+  answers: FacetAnswer[];
+  gate: GateCounts;
+  fetchQuality: FetchQualityCounts;
 }
 
 export interface AssembleFinalReportResult {
@@ -731,6 +790,43 @@ export function buildEvidenceBoundExecutiveSummary(
   return `${intro}\n\n${findings.join('\n\n')}`;
 }
 
+const MISSING_FACET_NOTE = 'not found in the accepted evidence.';
+
+/**
+ * An executive summary that answers the brief. For every explicit question
+ * it states each asked fact with the exact evidence sentence that carries it
+ * (label on its own line, so the cited sentence stays an exact source
+ * sentence for grounding), and names each fact no evidence states. The last
+ * line is the answer check a reader can scan.
+ */
+export function renderAnswerSummary(input: {
+  requirements: BriefRequirements;
+  answers: FacetAnswer[];
+  /** source URL → global anchor, e.g. "[^3]". */
+  anchorByUrl: Map<string, string>;
+  summaryLine: string;
+}): string {
+  const blocks: string[] = [];
+  input.requirements.questions.forEach((question, qi) => {
+    blocks.push(`**${question.question.replace(/\*+/gu, '').trim()}**`);
+    for (const facet of question.facets) {
+      const answer = input.answers.find((a) => a.questionIndex === qi && a.facet.key === facet.key);
+      const cited = (answer?.units ?? []).flatMap((unit) => {
+        const anchor = input.anchorByUrl.get(unit.sourceUrl);
+        return anchor === undefined ? [] : [citeExactEvidence(normalizeEvidenceText(unit.text), anchor)];
+      });
+      if (cited.length === 0) {
+        blocks.push(`*${facet.label}:* ${MISSING_FACET_NOTE}`);
+        continue;
+      }
+      blocks.push(`*${facet.label}:*`);
+      for (const sentence of cited) blocks.push(sentence);
+    }
+  });
+  blocks.push(`Answer check — ${input.summaryLine}.`);
+  return blocks.join('\n\n');
+}
+
 export async function assembleFinalReport(
   input: AssembleFinalReportInput,
 ): Promise<AssembleFinalReportResult> {
@@ -740,6 +836,7 @@ export async function assembleFinalReport(
     synthesisModelOverride,
     sourceMeta,
     sectionTitles,
+    answerCheck,
   } = input;
   const assemblyModel = resolveSynthesisModel(synthesisModelOverride, assemblyModelDefault());
 
@@ -811,6 +908,20 @@ export async function assembleFinalReport(
     };
   });
 
+  // Evidence the executive summary states as an answer may come from a source
+  // no section happened to cite; it joins the bibliography after the
+  // section sources so section numbering is unchanged.
+  if (answerCheck !== undefined) {
+    for (const answer of answerCheck.answers) {
+      for (const unit of answer.units) {
+        if (!urlToGlobal.has(unit.sourceUrl)) {
+          urlToGlobal.set(unit.sourceUrl, globalCounter);
+          globalCounter++;
+        }
+      }
+    }
+  }
+
   // Build full markdown from renumbered sections
   const sectionsMarkdown = renumberedSections
     .map((s) => {
@@ -851,6 +962,7 @@ export async function assembleFinalReport(
         author: meta !== undefined && meta.author !== undefined ? meta.author : '',
         provider: providerParse.success ? providerParse.data : ('crawl4ai' as ProviderName),
         published_at: meta !== undefined ? meta.published_at : undefined,
+        scraped_at: meta !== undefined ? meta.scraped_at : undefined,
       };
     });
 
@@ -858,7 +970,29 @@ export async function assembleFinalReport(
   // outside sentence grounding and therefore cannot safely become report
   // metadata, even when a prompt asks the model to avoid factual claims.
   const title = 'Evidence-Bound Research Report';
-  const executiveSummary = buildEvidenceBoundExecutiveSummary(renumberedSections);
+  let executiveSummary = buildEvidenceBoundExecutiveSummary(renumberedSections);
+  let answerQuality: AnswerQuality | undefined;
+  if (answerCheck !== undefined) {
+    const anchorByUrl = new Map<string, string>();
+    for (const [url, num] of urlToGlobal.entries()) anchorByUrl.set(url, `[^${num}]`);
+    answerQuality = buildAnswerQuality({
+      requirements: answerCheck.requirements,
+      analysisError: answerCheck.analysisError,
+      answers: answerCheck.answers,
+      anchorByUrl,
+      citedUrls: Array.from(urlToGlobal.keys()),
+      gate: answerCheck.gate,
+      fetchQuality: answerCheck.fetchQuality,
+    });
+    if (answerCheck.requirements !== null && answerCheck.requirements.questions.length > 0) {
+      executiveSummary = renderAnswerSummary({
+        requirements: answerCheck.requirements,
+        answers: answerCheck.answers,
+        anchorByUrl,
+        summaryLine: answerQuality.summary_line,
+      });
+    }
+  }
 
   const assemblyGaps = [...gaps];
   for (const section of renumberedSections) {
@@ -875,9 +1009,7 @@ export async function assembleFinalReport(
     sectionsMarkdown +
     (bibliography.length > 0
       ? '\n\n## Bibliography\n\n' +
-        bibliography
-          .map((b) => `${b.citation_anchor}: ${b.source_url}`)
-          .join('\n')
+        bibliography.map(formatBibliographyLine).join('\n')
       : '');
 
   // Audit M4: return the RENUMBERED sections — returning the originals gave
@@ -889,8 +1021,11 @@ export async function assembleFinalReport(
     full_markdown: fullMarkdown,
     sections: renumberedSections,
     bibliography,
-    gaps: assemblyGaps,
+    gaps: answerQuality !== undefined && answerQuality.status !== 'answered'
+      ? [...assemblyGaps, `answer check: ${answerQuality.summary_line}`]
+      : assemblyGaps,
     word_count: countWords(fullMarkdown),
+    ...(answerQuality !== undefined ? { answer_quality: answerQuality } : {}),
   });
 
   logger.info(

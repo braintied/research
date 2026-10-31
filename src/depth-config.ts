@@ -62,8 +62,25 @@ export interface DepthTunables {
    * critique pass combined). One page = one generateContent. Without this,
    * a standard/wide run × critique loop could mint hundreds of extract calls
    * (Aug 2026: a single brief produced ~7k extract ledger rows in a day).
+   *
+   * Since 2026-10-27 this is a safety ceiling, not the plan. Extraction runs
+   * in waves and stops when every section reaches its evidence target, runs
+   * out of candidates, or extraction reaches EXTRACT_SPEND_SHARE of the dollar
+   * cap. Before then it was the plan: a fixed 20 at standard fed 14 main-pass
+   * pages to 20 sections (2026-10-26: 186 sources found, 8 cited, 11 of 20
+   * sections empty, $0.03 of a $2 cap).
    */
   maxExtractPages: number;
+  /**
+   * Pages each section gets in the first extraction wave. Later waves go only
+   * to sections still below the evidence target; see
+   * `takeAdaptiveExtractWave()`.
+   */
+  firstWavePagesPerSection: number;
+  /** Validated quotes + claims a section needs before it stops taking pages. */
+  evidenceTargetUnits: number;
+  /** Distinct sources those units must come from. */
+  evidenceTargetSources: number;
   /** Max concurrent Gemini extract calls inside one extractQuotes wave. */
   extractConcurrency: number;
 }
@@ -82,7 +99,10 @@ export const DEPTH_CONFIG: Record<ResearchDepth, DepthTunables> = {
     hardCapUsd: 0.50,
     targetWordCountMin: 400,
     targetWordCountMax: 1200,
-    maxExtractPages: 10,
+    maxExtractPages: 16,
+    firstWavePagesPerSection: 1,
+    evidenceTargetUnits: 3,
+    evidenceTargetSources: 1,
     extractConcurrency: 3,
   },
   blog: {
@@ -95,7 +115,10 @@ export const DEPTH_CONFIG: Record<ResearchDepth, DepthTunables> = {
     hardCapUsd: 1.25,
     targetWordCountMin: 1000,
     targetWordCountMax: 2200,
-    maxExtractPages: 16,
+    maxExtractPages: 32,
+    firstWavePagesPerSection: 1,
+    evidenceTargetUnits: 4,
+    evidenceTargetSources: 2,
     extractConcurrency: 3,
   },
   // Standard is no longer "spend freely." 2026-08 GCP: research-agents
@@ -110,6 +133,9 @@ export const DEPTH_CONFIG: Record<ResearchDepth, DepthTunables> = {
   // evidence gaps labelled "after refinement" while no refinement search ever
   // ran (5 Tavily calls, all before extraction). 2 restores the one round the
   // cost program intended; the shared maxExtractPages budget still bounds it.
+  //
+  // 2026-10-27: maxExtractPages 20 → 96 as a ceiling. Evidence targets and the
+  // dollar share decide how many pages a run actually reads.
   standard: {
     subqueriesMin: 8,
     subqueriesMax: 16,
@@ -118,7 +144,10 @@ export const DEPTH_CONFIG: Record<ResearchDepth, DepthTunables> = {
     hardCapUsd: 3.0,
     targetWordCountMin: 800,
     targetWordCountMax: 5000,
-    maxExtractPages: 20,
+    maxExtractPages: 96,
+    firstWavePagesPerSection: 2,
+    evidenceTargetUnits: 6,
+    evidenceTargetSources: 2,
     extractConcurrency: 3,
   },
   // Wide remains high-stakes but not "80 pages × 8 critique passes".
@@ -131,6 +160,7 @@ export const DEPTH_CONFIG: Record<ResearchDepth, DepthTunables> = {
   // practitioner packs while trusted cortex+telegram priors still passed.
   // 64 keeps the cut vs the pre-program 80, and is enough for the release
   // profile under maxCostUsd=$5.
+  // 2026-10-27: 64 → 192 as a ceiling; evidence targets decide actual reads.
   wide: {
     subqueriesMin: 16,
     subqueriesMax: 32,
@@ -139,7 +169,10 @@ export const DEPTH_CONFIG: Record<ResearchDepth, DepthTunables> = {
     hardCapUsd: 8.0,
     targetWordCountMin: 3000,
     targetWordCountMax: 10000,
-    maxExtractPages: 64,
+    maxExtractPages: 192,
+    firstWavePagesPerSection: 2,
+    evidenceTargetUnits: 8,
+    evidenceTargetSources: 3,
     extractConcurrency: 3,
   },
 };
@@ -180,6 +213,12 @@ export function refinementExtractReserve(
   // Never starve the main pass: it always keeps at least half the budget.
   return Math.min(reserve, Math.floor(config.maxExtractPages / 2));
 }
+
+/**
+ * Share of the run's dollar cap extraction may spend. Past it, remaining
+ * pages are skipped so synthesis and critique still fit under the cap.
+ */
+export const EXTRACT_SPEND_SHARE = 0.6;
 
 /** Look up tunables for a depth mode. Always returns a valid config. */
 export function getDepthConfig(depth: ResearchDepth): DepthTunables {

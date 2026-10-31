@@ -26,9 +26,12 @@
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import {
+  failoverLadderForResolution,
+  FailoverExhaustedError,
   findCatalogModel,
   providerWires,
   reasoningParams,
+  runWithFailover,
   WireFormatUnsupportedError,
   type ModelResolution,
   type ReasoningEffort,
@@ -329,9 +332,60 @@ export interface ModelCallInput {
   telemetry?: { functionName: string; organizationId?: string; promptRunId?: string };
 }
 
+function hasProviderCredential(credentials: ResearchCredentials, provider: string): boolean {
+  const field = credentialFieldForProvider(provider);
+  if (field === null) return false;
+  const value = credentials[field];
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+/**
+ * The provider cannot serve this account: every host on the failover ladder
+ * failed with a failover-worthy status (402 balance, 429, 5xx, no response),
+ * or one answered 401 / 403. This is a host fault, not a bad page or prompt,
+ * so a stage must not turn it into an empty result.
+ *
+ * Measured 2026-10-07 (PT): with the DeepSeek balance at $0.00 every extraction
+ * returned HTTP 402, the extractor logged each as a failed page, and paid runs
+ * finished `partial` / `ungrounded` with zero citations and no stated cause.
+ */
+export function isProviderAccountFailure(error: unknown): boolean {
+  if (error instanceof FailoverExhaustedError) return true;
+  if (typeof error !== 'object' || error === null || !('status' in error)) return false;
+  return error.status === 401 || error.status === 403;
+}
+
+/**
+ * Call the model, failing over to the same model on another host.
+ *
+ * A `ModelResolution` target walks `failoverLadderForResolution`: DeepSeek
+ * direct, then Fireworks serving the same weights, under the process residency
+ * policy and the use-case's provider binding. The next host is tried only on a
+ * failure `@braintied/models` classifies as an outage (402, 429, 5xx, no
+ * response) and only when the credentials hold its key. A bare model id is a
+ * caller's explicit pin and is sent to that one host.
+ *
+ * When every host fails the call throws `FailoverExhaustedError`, which names
+ * each attempt (`deepseek#0 HTTP 402, fireworks#1 skipped (missing_credential)`).
+ */
 export async function callModel(input: ModelCallInput): Promise<ModelCallResult> {
-  const { credentials, system, user, maxTokens, telemetry } = input;
   const route = routeFor(input.model);
+  if (route.resolution === null) return callRoute(input, route);
+  const served = await runWithFailover(
+    failoverLadderForResolution(route.resolution),
+    (candidate) => callRoute(input, routeFor(candidate.resolution)),
+    {
+      // The primary is always sent, so a missing primary key still throws
+      // MissingCredentialError; later hosts are skipped without their key.
+      hasCredential: (candidate) =>
+        candidate.rank === 0 || hasProviderCredential(input.credentials, candidate.resolution.provider),
+    },
+  );
+  return served.result;
+}
+
+async function callRoute(input: ModelCallInput, route: Route): Promise<ModelCallResult> {
+  const { credentials, system, user, maxTokens, telemetry } = input;
   const model = route.apiModelId;
   const timeoutMs = input.timeoutMs === undefined ? SYNTHESIS_REQUEST_TIMEOUT_MS : input.timeoutMs;
 

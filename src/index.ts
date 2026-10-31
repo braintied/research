@@ -42,7 +42,7 @@ import type {
   ReportChunkInput,
   SearchOpts,
 } from './types.js';
-import { DEPTH_CONFIG, getModelPricing, refinementExtractReserve } from './depth-config.js';
+import { DEPTH_CONFIG, EXTRACT_SPEND_SHARE, getModelPricing, refinementExtractReserve } from './depth-config.js';
 import type { ResearchDepth } from './depth-config.js';
 import { CostTracker } from './cost-tracker.js';
 import {
@@ -59,7 +59,8 @@ import {
 import { planSubqueries } from './planner.js';
 import type { PlannerUsage } from './planner.js';
 import { splitDecisionBriefQuestions } from './decision-brief.js';
-import { allocateExtractBudgetFairShare } from './extract-budget.js';
+import { runAdaptiveExtraction, sectionEvidenceFrom, sectionNeedsEvidence } from './extract-budget.js';
+import type { SectionEvidence, SectionEvidenceTarget } from './extract-budget.js';
 import {
   createProviderRegistry,
   getEnabledProviders,
@@ -85,6 +86,27 @@ import type { GroundingResult } from './grounding.js';
 import { safeLogger } from './logger.js';
 import type { Logger } from './logger.js';
 import { parseCachedSearchResults, searchCachePolicyIdentity } from './search-cache.js';
+import {
+  analyzeBriefRequirements,
+  assessFetchedPage,
+  focusContentWindow,
+  isBoilerplateEvidence,
+  isPrimarySourceUrl,
+  judgeEvidenceRelevance,
+  questionTerms,
+  RELEVANCE_KEEP_THRESHOLD,
+  selectFacetAnswers,
+  urlIsOnDomain,
+} from './answer-quality.js';
+import type {
+  AnswerQuality,
+  AnswerQualityModelUsage,
+  BriefRequirements,
+  EvidenceJudgment,
+  EvidenceUnitForJudging,
+  FetchQualityCounts,
+  GateCounts,
+} from './answer-quality.js';
 
 // =============================================================================
 // Public re-exports — types, schemas, config
@@ -107,6 +129,7 @@ export {
 export type { ResearchDepth, DepthTunables, ModelPricing } from './depth-config.js';
 export { CostTracker } from './cost-tracker.js';
 export { logger } from './logger.js';
+export { researchUserAgent, setResearchUserAgentContact } from './user-agent.js';
 export type { Logger } from './logger.js';
 
 // The package's entire configuration surface. Hosts resolve env at their own
@@ -144,7 +167,19 @@ export { planSubqueries, summarizePromptBrief } from './planner.js';
 export type { PlanSubqueriesInput, PlannerUsage } from './planner.js';
 export { splitDecisionBriefQuestions, questionHeadingFor, SHARED_CONTEXT_MAX_CHARS } from './decision-brief.js';
 export type { DecisionBriefSplit } from './decision-brief.js';
-export { allocateExtractBudgetFairShare } from './extract-budget.js';
+export {
+  allocateExtractBudgetFairShare,
+  runAdaptiveExtraction,
+  sectionEvidenceFrom,
+  sectionNeedsEvidence,
+  takeAdaptiveExtractWave,
+} from './extract-budget.js';
+export type {
+  AdaptiveExtractionInput,
+  AdaptiveExtractionResult,
+  SectionEvidence,
+  SectionEvidenceTarget,
+} from './extract-budget.js';
 export {
   createProviderRegistry,
   getAllProviders,
@@ -165,6 +200,20 @@ export {
   perplexityAnswer,
   PerplexityApiError,
   createRedditProvider,
+  createRedditClient,
+  probeReddit,
+  RedditApiError,
+  REDDIT_VAULT_KEYS,
+  redditCredentialsFromResolver,
+  redditThreadApiUrl,
+  collectRedditCorpus,
+  fetchExpandedThread,
+  discoverSubreddits,
+  flattenCorpusTree,
+  redactUserMentions,
+  redditSearchCacheKey,
+  REDDIT_CORPUS_SCHEMA,
+  createDirectoryThreadStore,
   createYoutubeProvider,
   createHnProvider,
   rssProvider,
@@ -174,6 +223,9 @@ export {
   createInstagramProvider,
   discoverInstagramProfilePosts,
   InstagramSnapshotPendingError,
+  fetchInstagramProfile,
+  normalizeInstagramProfileSnapshot,
+  INSTAGRAM_PROFILE_WAIT_MS,
   BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID,
   BRIGHTDATA_INSTAGRAM_PROFILES_DATASET_ID,
   APIFY_INSTAGRAM_STORIES_ACTOR_ID,
@@ -188,6 +240,8 @@ export {
   resolveGitHubPublicAuthState,
   triggerCollection,
   pollSnapshot,
+  waitForBrightDataSnapshot,
+  BrightDataSnapshotPendingError,
   downloadSnapshot,
   scrapeDataset,
   unlockUrl,
@@ -218,6 +272,47 @@ export type {
   InstagramStoriesTarget,
   InstagramProfilePostsInput,
   NormalizedInstagramPost,
+  InstagramBioLink,
+  InstagramProfile,
+  InstagramProfilePost,
+  InstagramProfileFetchResult,
+  FetchInstagramProfileOptions,
+  RedditClient,
+  RedditClientOptions,
+  RedditSearchOptions,
+  RedditListSubredditOptions,
+  RedditFetchThreadOptions,
+  RedditSearchSort,
+  RedditListingSort,
+  RedditCommentSort,
+  RedditTimeFilter,
+  RedditPost,
+  RedditListing,
+  RedditComment,
+  RedditThread,
+  RedditProbeResult,
+  RedditErrorStage,
+  RedditThreadUrlResult,
+  RedditMoreStub,
+  RedditMoreChildrenOptions,
+  RedditMoreChildrenResult,
+  RedditSubredditInfo,
+  RedditSearchSubredditsOptions,
+  RedditCorpusCommentMode,
+  RedditCorpusComment,
+  RedditCorpusCommentStats,
+  RedditCorpusThread,
+  RedditCorpusErrorStage,
+  RedditCorpusError,
+  RedditCorpusSearchPage,
+  RedditThreadStore,
+  RedditCorpusProgress,
+  RedditCorpusOptions,
+  RedditCorpusResult,
+  ExpandThreadOptions,
+  ExpandedThread,
+  DiscoverSubredditsOptions,
+  DiscoverSubredditsResult,
   XBackend,
   XBackendAttempt,
   XTweetChainResult,
@@ -225,6 +320,8 @@ export type {
   ProviderRegistry,
   PollSnapshotOptions,
   ScrapeDatasetOptions,
+  WaitForBrightDataSnapshotOptions,
+  BrightDataSnapshotWaitResult,
   BrightDataRecord,
   UnlockUrlOptions,
   UnlockedPage,
@@ -279,6 +376,7 @@ export * from './evidence.js';
 export * from './source-modes.js';
 export * from './source-health.js';
 export * from './research-program.js';
+export * from './answer-quality.js';
 
 // Knowledge-ingestion core (continuous internet-knowledge ingestion).
 export * from './ingestion/index.js';
@@ -316,6 +414,7 @@ export type { ResearchModelRequirement, ResearchModelStage } from './model-polic
 export {
   callModel,
   credentialFieldForProvider,
+  isProviderAccountFailure,
   providerForModelId,
   UnroutableModelError,
 } from './model-call.js';
@@ -385,6 +484,15 @@ export type { YcCompany } from './providers/yc-portfolio.js';
 const SEARCH_RESULT_LIMIT = 8;
 /** Fetch ceiling (crawl). Extract has a separate, tighter run budget. */
 const CUMULATIVE_URL_CEILING = 400;
+/**
+ * Tokens reserved per extraction call when estimating its cost before
+ * dispatch: the output allowance (a short JSON list of quotes and claims) and
+ * the fixed prompt that rides on every call (instructions plus the focus
+ * questions). A close estimate, used only to keep parallel calls under the
+ * extraction ceiling and the run cap; never recorded as spend.
+ */
+const EXTRACT_OUTPUT_TOKEN_ALLOWANCE = 1500;
+const EXTRACT_PROMPT_TOKEN_ALLOWANCE = 900;
 const RERANK_TOP_K = 40;
 
 /**
@@ -394,6 +502,19 @@ const RERANK_TOP_K = 40;
 interface ExtractBudget {
   remaining: number;
   concurrency: number;
+  /**
+   * Extraction spend (the 'extract' cost category only) may not pass this,
+   * counting calls in flight. Synthesis and critique spend do not count
+   * against it, so a refinement pass can still read pages while the run's
+   * hard cap has room.
+   */
+  spendCeilingUsd: number;
+  /** The run's whole dollar cap; extraction checks it with in-flight estimates included. */
+  hardCapUsd: number;
+  /** Evidence a section needs before it stops taking pages. */
+  target: SectionEvidenceTarget;
+  /** Pages per section in the first wave of each extract pass. */
+  firstWavePagesPerSection: number;
   /** URLs already extracted this run — skip re-paying Gemini for them. */
   doneUrls: Set<string>;
   /** Stage counts for the run, shared by the first pass and refinement. */
@@ -412,6 +533,16 @@ export interface EvidenceFunnel {
   sourcesExtracted: number;
   /** Pages with content that the extract budget skipped. */
   sourcesSkippedForBudget: number;
+  /** Pages skipped because extraction reached its share of the dollar cap. */
+  sourcesSkippedForCost: number;
+  /** Page ceiling for the run (main pass + refinement). */
+  pageBudget: number;
+  /** Extraction waves run; each wave after the first served only sections below target. */
+  extractWaves: number;
+  /** Candidate pages left unread because their section already had enough evidence. */
+  sourcesNotNeeded: number;
+  /** Sections still below the evidence target when extraction stopped. */
+  sectionsBelowTarget: number;
   /** Pages with no complete sentence at all; nothing on them could be quoted, so they were not extracted. */
   sourcesWithoutVerifiableText: number;
   quotesExtracted: number;
@@ -427,6 +558,11 @@ function emptyEvidenceFunnel(): EvidenceFunnel {
     sourcesWithContent: 0,
     sourcesExtracted: 0,
     sourcesSkippedForBudget: 0,
+    sourcesSkippedForCost: 0,
+    pageBudget: 0,
+    extractWaves: 0,
+    sourcesNotNeeded: 0,
+    sectionsBelowTarget: 0,
     sourcesWithoutVerifiableText: 0,
     quotesExtracted: 0,
     quotesValidated: 0,
@@ -467,6 +603,10 @@ export interface PipelineUsageEvent {
 export type OnPipelineUsage = (event: PipelineUsageEvent) => void | Promise<void>;
 
 const SAFE_USAGE_OPERATIONS = new Set([
+  'brief-analysis-input',
+  'brief-analysis-output',
+  'relevance-input',
+  'relevance-output',
   'assembly-input',
   'assembly-input-cached',
   'assembly-output',
@@ -775,6 +915,13 @@ export interface RunDeepResearchResult {
   grounding: GroundingResult;
   /** Stage counts: how many sources and items survived each step. */
   evidenceFunnel: EvidenceFunnel;
+  /**
+   * Did the report answer the brief (asked facts found, primary source
+   * cited)? Same object as `report.answer_quality`. Always set by
+   * runDeepResearch; optional so hosts that construct this result (injected
+   * runners, test doubles) keep compiling.
+   */
+  answerQuality?: AnswerQuality;
 }
 
 export interface ValidatedEvidenceExcerpt {
@@ -896,6 +1043,41 @@ export async function runDeepResearch(
   // section paths are namespaced q{n}.* so extract-budget allocation and
   // report headings align with the caller's questions.
   // ---------------------------------------------------------------------------
+  // Answer-quality usage → CostTracker: brief analysis bills as 'plan', the
+  // relevance judge as 'critique' (both are cheap extract-tier calls).
+  const answerUsageSink = (usage: AnswerQualityModelUsage): void => {
+    const pricing = getModelPricing(usage.model);
+    const category = usage.stage === 'brief-analysis' ? 'plan' : 'critique';
+    costTracker.record({
+      provider: usage.provider,
+      category,
+      units: usage.inputTokens,
+      unit_cost_usd: pricing.inputUsdPerM / 1_000_000,
+      metadata: { model: usage.model, operation: `${usage.stage}-input` },
+    });
+    costTracker.record({
+      provider: usage.provider,
+      category,
+      units: usage.outputTokens,
+      unit_cost_usd: pricing.outputUsdPerM / 1_000_000,
+      metadata: { model: usage.model, operation: `${usage.stage}-output` },
+    });
+  };
+
+  // What must the answer contain? Runs beside planning. A failure is
+  // recorded on the answer-quality verdict (status not_assessed), never
+  // replaced by a guess.
+  let analysisError: string | undefined;
+  const requirementsPromise: Promise<BriefRequirements | null> = analyzeBriefRequirements({
+    credentials: input.credentials,
+    brief: input.brief,
+    usageSink: answerUsageSink,
+  }).catch((error: unknown) => {
+    analysisError = errMsg(error).slice(0, 240);
+    log.warn({ error: analysisError }, '[runDeepResearch] Brief analysis failed; answer check not assessed');
+    return null;
+  });
+
   const decisionSplit = splitDecisionBriefQuestions(input.brief);
   let plannedSubqueries: Subquery[];
   let sectionTitles: Record<string, string> | undefined;
@@ -959,7 +1141,23 @@ export async function runDeepResearch(
   }
 
   const seededSubqueries = (input.seedSubqueries ?? []).map((subquery) => SubquerySchema.parse(subquery));
-  let subqueries: Subquery[] = [...seededSubqueries, ...plannedSubqueries];
+  const requirements = await requirementsPromise;
+  const primarySubqueries = primarySourceSubqueries(requirements, searchProviders);
+  let subqueries: Subquery[] = [...primarySubqueries, ...seededSubqueries, ...plannedSubqueries];
+  if (requirements !== null) {
+    log.info(
+      {
+        questions: requirements.questions.length,
+        facets: requirements.questions.reduce((n, q) => n + q.facets.length, 0),
+        primarySources: requirements.primary_sources.map((source) => source.domain),
+        primarySubqueries: primarySubqueries.length,
+      },
+      '[runDeepResearch] Brief requirements analyzed',
+    );
+  }
+  const briefQuestions = requirements === null ? undefined : requirements.questions.map((q) => q.question);
+  const focusTerms = questionTerms(requirements, input.brief);
+  const fetchQuality: FetchQualityCounts = { pagesRejected: 0, evidenceRejected: 0 };
 
   if (subqueries.length === 0) {
     throw new Error('Planner returned zero subqueries — cannot proceed');
@@ -973,13 +1171,29 @@ export async function runDeepResearch(
     subqueries, searchProviders, costTracker, log, input.cache, minFreeResults,
     input.searchOptions, input.providerSearchOptions,
   );
+  // Canonical primary-source pages (named in the brief, or the official page
+  // the analysis named on the official domain) are fetched directly, ahead of
+  // anything search ranked, so "cite the official changelog" reads it.
+  allSearchResults.unshift(...primarySourceDirectResults(requirements, allSearchResults));
+  allSearchResults.sort((a, b) => primaryRank(a, requirements) - primaryRank(b, requirements));
   const allDiscoveries: SearchResult[] = [...allSearchResults];
 
   // Provenance map for the bibliography (audit m3) — accumulated across the
   // initial search and every critique-loop refinement search.
   const sourceMetaByUrl: Record<string, {
-    provider?: string; title?: string; author?: string; published_at?: string;
+    provider?: string; title?: string; author?: string; published_at?: string; scraped_at?: string;
   }> = {};
+  // When this run obtained each page's content (a cache hit counts as the
+  // moment the run read it). Carried to the bibliography so a stored report
+  // says when its evidence was scraped, not only when the report was written.
+  const stampScraped = (markdownByUrlNow: Record<string, string>): void => {
+    const at = new Date().toISOString();
+    for (const url of Object.keys(markdownByUrlNow)) {
+      const meta = sourceMetaByUrl[url];
+      if (meta !== undefined && meta.scraped_at === undefined) meta.scraped_at = at;
+      else if (meta === undefined) sourceMetaByUrl[url] = { scraped_at: at };
+    }
+  };
   const recordSourceMeta = (results: SearchResult[]): void => {
     for (const r of results) {
       if (sourceMetaByUrl[r.url] === undefined) {
@@ -1005,7 +1219,8 @@ export async function runDeepResearch(
   // ---------------------------------------------------------------------------
   // Step 3: fetch content
   // ---------------------------------------------------------------------------
-  const markdownByUrl = await fetchContent(input.credentials, urlsToFetch, enabledProviders, log, input.cache);
+  const markdownByUrl = await fetchContent(input.credentials, urlsToFetch, enabledProviders, log, input.cache, fetchQuality);
+  stampScraped(markdownByUrl);
 
   // ---------------------------------------------------------------------------
   // Step 4: extract quotes → per-section maps
@@ -1016,12 +1231,20 @@ export async function runDeepResearch(
   // Part of the budget is held back for the refinement pass. Without it the
   // main pass spent every page (20 of 20, measured 2026-09-24) and the
   // critique's refinement subqueries could search but never extract.
+  //
+  // maxExtractPages is a ceiling. How many pages a run reads is decided by
+  // evidence: extraction runs in waves and stops feeding a section once it
+  // reaches the depth's evidence target (see extractQuotes).
   const refinementReserve = refinementExtractReserve(depthConfig);
   const extractBudget: ExtractBudget = {
     remaining: depthConfig.maxExtractPages - refinementReserve,
     concurrency: depthConfig.extractConcurrency,
+    spendCeilingUsd: capUsd * EXTRACT_SPEND_SHARE,
+    hardCapUsd: capUsd,
+    target: { units: depthConfig.evidenceTargetUnits, sources: depthConfig.evidenceTargetSources },
+    firstWavePagesPerSection: depthConfig.firstWavePagesPerSection,
     doneUrls: new Set<string>(),
-    funnel: emptyEvidenceFunnel(),
+    funnel: { ...emptyEvidenceFunnel(), pageBudget: depthConfig.maxExtractPages },
   };
   let refinementReserveReleased = refinementReserve === 0;
 
@@ -1036,6 +1259,7 @@ export async function runDeepResearch(
     log,
     extractBudget,
     input.cache,
+    { terms: focusTerms, questions: briefQuestions, fetchQuality, requirements, prior: null },
   );
 
   let { quotesBySection } = extraction;
@@ -1044,16 +1268,42 @@ export async function runDeepResearch(
   // ---------------------------------------------------------------------------
   // Step 5: section synthesis (rerank per section, then synthesize)
   // ---------------------------------------------------------------------------
+  // Relevance gate: every evidence unit is judged against the brief's
+  // questions once; off-topic units never reach synthesis. Judgments persist
+  // across critique passes so only new evidence is judged again.
+  const judgments = new Map<string, EvidenceJudgment>();
+  const gate: GateCounts = {
+    status: requirements === null ? 'not_run' : 'applied',
+    judged: 0,
+    kept: 0,
+    dropped: 0,
+    unjudged: 0,
+  };
+  const gateEvidence = async (): Promise<GatedEvidence> => {
+    const gated = await applyRelevanceGate({
+      credentials: input.credentials,
+      requirements,
+      quotesBySection,
+      claimsBySection,
+      judgments,
+      gate,
+      usageSink: answerUsageSink,
+      log,
+    });
+    return gated;
+  };
+  let gated = await gateEvidence();
   let sections = await synthesizeSections(
     input.credentials,
     subqueries,
-    quotesBySection,
-    claimsBySection,
+    gated.quotesBySection,
+    gated.claimsBySection,
     targetWordCount,
     costTracker,
     log,
     input.synthesisModelOverride,
     sectionTitles,
+    briefQuestions,
   );
 
   // ---------------------------------------------------------------------------
@@ -1142,7 +1392,8 @@ export async function runDeepResearch(
     mergeDiscoveryResults(allDiscoveries, extraResults);
     recordSourceMeta(extraResults);
     const extraToFetch = extraResults.slice(0, Math.min(extraResults.length, CUMULATIVE_URL_CEILING));
-    const extraMarkdown = await fetchContent(input.credentials, extraToFetch, enabledProviders, log, input.cache);
+    const extraMarkdown = await fetchContent(input.credentials, extraToFetch, enabledProviders, log, input.cache, fetchQuality);
+    stampScraped(extraMarkdown);
 
     if (!refinementReserveReleased) {
       extractBudget.remaining += refinementReserve;
@@ -1160,6 +1411,13 @@ export async function runDeepResearch(
       log,
       extractBudget,
       input.cache,
+      {
+        terms: focusTerms,
+        questions: briefQuestions,
+        fetchQuality,
+        requirements,
+        prior: { quotesBySection, claimsBySection },
+      },
     );
 
     // Merge new evidence into the running maps.
@@ -1194,16 +1452,18 @@ export async function runDeepResearch(
     }
 
     // Re-synthesize with the enriched evidence.
+    gated = await gateEvidence();
     sections = await synthesizeSections(
     input.credentials,
       subqueries,
-      quotesBySection,
-      claimsBySection,
+      gated.quotesBySection,
+      gated.claimsBySection,
       targetWordCount,
       costTracker,
       log,
       input.synthesisModelOverride,
       sectionTitles,
+      briefQuestions,
     );
 
     critiquePass++;
@@ -1212,6 +1472,9 @@ export async function runDeepResearch(
   // ---------------------------------------------------------------------------
   // Step 7: assemble final report
   // ---------------------------------------------------------------------------
+  const facetAnswers = requirements === null
+    ? []
+    : selectFacetAnswers({ requirements, units: gated.units, judgments });
   const assembly = await assembleFinalReport({
     promptMd: input.brief,
     sections,
@@ -1219,6 +1482,13 @@ export async function runDeepResearch(
     sourceMeta: sourceMetaByUrl,
     synthesisModelOverride: input.synthesisModelOverride,
     sectionTitles,
+    answerCheck: {
+      requirements,
+      ...(analysisError !== undefined ? { analysisError } : {}),
+      answers: facetAnswers,
+      gate,
+      fetchQuality,
+    },
   });
   recordSynthCost(costTracker, assembly.model, assembly.inputTokens, assembly.cachedReadTokens, assembly.outputTokens, 'assembly');
   const report = assembly.report;
@@ -1294,6 +1564,11 @@ export async function runDeepResearch(
     }
   }
 
+  const plannedSections = new Set(subqueries.map((subquery) => subquery.section_path));
+  extractBudget.funnel.sectionsBelowTarget = [...plannedSections].filter((section) =>
+    sectionNeedsEvidence(sectionEvidence(section, quotesBySection, claimsBySection, null), extractBudget.target),
+  ).length;
+
   return {
     report,
     quotes: allQuotes,
@@ -1302,6 +1577,7 @@ export async function runDeepResearch(
     validatedEvidence,
     grounding,
     evidenceFunnel: extractBudget.funnel,
+    answerQuality: report.answer_quality ?? notAssessedAnswerQuality(gate, fetchQuality),
   };
 }
 
@@ -1605,10 +1881,24 @@ async function fetchContent(
   results: SearchResult[],
   enabledProviders: EnabledProviders,
   log: Logger,
-  cache?: ResearchCacheAdapter,
+  cache: ResearchCacheAdapter | undefined,
+  fetchQuality: FetchQualityCounts,
 ): Promise<Record<string, string>> {
   const markdownByUrl: Record<string, string> = {};
   const crawl4aiProvider = enabledProviders['crawl4ai'];
+  // Error pages, bot walls and navigation shells are not content. They used
+  // to reach extraction, where "A required part of this site couldn't load"
+  // became a validated, cited executive-summary sentence (2026-10-12).
+  const accept = (url: string, markdown: string): boolean => {
+    const assessment = assessFetchedPage(markdown);
+    if (assessment.usable) return true;
+    fetchQuality.pagesRejected++;
+    log.info(
+      { url: url.slice(0, 80), reason: assessment.reason, proseChars: assessment.proseChars },
+      '[runDeepResearch] Fetched page rejected as non-content',
+    );
+    return false;
+  };
 
   // Bounded fan-out (audit F7): the previous unbounded Promise.all put every
   // fetch (≤400) in flight at once — a 429 storm against our own scraper.
@@ -1619,7 +1909,7 @@ async function fetchContent(
       const cacheKey = `fetch:${result.url}`;
       const cachedMarkdown = await cacheGet(cache, cacheKey, log);
       if (cachedMarkdown !== null && cachedMarkdown.length > 0) {
-        markdownByUrl[result.url] = cachedMarkdown;
+        if (accept(result.url, cachedMarkdown)) markdownByUrl[result.url] = cachedMarkdown;
         return;
       }
 
@@ -1629,6 +1919,7 @@ async function fetchContent(
       // skip the crawl.
       const searchRawContent = result.raw_metadata['raw_content'];
       if (typeof searchRawContent === 'string' && searchRawContent.length >= 800) {
+        if (!accept(result.url, searchRawContent)) return;
         markdownByUrl[result.url] = searchRawContent;
         await cacheSet(cache, cacheKey, searchRawContent, FETCH_CACHE_TTL_SECONDS, log);
         return;
@@ -1650,7 +1941,7 @@ async function fetchContent(
           '[runDeepResearch] Fetch failed (non-fatal, skipping)',
         );
       }
-      if (markdown.length > 0) {
+      if (markdown.length > 0 && accept(result.url, markdown)) {
         markdownByUrl[result.url] = markdown;
         await cacheSet(cache, cacheKey, markdown, FETCH_CACHE_TTL_SECONDS, log);
       }
@@ -1682,7 +1973,8 @@ async function extractQuotes(
   costTracker: CostTracker,
   log: Logger,
   extractBudget: ExtractBudget,
-  cache?: ResearchCacheAdapter,
+  cache: ResearchCacheAdapter | undefined,
+  focus: ExtractFocus,
 ): Promise<ExtractionMaps> {
   // Map each section to the URLs its OWN subqueries actually retrieved
   // (audit F1). The old mapping bucketed by provider identity over the global
@@ -1719,9 +2011,13 @@ async function extractQuotes(
   extractBudget.funnel.sourcesWithoutVerifiableText += resultsFetched.length - resultsWithContent.length;
 
   // Dedup by URL, skip already-extracted, then hard-cap to remaining budget.
+  // Primary-source pages go first so the budget never skips the official page.
   const seen = new Set<string>();
   const candidates: typeof resultsWithContent = [];
-  for (const result of resultsWithContent) {
+  const ordered = [...resultsWithContent].sort(
+    (a, b) => primaryRank(a, focus.requirements) - primaryRank(b, focus.requirements),
+  );
+  for (const result of ordered) {
     if (seen.has(result.url) || extractBudget.doneUrls.has(result.url)) {
       continue;
     }
@@ -1729,208 +2025,253 @@ async function extractQuotes(
     candidates.push(result);
   }
 
-  // Fair-share, not FIFO: the prefix slice preserved subquery order, so the
-  // first few subqueries consumed the whole run budget and every later
-  // section extracted zero pages (measured 2026-08-15: standard runs on
-  // multi-question briefs emitted evidence gaps for every section after the
-  // first ~5 subqueries). Round-robin by section guarantees each section
-  // floor(budget / sections) pages before any section takes extras.
-  const allowed = allocateExtractBudgetFairShare(
-    candidates,
-    (result) => {
-      const firstSection = result.retrieved_for[0];
-      return firstSection === undefined ? '(unsectioned)' : firstSection;
-    },
-    Math.max(0, extractBudget.remaining),
-  );
-  const skippedForBudget = candidates.length - allowed.length;
-  extractBudget.remaining -= allowed.length;
+  // Adaptive, not a fixed share. The first wave gives each section
+  // firstWavePagesPerSection pages; after every wave the run counts validated
+  // evidence per section and only sections below target get more, thinnest
+  // first, until targets, candidates, the page budget or the extraction
+  // dollar ceiling run out. Measured 2026-10-26: a fixed budget fed 14 pages
+  // to 20 sections and left 11 of them empty at $0.03 of a $2 cap.
+  //
+  // A page feeds every section it was retrieved for or that a subquery's top
+  // results named. It is queued and credited under all of them, so a page one
+  // section no longer needs is still read for another, and a refinement page
+  // past the top results still counts for the section that searched for it.
+  const sectionsOf = (result: (typeof candidates)[number]): string[] => {
+    const sections = new Set<string>(result.retrieved_for);
+    for (const [sectionPath, sectionUrls] of sectionToUrls.entries()) {
+      if (sectionUrls.includes(result.url)) sections.add(sectionPath);
+    }
+    return [...sections];
+  };
   extractBudget.funnel.sourcesWithContent += candidates.length;
-  extractBudget.funnel.sourcesExtracted += allowed.length;
-  extractBudget.funnel.sourcesSkippedForBudget += skippedForBudget;
-  for (const result of allowed) {
-    extractBudget.doneUrls.add(result.url);
-  }
 
-  if (skippedForBudget > 0 || candidates.length < resultsWithContent.length) {
-    log.info(
-      {
-        candidates: candidates.length,
-        extracting: allowed.length,
-        skippedForBudget,
-        alreadyDone: extractBudget.doneUrls.size - allowed.length,
-        remainingBudget: extractBudget.remaining,
-        concurrency: extractBudget.concurrency,
-      },
-      '[runDeepResearch] Extract budget applied',
+  const evidenceNow = (): Map<string, SectionEvidence> => {
+    const sections = new Set<string>();
+    for (const result of candidates) for (const section of sectionsOf(result)) sections.add(section);
+    const out = new Map<string, SectionEvidence>();
+    for (const section of sections) {
+      out.set(section, sectionEvidence(section, quotesBySection, claimsBySection, focus.prior));
+    }
+    return out;
+  };
+
+  const extractRates = extractionRates();
+  const estimateExtractUsd = (result: (typeof candidates)[number]): number => {
+    const markdown = markdownByUrl[result.url];
+    const chars = markdown === undefined ? GEMINI_MAX_CONTENT_CHARS : Math.min(markdown.length, GEMINI_MAX_CONTENT_CHARS);
+    const questionTokens = Math.ceil((focus.questions ?? []).join(' ').length / CHARS_PER_TOKEN);
+    return ((Math.ceil(chars / CHARS_PER_TOKEN) + EXTRACT_PROMPT_TOKEN_ALLOWANCE + questionTokens) * extractRates.inputUsdPerM
+      + EXTRACT_OUTPUT_TOKEN_ALLOWANCE * extractRates.outputUsdPerM) / 1_000_000;
+  };
+  const extractSpentUsd = (): number => {
+    const spent = costTracker.byCategory()['extract'];
+    return spent === undefined ? 0 : spent;
+  };
+
+  const extractOne = async (result: (typeof candidates)[number]): Promise<void> => {
+    const markdown = markdownByUrl[result.url];
+    const providerName = result.provider;
+    const provider = enabledProviders[providerName];
+    const extractResolution = researchStageResolution('extract');
+    const modelId = extractResolution.apiModelId;
+    // The extractor reads a question-focused window of a long page, and is
+    // told the questions; the cache key carries both so a focused
+    // extraction is never served for a different question.
+    const window = focusContentWindow(markdown, focus.terms, GEMINI_MAX_CONTENT_CHARS);
+    const focusQuestions = focus.questions ?? [];
+    const cacheKey = extractCacheKey(
+      result.url,
+      focusQuestions.length > 0 ? `${window}\u0000${focusQuestions.join('\u0000')}` : markdown,
+      modelId,
     );
-  }
 
-  // Bounded fan-out (audit F7): extraction is one Gemini call per source —
-  // unbounded Promise.all hammered the API with every source at once.
-  // Concurrency is depth-tunable (default 4); never unbounded.
-  await mapWithConcurrency(
-    allowed,
-    extractBudget.concurrency,
-    async (result) => {
-      const markdown = markdownByUrl[result.url];
-      const providerName = result.provider;
-      const provider = enabledProviders[providerName];
-      const extractResolution = researchStageResolution('extract');
-      const modelId = extractResolution.apiModelId;
-      const cacheKey = extractCacheKey(result.url, markdown, modelId);
-
-      let extracted: ExtractedQuotes | null = null;
-      let cacheHit = false;
-      const cachedRaw = await cacheGet(cache, cacheKey, log);
-      if (cachedRaw !== null) {
-        try {
-          const parsed = ExtractedQuotesSchema.safeParse(JSON.parse(cachedRaw));
-          if (parsed.success) {
-            extracted = parsed.data;
-            cacheHit = true;
-          }
-        } catch {
-          // corrupt cache entry — fall through to live extract
+    let extracted: ExtractedQuotes | null = null;
+    let cacheHit = false;
+    const cachedRaw = await cacheGet(cache, cacheKey, log);
+    if (cachedRaw !== null) {
+      try {
+        const parsed = ExtractedQuotesSchema.safeParse(JSON.parse(cachedRaw));
+        if (parsed.success) {
+          extracted = parsed.data;
+          cacheHit = true;
         }
+      } catch {
+        // corrupt cache entry — fall through to live extract
       }
+    }
 
-      if (extracted === null) {
-        if (provider !== undefined && provider.extract !== undefined) {
-          try {
-            extracted = await provider.extract({
-              provider: providerName,
-              url: result.url,
-              raw_content: markdown,
-              markdown,
-              title: '',
-              engagement: {},
-              raw_metadata: {},
-              fetch_status: 'ok',
-            });
-          } catch (err: unknown) {
-            log.warn(
-              { url: result.url.slice(0, 80), error: errMsg(err).slice(0, 120) },
-              '[runDeepResearch] Provider extract() failed, falling back to Gemini',
-            );
-            extracted = await extractQuotesWithGemini({
-              credentials,
-              provider: providerName,
-              url: result.url,
-              content: markdown,
-              mode: 'longform',
-            });
-          }
-        } else {
+    if (extracted === null) {
+      if (provider !== undefined && provider.extract !== undefined) {
+        try {
+          extracted = await provider.extract({
+            provider: providerName,
+            url: result.url,
+            raw_content: markdown,
+            markdown,
+            title: '',
+            engagement: {},
+            raw_metadata: {},
+            fetch_status: 'ok',
+          });
+        } catch (err: unknown) {
+          log.warn(
+            { url: result.url.slice(0, 80), error: errMsg(err).slice(0, 120) },
+            '[runDeepResearch] Provider extract() failed, falling back to Gemini',
+          );
           extracted = await extractQuotesWithGemini({
             credentials,
             provider: providerName,
             url: result.url,
-            content: markdown,
-            mode: extractionModeFor(providerName),
+            content: window,
+            mode: 'longform',
+            focusQuestions,
           });
         }
-        await cacheSet(cache, cacheKey, JSON.stringify(extracted), EXTRACT_CACHE_TTL_SECONDS, log);
-      }
-
-      // Extraction cost (audit M2) — real Gemini tokens when the extractor
-      // reported them, else a conservative estimate from content length so
-      // the cap still sees extraction spend from provider-native extractors.
-      // Cache hits do not re-bill the LLM (record $0 with operation tag).
-      if (cacheHit) {
-        costTracker.record({
-          provider: extractResolution.provider,
-          category: 'extract',
-          units: 0,
-          unit_cost_usd: 0,
-          metadata: { model: modelId, operation: 'extract-cache-hit' },
-        });
-      } else if (extracted.usage !== undefined) {
-        const rates = extractionRates();
-        costTracker.record({
-          provider: extractResolution.provider,
-          category: 'extract',
-          units: extracted.usage.prompt_tokens,
-          unit_cost_usd: rates.inputUsdPerM / 1_000_000,
-          metadata: { model: modelId, operation: 'extract-input' },
-        });
-        costTracker.record({
-          provider: extractResolution.provider,
-          category: 'extract',
-          units: extracted.usage.candidate_tokens,
-          unit_cost_usd: rates.outputUsdPerM / 1_000_000,
-          metadata: { model: modelId, operation: 'extract-output' },
-        });
       } else {
-        const rates = extractionRates();
-        const estimatedInputTokens = Math.ceil(Math.min(markdown.length, GEMINI_MAX_CONTENT_CHARS) / CHARS_PER_TOKEN);
-        costTracker.record({
-          provider: extractResolution.provider,
-          category: 'extract',
-          units: estimatedInputTokens,
-          unit_cost_usd: rates.inputUsdPerM / 1_000_000,
-          metadata: { model: modelId, operation: 'extract-input-estimated' },
+        extracted = await extractQuotesWithGemini({
+          credentials,
+          provider: providerName,
+          url: result.url,
+          content: window,
+          mode: extractionModeFor(providerName),
+          focusQuestions,
         });
       }
+      await cacheSet(cache, cacheKey, JSON.stringify(extracted), EXTRACT_CACHE_TTL_SECONDS, log);
+    }
 
-      // Provider-native extractors cross the same immutable evidence boundary
-      // as Gemini. Nothing becomes synthesis or coverage evidence unless it is
-      // one complete sentence/line from the fetched source. Quote URLs are
-      // normalized back to the fetched source (or a same-source anchor) so an
-      // extractor cannot redirect provenance to an unrelated page.
-      const quotes = extracted.verbatim_quotes
-        .filter((quote) => isVerbatimQuoteSupportedBySource(quote.quote, markdown))
-        .map((quote) => ({
-          ...quote,
-          source_url: resolveSameSourceCitationUrl(result.url, quote.source_url),
-        }));
-      const claims = extracted.key_claims.filter((claim) =>
-        isKeyClaimSupportedBySource(claim, markdown));
-      const droppedEvidence =
-        (extracted.verbatim_quotes.length - quotes.length) +
-        (extracted.key_claims.length - claims.length);
-      const funnel = extractBudget.funnel;
-      funnel.quotesExtracted += extracted.verbatim_quotes.length;
-      funnel.quotesValidated += quotes.length;
-      funnel.claimsExtracted += extracted.key_claims.length;
-      funnel.claimsValidated += claims.length;
-      if (quotes.length === 0 && claims.length === 0) funnel.sourcesWithNoValidatedEvidence += 1;
-      if (droppedEvidence > 0) {
-        log.warn(
-          { url: result.url.slice(0, 80), droppedEvidence },
-          '[runDeepResearch] Dropped source-unsupported extracted evidence',
-        );
-      }
-      sourceQuotesByUrl[result.url] = quotes;
+    // Extraction cost (audit M2) — real Gemini tokens when the extractor
+    // reported them, else a conservative estimate from content length so
+    // the cap still sees extraction spend from provider-native extractors.
+    // Cache hits do not re-bill the LLM (record $0 with operation tag).
+    if (cacheHit) {
+      costTracker.record({
+        provider: extractResolution.provider,
+        category: 'extract',
+        units: 0,
+        unit_cost_usd: 0,
+        metadata: { model: modelId, operation: 'extract-cache-hit' },
+      });
+    } else if (extracted.usage !== undefined) {
+      const rates = extractionRates();
+      costTracker.record({
+        provider: extractResolution.provider,
+        category: 'extract',
+        units: extracted.usage.prompt_tokens,
+        unit_cost_usd: rates.inputUsdPerM / 1_000_000,
+        metadata: { model: modelId, operation: 'extract-input' },
+      });
+      costTracker.record({
+        provider: extractResolution.provider,
+        category: 'extract',
+        units: extracted.usage.candidate_tokens,
+        unit_cost_usd: rates.outputUsdPerM / 1_000_000,
+        metadata: { model: modelId, operation: 'extract-output' },
+      });
+    } else {
+      const rates = extractionRates();
+      const estimatedInputTokens = Math.ceil(Math.min(markdown.length, GEMINI_MAX_CONTENT_CHARS) / CHARS_PER_TOKEN);
+      costTracker.record({
+        provider: extractResolution.provider,
+        category: 'extract',
+        units: estimatedInputTokens,
+        unit_cost_usd: rates.inputUsdPerM / 1_000_000,
+        metadata: { model: modelId, operation: 'extract-input-estimated' },
+      });
+    }
 
-      for (const [sectionPath, sectionUrls] of sectionToUrls.entries()) {
-        if (!sectionUrls.includes(result.url)) {
-          continue;
-        }
-        if (quotesBySection[sectionPath] === undefined) {
-          quotesBySection[sectionPath] = [];
-        }
-        for (const q of quotes) {
-          quotesBySection[sectionPath].push(q);
-        }
-        if (claimsBySection[sectionPath] === undefined) {
-          claimsBySection[sectionPath] = [];
-        }
-        for (const claim of claims) {
-          claimsBySection[sectionPath].push({
-            claim,
-            source_url: result.url,
-            provider: providerName,
-          });
-        }
-        if (providerCoverageBySection[sectionPath] === undefined) {
-          providerCoverageBySection[sectionPath] = [];
-        }
-        if (!providerCoverageBySection[sectionPath].includes(providerName)) {
-          providerCoverageBySection[sectionPath].push(providerName);
-        }
+    // Provider-native extractors cross the same immutable evidence boundary
+    // as Gemini. Nothing becomes synthesis or coverage evidence unless it is
+    // one complete sentence/line from the fetched source. Quote URLs are
+    // normalized back to the fetched source (or a same-source anchor) so an
+    // extractor cannot redirect provenance to an unrelated page.
+    const supportedQuotes = extracted.verbatim_quotes
+      .filter((quote) => isVerbatimQuoteSupportedBySource(quote.quote, markdown));
+    const supportedClaims = extracted.key_claims.filter((claim) =>
+      isKeyClaimSupportedBySource(claim, markdown));
+    // A sentence can be verbatim and still be site chrome or an error
+    // banner. Those are dropped here, before they can be cited.
+    const quotes = supportedQuotes
+      .filter((quote) => !isBoilerplateEvidence(quote.quote))
+      .map((quote) => ({
+        ...quote,
+        source_url: resolveSameSourceCitationUrl(result.url, quote.source_url),
+      }));
+    const claims = supportedClaims.filter((claim) => !isBoilerplateEvidence(claim));
+    focus.fetchQuality.evidenceRejected +=
+      (supportedQuotes.length - quotes.length) + (supportedClaims.length - claims.length);
+    const droppedEvidence =
+      (extracted.verbatim_quotes.length - quotes.length) +
+      (extracted.key_claims.length - claims.length);
+    const funnel = extractBudget.funnel;
+    funnel.quotesExtracted += extracted.verbatim_quotes.length;
+    funnel.quotesValidated += quotes.length;
+    funnel.claimsExtracted += extracted.key_claims.length;
+    funnel.claimsValidated += claims.length;
+    if (quotes.length === 0 && claims.length === 0) funnel.sourcesWithNoValidatedEvidence += 1;
+    if (droppedEvidence > 0) {
+      log.warn(
+        { url: result.url.slice(0, 80), droppedEvidence },
+        '[runDeepResearch] Dropped source-unsupported extracted evidence',
+      );
+    }
+    sourceQuotesByUrl[result.url] = quotes;
+
+    for (const sectionPath of sectionsOf(result)) {
+      if (quotesBySection[sectionPath] === undefined) {
+        quotesBySection[sectionPath] = [];
       }
+      for (const q of quotes) {
+        quotesBySection[sectionPath].push(q);
+      }
+      if (claimsBySection[sectionPath] === undefined) {
+        claimsBySection[sectionPath] = [];
+      }
+      for (const claim of claims) {
+        claimsBySection[sectionPath].push({
+          claim,
+          source_url: result.url,
+          provider: providerName,
+        });
+      }
+      if (providerCoverageBySection[sectionPath] === undefined) {
+        providerCoverageBySection[sectionPath] = [];
+      }
+      if (!providerCoverageBySection[sectionPath].includes(providerName)) {
+        providerCoverageBySection[sectionPath].push(providerName);
+      }
+    }
+  };
+
+  // Bounded fan-out (audit F7): one model call per source, never unbounded.
+  const outcome = await runAdaptiveExtraction({
+    candidates,
+    keyOf: (result) => result.url,
+    sectionsOf,
+    evidence: evidenceNow,
+    target: extractBudget.target,
+    firstWavePagesPerSection: extractBudget.firstWavePagesPerSection,
+    concurrency: extractBudget.concurrency,
+    pageBudget: Math.max(0, extractBudget.remaining),
+    extractSpentUsd,
+    extractCeilingUsd: extractBudget.spendCeilingUsd,
+    estimateUsd: estimateExtractUsd,
+    hardCapReached: (reservedUsd) => costTracker.total() + reservedUsd > extractBudget.hardCapUsd,
+    extract: async (result) => {
+      extractBudget.doneUrls.add(result.url);
+      await extractOne(result);
     },
+  });
+  extractBudget.remaining -= outcome.extracted;
+  const funnel = extractBudget.funnel;
+  funnel.sourcesExtracted += outcome.extracted;
+  funnel.extractWaves += outcome.waves;
+  funnel.sourcesNotNeeded += outcome.notNeeded;
+  funnel.sourcesSkippedForBudget += outcome.skippedForBudget;
+  funnel.sourcesSkippedForCost += outcome.skippedForCost;
+  log.info(
+    { candidates: candidates.length, ...outcome, remainingBudget: extractBudget.remaining },
+    '[runDeepResearch] Adaptive extraction finished',
   );
 
   log.info(
@@ -1949,8 +2290,9 @@ async function synthesizeSections(
   targetWordCount: { min: number; max: number },
   costTracker: CostTracker,
   log: Logger,
-  synthesisModelOverride?: string,
-  sectionTitles?: Record<string, string>,
+  synthesisModelOverride: string | undefined,
+  sectionTitles: Record<string, string> | undefined,
+  briefQuestions: string[] | undefined,
 ): Promise<SectionDraft[]> {
   const sectionPathsSeen = new Set<string>();
   const sectionGoals: Record<string, string[]> = {};
@@ -2027,6 +2369,7 @@ async function synthesizeSections(
     claimsByPath: claimsBySection,
     synthesisModelOverride,
     sectionTitles,
+    briefQuestions,
   });
   recordSynthCost(
     costTracker,
@@ -2097,6 +2440,237 @@ function serializeCritiqueHint(c: {
           .join('; ')}`
       : '',
   ].filter((s) => s.length > 0).join('. ');
+}
+
+/** Question focus handed to extraction. */
+interface ExtractFocus {
+  terms: string[];
+  questions: string[] | undefined;
+  fetchQuality: FetchQualityCounts;
+  requirements: BriefRequirements | null;
+  /**
+   * Evidence earlier passes already hold, so a refinement pass counts it
+   * toward a section's target instead of re-feeding a section that is full.
+   * Null on the main pass.
+   */
+  prior: SectionEvidenceMaps | null;
+}
+
+interface SectionEvidenceMaps {
+  quotesBySection: Record<string, VerbatimQuote[]>;
+  claimsBySection: Record<string, { claim: string; source_url: string; provider: ProviderName }[]>;
+}
+
+/** Validated units and distinct sources a section holds across this pass and any prior one. */
+function sectionEvidence(
+  section: string,
+  quotesBySection: SectionEvidenceMaps['quotesBySection'],
+  claimsBySection: SectionEvidenceMaps['claimsBySection'],
+  prior: SectionEvidenceMaps | null,
+): SectionEvidence {
+  const maps: SectionEvidenceMaps[] = [{ quotesBySection, claimsBySection }];
+  if (prior !== null) maps.push(prior);
+  const entries: { source_url: string }[] = [];
+  for (const map of maps) {
+    const quotes = map.quotesBySection[section];
+    if (quotes !== undefined) entries.push(...quotes);
+    const claims = map.claimsBySection[section];
+    if (claims !== undefined) entries.push(...claims);
+  }
+  return sectionEvidenceFrom(entries);
+}
+
+/** Section path the primary-source searches and direct fetches answer under. */
+const PRIMARY_SECTION_PATH = 'A.0';
+const PRIMARY_SEARCH_PROVIDERS: ProviderName[] = ['searxng', 'serper', 'tavily', 'exa'];
+const MAX_PRIMARY_QUESTIONS = 3;
+
+/**
+ * One domain-restricted search per (primary source, question). The query
+ * carries `site:` for engines that read operators; `include_domains` is
+ * honored natively by Tavily and enforced on every provider's results.
+ */
+export function primarySourceSubqueries(
+  requirements: BriefRequirements | null,
+  searchProviders: Partial<Record<ProviderName, unknown>>,
+): Subquery[] {
+  if (requirements === null) return [];
+  const providers = PRIMARY_SEARCH_PROVIDERS.filter((name) => searchProviders[name] !== undefined);
+  if (providers.length === 0) return [];
+  const out: Subquery[] = [];
+  for (const source of requirements.primary_sources.slice(0, 2)) {
+    for (const question of requirements.questions.slice(0, MAX_PRIMARY_QUESTIONS)) {
+      out.push(SubquerySchema.parse({
+        section_path: PRIMARY_SECTION_PATH,
+        query: `${question.question.slice(0, 200)} site:${source.domain}`,
+        providers,
+        expected_source_types: ['documentation'],
+        rationale: `Answer from the primary source (${source.name}): ${question.question.slice(0, 200)}`,
+        search_options: { include_domains: [source.domain] },
+      }));
+    }
+  }
+  return out;
+}
+
+/** Canonical primary-source URLs not already found by search, as fetchable results. */
+export function primarySourceDirectResults(
+  requirements: BriefRequirements | null,
+  found: SearchResult[],
+): SearchResult[] {
+  if (requirements === null) return [];
+  const known = new Set(found.map((result) => result.url));
+  const out: SearchResult[] = [];
+  for (const source of requirements.primary_sources) {
+    for (const url of source.urls) {
+      if (known.has(url) || !urlIsOnDomain(url, source.domain)) continue;
+      known.add(url);
+      out.push(SearchResultSchema.parse({
+        provider: 'crawl4ai',
+        url,
+        title: source.name,
+        retrieved_for: [PRIMARY_SECTION_PATH],
+      }));
+    }
+  }
+  return out;
+}
+
+/** 0 for a primary-source result, 1 otherwise — a stable sort key. */
+function primaryRank(result: SearchResult, requirements: BriefRequirements | null): number {
+  if (requirements === null) return 1;
+  return isPrimarySourceUrl(result.url, requirements.primary_sources) ? 0 : 1;
+}
+
+type ClaimEvidence = { claim: string; source_url: string; provider: ProviderName };
+
+interface GatedEvidence {
+  quotesBySection: Record<string, VerbatimQuote[]>;
+  claimsBySection: Record<string, ClaimEvidence[]>;
+  /** Every kept unit, in extraction order, for facet-answer selection. */
+  units: EvidenceUnitForJudging[];
+}
+
+function evidenceKey(sourceUrl: string, text: string): string {
+  return `${sourceUrl}\u0000${text.replace(/\s+/gu, ' ').trim().toLowerCase()}`;
+}
+
+/**
+ * Judge any unjudged evidence against the brief's questions, then return
+ * section maps holding only units judged relevant (relevance >= 2) plus any
+ * the judge could not cover (counted as unjudged). Within a section, units
+ * that state an asked fact and primary-source units come first.
+ *
+ * When the brief could not be analyzed there is nothing to judge against;
+ * evidence passes through and the gate reports `not_run`.
+ */
+async function applyRelevanceGate(input: {
+  credentials: ResearchCredentials;
+  requirements: BriefRequirements | null;
+  quotesBySection: Record<string, VerbatimQuote[]>;
+  claimsBySection: Record<string, ClaimEvidence[]>;
+  judgments: Map<string, EvidenceJudgment>;
+  gate: GateCounts;
+  usageSink: (usage: AnswerQualityModelUsage) => void;
+  log: Logger;
+}): Promise<GatedEvidence> {
+  const { requirements, judgments, gate } = input;
+  const units: EvidenceUnitForJudging[] = [];
+  const unitKeys = new Set<string>();
+  const addUnit = (text: string, sourceUrl: string): void => {
+    const key = evidenceKey(sourceUrl, text);
+    if (unitKeys.has(key)) return;
+    unitKeys.add(key);
+    units.push({ key, text, sourceUrl });
+  };
+  for (const quotes of Object.values(input.quotesBySection)) {
+    for (const q of quotes) addUnit(q.quote, q.source_url);
+  }
+  for (const claims of Object.values(input.claimsBySection)) {
+    for (const c of claims) addUnit(c.claim, c.source_url);
+  }
+
+  if (requirements === null || requirements.questions.length === 0) {
+    gate.status = 'not_run';
+    return { quotesBySection: input.quotesBySection, claimsBySection: input.claimsBySection, units };
+  }
+
+  const unjudged = units.filter((unit) => !judgments.has(unit.key));
+  if (unjudged.length > 0) {
+    const result = await judgeEvidenceRelevance({
+      credentials: input.credentials,
+      requirements,
+      units: unjudged,
+      usageSink: input.usageSink,
+    });
+    for (const [key, judgment] of result.judgments) judgments.set(key, judgment);
+    if (result.failedBatches > 0 && result.judgments.size === 0) gate.status = 'unavailable';
+  }
+
+  const keep = (key: string): boolean => {
+    const judgment = judgments.get(key);
+    return judgment === undefined || judgment.relevance >= RELEVANCE_KEEP_THRESHOLD;
+  };
+  const priority = (key: string, url: string): number => {
+    const judgment = judgments.get(key);
+    const relevance = judgment === undefined ? RELEVANCE_KEEP_THRESHOLD : judgment.relevance;
+    const answers = judgment !== undefined && judgment.answers.length > 0 ? 1 : 0;
+    const primary = isPrimarySourceUrl(url, requirements.primary_sources) ? 1 : 0;
+    return answers * 100 + primary * 10 + relevance;
+  };
+
+  const quotesBySection: Record<string, VerbatimQuote[]> = {};
+  for (const [path, quotes] of Object.entries(input.quotesBySection)) {
+    quotesBySection[path] = quotes
+      .map((q, order) => ({ q, order, key: evidenceKey(q.source_url, q.quote) }))
+      .filter((entry) => keep(entry.key))
+      .sort((a, b) => priority(b.key, b.q.source_url) - priority(a.key, a.q.source_url) || a.order - b.order)
+      .map((entry) => entry.q);
+  }
+  const claimsBySection: Record<string, ClaimEvidence[]> = {};
+  for (const [path, claims] of Object.entries(input.claimsBySection)) {
+    claimsBySection[path] = claims
+      .map((c, order) => ({ c, order, key: evidenceKey(c.source_url, c.claim) }))
+      .filter((entry) => keep(entry.key))
+      .sort((a, b) => priority(b.key, b.c.source_url) - priority(a.key, a.c.source_url) || a.order - b.order)
+      .map((entry) => entry.c);
+  }
+
+  const kept = units.filter((unit) => keep(unit.key));
+  gate.judged = units.filter((unit) => judgments.has(unit.key)).length;
+  gate.unjudged = units.length - gate.judged;
+  gate.kept = kept.length;
+  gate.dropped = units.length - kept.length;
+  input.log.info(
+    { units: units.length, kept: gate.kept, dropped: gate.dropped, unjudged: gate.unjudged },
+    '[runDeepResearch] Relevance gate applied',
+  );
+  return { quotesBySection, claimsBySection, units: kept };
+}
+
+function notAssessedAnswerQuality(gate: GateCounts, fetchQuality: FetchQualityCounts): AnswerQuality {
+  return {
+    status: 'not_assessed',
+    answered_ratio: 0,
+    facets_total: 0,
+    facets_answered: 0,
+    questions: [],
+    primary_sources: [],
+    primary_source_cited: null,
+    relevance_gate: {
+      status: gate.status,
+      units_judged: gate.judged,
+      units_kept: gate.kept,
+      units_dropped: gate.dropped,
+      units_unjudged: gate.unjudged,
+    },
+    fetch_quality: {
+      pages_rejected: fetchQuality.pagesRejected,
+      evidence_rejected: fetchQuality.evidenceRejected,
+    },
+    summary_line: 'answered: not assessed',
+    passed: false,
+  };
 }
 
 /** Map a provider name to a Gemini extraction mode. */

@@ -1,0 +1,41 @@
+{
+ "kind": "Listing",
+ "data": {
+  "after": null,
+  "children": [
+   {
+    "kind": "t5",
+    "data": {
+     "display_name": "AgingParents",
+     "title": "Aging Parents",
+     "subscribers": 120000,
+     "public_description": "Support for adult children",
+     "url": "/r/AgingParents/",
+     "over18": false
+    }
+   },
+   {
+    "kind": "t5",
+    "data": {
+     "display_name": "CaregiverSupport",
+     "title": "Caregiver Support",
+     "subscribers": 90000,
+     "public_description": "Caregivers",
+     "url": "/r/CaregiverSupport/",
+     "over18": false
+    }
+   },
+   {
+    "kind": "t5",
+    "data": {
+     "display_name": "tiny_sub",
+     "title": "tiny",
+     "subscribers": 12,
+     "public_description": "",
+     "url": "/r/tiny_sub/",
+     "over18": false
+    }
+   }
+  ]
+ }
+}

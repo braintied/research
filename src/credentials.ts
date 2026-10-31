@@ -24,7 +24,17 @@
 // Sub-records
 // =============================================================================
 
-/** Reddit's OAuth client-credentials grant needs all three values together. */
+/**
+ * Reddit's OAuth client-credentials grant needs all three values together.
+ *
+ * Sources, both host-side: `resolveResearchCredentials(env)` reads
+ * REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET / REDDIT_USER_AGENT; a vault host
+ * reads the platform rows `reddit/client_id`, `reddit/client_secret`,
+ * `reddit/user_agent` (provider `reddit`, lowercase key_name) through
+ * `redditCredentialsFromResolver` and `REDDIT_VAULT_KEYS`. Every Reddit read
+ * goes through `createRedditClient` (OAuth on oauth.reddit.com); unauthenticated
+ * www/old.reddit.com JSON answers HTTP 403 and is never used.
+ */
 export interface RedditCredentials {
   readonly clientId: string;
   readonly clientSecret: string;

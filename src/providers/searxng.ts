@@ -32,6 +32,8 @@ const SearxngResultSchema = z.object({
   engine: z.string().optional(),
   publishedDate: z.string().nullable().optional(),
   score: z.number().optional(),
+  /** Image search results carry the image itself here; `url` is the page it sits on. */
+  img_src: z.string().nullable().optional(),
 });
 
 const SearxngResponseSchema = z.object({
@@ -52,6 +54,8 @@ export interface SearxngResult {
   engine: string | undefined;
   published_at: string | undefined;
   score: number | undefined;
+  /** The image URL, on `category: 'images'` results. */
+  image: string | undefined;
 }
 
 export interface SearxngSearchOpts {
@@ -60,7 +64,7 @@ export interface SearxngSearchOpts {
   /** Per-instance request timeout. Default 12s. */
   timeoutMs?: number;
   /** SearXNG `format=json` is required; this is here only to override category. */
-  category?: 'general' | 'news' | 'science';
+  category?: 'general' | 'news' | 'science' | 'images';
   /**
    * SearXNG native recency filter. Mapped from SearchOpts.recency_days by the
    * provider — before this existed, recency filtering was a paid-Tavily-only
@@ -72,6 +76,8 @@ export interface SearxngSearchOpts {
    * Absent means the instance default set.
    */
   engines?: string[];
+  /** Transport. Default the global `fetch`; a caller that injects its own network passes it here. */
+  fetchImpl?: typeof fetch;
 }
 
 const SEARXNG_ENGINE_NAME = /^[a-z][a-z0-9_-]{0,32}$/;
@@ -210,7 +216,8 @@ async function callOnce(
   const url = `${baseUrl}/search?${params.toString()}`;
   const timeoutMs = opts.timeoutMs !== undefined ? opts.timeoutMs : 12_000;
 
-  const response = await fetch(url, {
+  const doFetch = opts.fetchImpl !== undefined ? opts.fetchImpl : fetch;
+  const response = await doFetch(url, {
     method: 'GET',
     headers: {
       Accept: 'application/json',
@@ -237,6 +244,7 @@ async function callOnce(
     engine: r.engine,
     published_at: r.publishedDate !== null && r.publishedDate !== undefined ? r.publishedDate : undefined,
     score: r.score,
+    image: r.img_src !== null && r.img_src !== undefined && r.img_src !== '' ? r.img_src : undefined,
   }));
 }
 

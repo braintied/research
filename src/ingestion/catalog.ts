@@ -25,6 +25,7 @@ import type { ResearchCredentials } from '../credentials.js';
 import { logger } from '../logger.js';
 import { crawlUrl } from '../pipeline-core.js';
 import { fetchPublicText } from '../public-http.js';
+import { researchUserAgent } from '../user-agent.js';
 import { fetchRssFeed } from '../advice-rss.js';
 import { discoverInstagramProfilePosts } from '../providers/instagram.js';
 import { listChannelVideos, resolveChannelId } from '../youtube/channel.js';
@@ -364,10 +365,12 @@ const LOC_PATTERN = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
  * tuckerhamilton.com/sitemap.xml with 403 to a bare request and 200 to any
  * named agent (measured 2026-09-04). Same identity the RSS provider sends.
  */
-const SITEMAP_HEADERS: Readonly<Record<string, string>> = {
-  'User-Agent': 'OraResearch/1.0 (catalog; contact: team@braintied.com)',
-  Accept: 'application/xml,text/xml;q=0.9,*/*;q=0.8',
-};
+function sitemapHeaders(): Readonly<Record<string, string>> {
+  return {
+    'User-Agent': researchUserAgent('catalog'),
+    Accept: 'application/xml,text/xml;q=0.9,*/*;q=0.8',
+  };
+}
 
 function locsFrom(xml: string): string[] {
   const out: string[] = [];
@@ -397,7 +400,7 @@ export async function listSitemapPages(
   let response;
   try {
     response = await fetchText(sitemapUrl, {
-      headers: SITEMAP_HEADERS,
+      headers: sitemapHeaders(),
       acceptedContentTypes: ['application/xml', 'text/xml', 'application/rss+xml', 'text/plain', 'text/html'],
       maxBytes: 5 * 1024 * 1024,
     });
@@ -419,7 +422,7 @@ export async function listSitemapPages(
     for (const child of childSitemaps.slice(0, 20)) {
       try {
         const childResponse = await fetchText(child, {
-          headers: SITEMAP_HEADERS,
+          headers: sitemapHeaders(),
           acceptedContentTypes: ['application/xml', 'text/xml', 'text/plain'],
           maxBytes: 5 * 1024 * 1024,
         });

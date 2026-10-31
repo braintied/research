@@ -7,6 +7,7 @@
  */
 
 import { z } from 'zod';
+import { researchUserAgent } from '../user-agent.js';
 import { logger } from '../logger.js';
 import type { ResearchCredentials } from '../credentials.js';
 import { sleep } from '../pipeline-core.js';
@@ -212,7 +213,7 @@ export function createHnProvider(credentials: ResearchCredentials): SearchProvid
       }
 
       const response = await fetch(`${HN_BASE}/search?${params.toString()}`, {
-        headers: { 'User-Agent': 'OraResearch/1.0 (deep-research; contact: team@braintied.com)' },
+        headers: { 'User-Agent': researchUserAgent('deep-research') },
         signal: opts.signal !== undefined ? opts.signal : AbortSignal.timeout(15000),
       });
 
@@ -275,7 +276,7 @@ export function createHnProvider(credentials: ResearchCredentials): SearchProvid
       await rateLimit();
 
       const response = await fetch(`${HN_BASE}/items/${objectId}`, {
-        headers: { 'User-Agent': 'OraResearch/1.0 (deep-research; contact: team@braintied.com)' },
+        headers: { 'User-Agent': researchUserAgent('deep-research') },
         signal: signal !== undefined ? signal : AbortSignal.timeout(15000),
       });
 

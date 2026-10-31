@@ -14,6 +14,7 @@
 
 import { logger } from './logger.js';
 import { fetchPublicText } from './public-http.js';
+import { researchUserAgent } from './user-agent.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -297,7 +298,7 @@ export async function fetchRssFeed(
         'text/xml',
       ],
       headers: {
-        'User-Agent': 'OraResearch/1.0 (advice-pipeline; contact: team@braintied.com)',
+        'User-Agent': researchUserAgent('advice-pipeline'),
         'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
       },
       maxBytes: 5_000_000,

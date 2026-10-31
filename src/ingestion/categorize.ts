@@ -18,7 +18,7 @@
 
 import { z } from 'zod';
 import { MissingCredentialError, type ResearchCredentials } from '../credentials.js';
-import { callModel } from '../model-call.js';
+import { callModel, isProviderAccountFailure } from '../model-call.js';
 import { researchStageResolution } from '../model-policy.js';
 import { logger } from '../logger.js';
 import { KNOWLEDGE_CATEGORIES } from './types.js';
@@ -280,9 +280,10 @@ async function categorizeBatch<C extends string>(
     });
     text = result.text;
   } catch (err) {
-    // A missing credential is a configuration fault: surface it rather than
-    // hand back a knowledge base where every item is the fallback category.
-    if (err instanceof MissingCredentialError) throw err;
+    // A missing credential or a refused provider account is a configuration
+    // fault: surface it rather than hand back a knowledge base where every
+    // item is the fallback category.
+    if (err instanceof MissingCredentialError || isProviderAccountFailure(err)) throw err;
     logger.warn(
       { error: err instanceof Error ? err.message : String(err), batchSize: batch.length },
       '[categorizeItems] model call failed — items keep default category',

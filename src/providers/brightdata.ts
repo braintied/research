@@ -22,8 +22,8 @@
 
 import { z } from 'zod';
 import { hashUrl, canonicalizeUrl } from '../types.js';
-import { sleep } from '../pipeline-core.js';
 import { logger } from '../logger.js';
+import { waitForBrightDataSnapshot } from './brightdata-snapshot.js';
 import { MissingCredentialError, type ResearchCredentials } from '../credentials.js';
 import type { IngestedItem, IngestEngagement } from '../ingestion/types.js';
 
@@ -83,10 +83,6 @@ const TriggerResponseSchema = z.object({
   snapshot_id: z.string().min(1),
 });
 
-const ProgressResponseSchema = z.object({
-  status: z.string().min(1),
-});
-
 // Bright Data records vary by dataset; be permissive and map whatever fields
 // exist. `.passthrough()` keeps unknown keys without failing validation.
 const BrightDataRecordSchema = z
@@ -123,10 +119,35 @@ export interface PollSnapshotOptions {
   maxWaitMs?: number;
   initialIntervalMs?: number;
   maxIntervalMs?: number;
+  /** Caller abort: stops the wait at once, between polls or mid-request. */
+  signal?: AbortSignal;
 }
 
+/**
+ * Kept as an interface with its own `signal` member, as published in 2.8.0.
+ * A type alias of the same shape reads to the release's api-surface check as
+ * a removed member, which would block publishing this package.
+ */
 export interface ScrapeDatasetOptions extends PollSnapshotOptions {
   signal?: AbortSignal;
+}
+
+/**
+ * Thrown when a snapshot is still running at the wait ceiling. The snapshot
+ * keeps running on Bright Data's side and is billed once; poll `snapshotId`
+ * again, or download it, instead of triggering a second collection.
+ */
+export class BrightDataSnapshotPendingError extends Error {
+  readonly snapshotId: string;
+  /** The last retryable poll failure inside the wait, when the ceiling was hit through one. */
+  readonly lastTransientError: string | undefined;
+  constructor(snapshotId: string, waitedMs: number, lastTransientError?: string) {
+    const lastPoll = lastTransientError === undefined ? '' : `; last poll: ${lastTransientError}`;
+    super(`Bright Data snapshot "${snapshotId}" not ready after ${Math.round(waitedMs / 1000)}s (tolerated timeout${lastPoll})`);
+    this.name = 'BrightDataSnapshotPendingError';
+    this.snapshotId = snapshotId;
+    this.lastTransientError = lastTransientError;
+  }
 }
 
 /**
@@ -207,8 +228,11 @@ export async function discoverAndDownload(
 }
 
 /**
- * Poll a snapshot until it reports `ready`. Returns when ready; throws a
- * tolerated error string on `failed` or when the wait cap is exceeded.
+ * Poll a snapshot until it reports `ready`, backing off between polls. A poll
+ * that times out, hits a network error, or gets HTTP 5xx/429 is retried inside
+ * `maxWaitMs`; a terminal status, a caller abort, or another 4xx throws at once.
+ * Throws BrightDataSnapshotPendingError (a tolerated timeout carrying the
+ * snapshot id) when the ceiling passes.
  */
 export async function pollSnapshot(
   credentials: ResearchCredentials,
@@ -216,51 +240,24 @@ export async function pollSnapshot(
   opts: PollSnapshotOptions = {},
 ): Promise<void> {
   const token = requireBrightDataToken(credentials);
-  const maxWaitMs = opts.maxWaitMs !== undefined ? opts.maxWaitMs : POLL_MAX_WAIT_MS;
   const initialIntervalMs =
     opts.initialIntervalMs !== undefined ? opts.initialIntervalMs : POLL_INITIAL_INTERVAL_MS;
-  const maxIntervalMs = opts.maxIntervalMs !== undefined ? opts.maxIntervalMs : POLL_MAX_INTERVAL_MS;
-
-  const url = `${BRIGHTDATA_BASE_URL}/progress/${encodeURIComponent(snapshotId)}`;
-  const startedAt = Date.now();
-  let intervalMs = initialIntervalMs;
-
-  while (true) {
-    const remainingBeforeSleep = maxWaitMs - (Date.now() - startedAt);
-    if (remainingBeforeSleep <= 0) break;
-    await sleep(Math.min(intervalMs, remainingBeforeSleep));
-    const remainingForRequest = maxWaitMs - (Date.now() - startedAt);
-    if (remainingForRequest <= 0) break;
-
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(Math.max(1, Math.min(PROGRESS_TIMEOUT_MS, remainingForRequest))),
-    });
-
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(
-        `Bright Data progress error (${snapshotId}): HTTP ${response.status} ${body.slice(0, 100)}`,
-      );
-    }
-
-    const status = ProgressResponseSchema.parse(await response.json()).status.toLowerCase();
-
-    if (status === 'ready') {
-      return;
-    }
-    if (status === 'failed') {
-      throw new Error(`Bright Data snapshot "${snapshotId}" ended with status "failed"`);
-    }
-
-    // status === 'running' (or any other transient state): back off and retry.
-    intervalMs = Math.min(intervalMs * 2, maxIntervalMs);
+  const result = await waitForBrightDataSnapshot({
+    snapshotId,
+    token,
+    maxWaitMs: opts.maxWaitMs !== undefined ? opts.maxWaitMs : POLL_MAX_WAIT_MS,
+    progressTimeoutMs: PROGRESS_TIMEOUT_MS,
+    initialDelayMs: initialIntervalMs,
+    intervalMs: initialIntervalMs * 2,
+    backoffFactor: 2,
+    maxIntervalMs: opts.maxIntervalMs !== undefined ? opts.maxIntervalMs : POLL_MAX_INTERVAL_MS,
+    signal: opts.signal,
+    label: 'Bright Data',
+    subject: `Bright Data snapshot "${snapshotId}"`,
+  });
+  if (!result.ready) {
+    throw new BrightDataSnapshotPendingError(snapshotId, result.waitedMs, result.lastTransientError);
   }
-
-  throw new Error(
-    `Bright Data snapshot "${snapshotId}" not ready after ${Math.round(maxWaitMs / 1000)}s (tolerated timeout)`,
-  );
 }
 
 /**

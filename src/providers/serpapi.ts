@@ -125,8 +125,8 @@ export function createSerpapiProvider(credentials: ResearchCredentials): SearchP
         engine: 'google',
         api_key: apiKey,
         num: String(opts.limit !== undefined ? opts.limit : 10),
-        hl: 'en',
-        gl: 'us',
+        hl: opts.search_locale !== undefined ? opts.search_locale.language : 'en',
+        gl: opts.search_locale !== undefined ? opts.search_locale.region : 'us',
       });
 
       const response = await fetch(`${SERPAPI_URL}?${params.toString()}`, {

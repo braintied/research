@@ -9,6 +9,7 @@ import {
   compactSeedQuestion,
   evaluateSourceModeCoverage,
   inferredRedditCommunities,
+  inferredTravelCommunities,
   resolveSourceExecutionPlan,
   type TrustedSourceMode,
 } from '../src/source-modes.js';
@@ -64,6 +65,14 @@ test('software jobs keep the engineering seed suffixes', () => {
     plan.seededSubqueries.find((subquery) => subquery.source_mode === 'youtube')?.query ?? '',
     /engineering talk demo interview/,
   );
+});
+
+test('inferredTravelCommunities routes by the destination table the caller passes', () => {
+  const question = 'cheap flights to Reykjavik in March';
+  assert.ok(!inferredTravelCommunities(question)?.includes('iceland'));
+  const withIceland = inferredTravelCommunities(question, [[/reykjavik|iceland/i, ['iceland']]]);
+  assert.ok(withIceland?.includes('iceland'));
+  assert.ok(withIceland?.includes('travel'));
 });
 
 test('inferredRedditCommunities only fires on Burning Man jobs', () => {

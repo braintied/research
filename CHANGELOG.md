@@ -1,3 +1,289 @@
+## 5.1.0
+
+### Minor Changes
+
+- 1de3deb: New `@braintied/artists`: find a specialist artist and their studio near a place, tattoo first. Four injected lanes (Google Maps via pets, OpenStreetMap `shop=tattoo`, Google web search for Instagram artists and studio sites, an Instagram profile reader), each allowed to fail on its own; a studio-site reader for per-artist styles and handles, contacts, house calls, consultations, hygiene copy and printed rates; artist↔studio links by handle, tag, bio link or phone; every claim marked unverified with its source and date; `tattooPreferenceFact` for Cortex `human_facts`.
+
+  `@braintied/serpapi`: the `google` web engine (`googleSearch`, `parseGoogleSearch`), schema read off a live 2026-10-30 response, including `/goto` redirect links and Instagram rows.
+
+  `@braintied/research`: a `./public-http` subpath export of the existing outbound guard (`fetchPublicText`, `isPublicAddress`, `resolvePublicHttpUrl`, `UnsafeOutboundUrlError` and their types), node built-ins only, so a consumer fetches public pages through research's pinned, per-hop address check without importing the rest of research. `@braintied/artists` fetches studio sites through it.
+
+### Patch Changes
+
+- Updated dependencies [bce2fb9]
+- Updated dependencies [a9be5bd]
+  - @braintied/cost@6.12.3
+  - @braintied/models@4.3.0
+
+## 5.0.2
+
+### Patch Changes
+
+- Updated dependencies [2847125]
+- Updated dependencies [2847125]
+  - @braintied/cost@6.12.2
+  - @braintied/models@4.2.0
+
+## 5.0.1
+
+### Patch Changes
+
+- Updated dependencies [8845059]
+  - @braintied/cost@6.12.1
+
+## 5.0.0
+
+### Major Changes
+
+- fb643fa: Extraction now adapts to the evidence each section actually gets, instead of a fixed page count.
+
+  Each section receives `firstWavePagesPerSection` pages. After every wave the run counts validated quotes and claims per section, and the distinct source documents behind them (same-page anchors such as `#comment-…` or `#t=…` count as one document). Only sections still below the depth's target (`evidenceTargetUnits` from at least `evidenceTargetSources` documents) get more pages, thinnest first. Later waves size each short section's share so the worker pool stays busy. A page feeds, and is queued under, every section it was retrieved for, so a page one section no longer needs is still read for another, and it is never extracted twice.
+
+  Extraction stops when every section is at target, candidates run out, the page ceiling is reached, the run's hard cap is spent, or extraction spend (the `extract` cost category only) would pass `EXTRACT_SPEND_SHARE` (60%) of the cap. Each page's estimated cost is reserved before dispatch, so parallel calls cannot jointly overshoot. The refinement pass counts evidence earlier passes already hold. The loop is `runAdaptiveExtraction`, a pure driver the pipeline calls with its extractor.
+
+  `maxExtractPages` becomes a safety ceiling (quick 16, blog 32, standard 96, wide 192) rather than the plan. Targets: quick 3 units/1 source, blog 4/2, standard 6/2, wide 8/3. New exports: `runAdaptiveExtraction`, `takeAdaptiveExtractWave`, `sectionEvidenceFrom`, `sectionNeedsEvidence`, `EXTRACT_SPEND_SHARE` and their types. `allocateExtractBudgetFairShare` stays exported for existing callers but the pipeline no longer uses it. The evidence funnel adds `pageBudget`, `extractWaves`, `sourcesNotNeeded`, `sourcesSkippedForCost` and `sectionsBelowTarget`.
+
+  Measured 2026-10-26: a standard run on a five-question brief planned 20 sections, discovered 186 sources across web, Reddit and YouTube, and could read 14 main-pass pages. It cited 8 sources and left 11 of 20 sections as evidence gaps at $0.03 of a $2 cap.
+
+  Major because `DepthTunables` gains required members (`firstWavePagesPerSection`, `evidenceTargetUnits`, `evidenceTargetSources`) and `EvidenceFunnel` gains required counts. No function signature changed.
+
+## 4.1.0
+
+### Minor Changes
+
+- 5d77166: Trip atlas, productized. `@braintied/places` gains the `Atlas` contract (strict Zod schema for meta, spots with media and voices carrying source kind and provenance, timeline, plans, booked; optional `checked_at` and per-spot `sources` for spots pinned from a shared link), `atlasPublicity`, the OSRM distance table with a per-country road-time factor, and Natural Earth country geo prep with a point-of-view option. `@braintied/departure` adds `planToAtlas`, projecting a stored plan into the atlas timeline and bookings. `@braintied/research` SearXNG search takes an `images` category, returns `img_src`, and accepts an injected `fetch`. New `@braintied/atlas` runs the engine: geo, distances, Commons, media gathering (SearXNG, crawl4ai, SerpApi Google Images metered through `@braintied/cost`), the page build and a CLI.
+
+## 4.0.0
+
+### Major Changes
+
+- d203ed8: The zod peer range is now `^4.6.7` (was `^4.4.3`). zod below 4.6.6 is affected by GHSA-mrhx-c7xc-m3w5 (high: memory exhaustion when validating oversized constrained collections). Major because a narrowed peer range is a breaking change to the install contract: a consumer on zod 4.4.x or 4.5.x must move to zod 4.6.7 or later. No API changed.
+
+## 3.1.3
+
+### Patch Changes
+
+- 00d35fb: run-internal-research: treat a terminal durable status as terminal. A `failed` run (HTTP 500 with the run's `error_code`) or an expired one (410 `RUN_EXPIRED`) now exits non-zero with the code and a one-line reason, and rewrites the metadata checkpoint to `checkpoint_status: terminal_failure` with `error_code` and `error_reason`. The checkpoint used to stay at `awaiting_terminal_result`, so `bt-research` resumed a run the worker had already rejected (`RESEARCH_INPUT_REJECTED`, a `--max-cost-usd` above the worker's $5 `INTERNAL_RESEARCH_MAX_COST_USD`) for 3 hours. Queued and running runs still poll and resume as before.
+
+## 3.1.2
+
+### Patch Changes
+
+- Updated dependencies [fea3dbe]
+- Updated dependencies [6c5e59c]
+  - @braintied/cost@6.12.0
+  - @braintied/models@4.1.1
+
+## 3.1.1
+
+### Patch Changes
+
+- Updated dependencies [c3b03f5]
+  - @braintied/cost@6.11.0
+
+## 3.1.0
+
+### Minor Changes
+
+- d5ed410: New `fetchInstagramProfile(credentials, handleOrUrl, { signal, maxWaitMs, resumeSnapshotId })`: one public Instagram profile in one Bright Data call, with display name, bio, every bio link, counts, profile image and the recent posts (caption, media URLs, permalink, timestamp) the profiles dataset carries on the same record. A collection still running at the wait budget answers `{ status: 'pending', snapshotId }`; pass the id back as `resumeSnapshotId` to collect it without a second bill. The profile fetch path now also reads the website when Bright Data sends `external_url` as an array (it was dropped before).
+
+## 3.0.6
+
+### Patch Changes
+
+- Updated dependencies [72fc9c7]
+  - @braintied/cost@6.10.0
+
+## 3.0.5
+
+### Patch Changes
+
+- Updated dependencies [1b8bf40]
+  - @braintied/models@4.1.0
+
+## 3.0.4
+
+### Patch Changes
+
+- Updated dependencies [9cd4748]
+  - @braintied/cost@6.9.0
+
+## 3.0.3
+
+### Patch Changes
+
+- Updated dependencies [4079ed0]
+  - @braintied/models@4.0.0
+
+## 3.0.2
+
+### Patch Changes
+
+- Updated dependencies [f1184ce]
+  - @braintied/models@3.0.0
+
+## 3.0.1
+
+### Patch Changes
+
+- Updated dependencies [01bf4fa]
+  - @braintied/models@2.0.0
+
+## 3.0.0
+
+### Major Changes
+
+- f613878: Reddit corpus: `collectRedditCorpus` (subreddits x queries to one file per thread with full comment trees via `/api/morechildren` and continue-thread expansion, resumable store, per-request error list, no usernames by default), `discoverSubreddits`, client `moreChildren` and `searchSubreddits`, and the `reddit-corpus.mjs` runner (`check`, `discover`, `collect`) that exits 2 without OAuth credentials.
+
+### Patch Changes
+
+- Updated dependencies [b10e2dd]
+  - @braintied/cost@6.8.0
+
+## 2.9.2
+
+### Patch Changes
+
+- Updated dependencies [7ef64f8]
+  - @braintied/models@1.25.0
+
+## 2.9.1
+
+### Patch Changes
+
+- Updated dependencies [eea26d3]
+  - @braintied/cost@6.7.0
+
+## 2.9.0
+
+### Minor Changes
+
+- 326270c: Answer quality: reports now answer the brief, and say when they do not.
+
+  - Brief analysis (one cheap call) lists the brief's explicit questions, the facts each asks for (version, date, price, name...), and the primary source it names or implies.
+  - Primary sources are searched with `site:`/`include_domains` and their canonical pages are fetched directly, ahead of search results and the extract budget.
+  - Fetch quality: short error, bot-wall and script-failure pages and navigation shells are rejected before extraction; verbatim site chrome ("A required part of this site couldn't load", cookie and browser notices) is dropped as evidence.
+  - Extraction reads a question-focused window of long pages and is told the questions (the extract cache key carries both).
+  - Relevance gate: every evidence unit is judged against the questions before synthesis; off-topic units never reach a section.
+  - The executive summary answers each question fact by fact with exact evidence sentences, or says which fact is missing, and ends with the answer check line.
+  - New `answer_quality` on `FinalReport` (and `answerQuality` on pipeline results): answered facets, primary-source citation, gate and fetch counts, `summary_line`, `passed`. The skill runners write it to metadata (`answer_quality`, `answer_quality_status`, `answer_quality_passed`, `answer_check`).
+  - Grounding accepts a short citation (two or three tokens, such as "Bot API 10.3") only as an exact match of a validated verbatim quote.
+  - New eval: `evals/run-answer-quality.ts` with ten briefs and expected answer facts.
+
+## 2.8.2
+
+### Patch Changes
+
+- ff4e078: Bright Data snapshot polling no longer abandons a triggered, billed snapshot on one bad poll. Instagram `waitForSnapshot` and the tolerant `pollSnapshot` now share `waitForBrightDataSnapshot`: inside the overall wait ceiling, a progress poll that times out, hits a network error, or gets HTTP 5xx/429 is counted and retried. Terminal snapshot statuses, caller aborts, and other 4xx responses still fail at once. At the ceiling, Instagram throws `InstagramSnapshotPendingError` and `pollSnapshot` throws the new `BrightDataSnapshotPendingError`, both carrying `snapshotId` and the last transient failure. `pollSnapshot` now honors `signal`, so `scrapeDataset`'s caller abort reaches the poll loop.
+
+## 2.8.1
+
+### Patch Changes
+
+- Updated dependencies [fec5fc4]
+- Updated dependencies [fec5fc4]
+- Updated dependencies [05de09c]
+  - @braintied/cost@6.6.0
+  - @braintied/models@1.24.0
+
+## 2.8.0
+
+### Minor Changes
+
+- 1c7f35b: `@braintied/research`: the Reddit client carries what the hosts moving onto it read today. `RedditPost` gains `isSelf`, `score` (Reddit's net score; `ups` when Reddit omits it), `linkFlairText`, `over18` and `quarantine`; `RedditComment` gains `score`. `listSubreddit` accepts the `controversial` sort, and `fetchThread` takes a comment `sort` (`RedditCommentSort`: `confidence`, `top`, `new`, `controversial`, `old`, `qa`). `fetchThread` resolves `https://redd.it/<id>` short links to the post and refuses one that names no post, before any token is requested. Answers of 500, 502, 503 or 504 and network failures are retried with 1s then 2s backoff, three attempts in all, before `RedditApiError` carries the last status; a caller's abort is never retried.
+
+## 2.7.0
+
+### Minor Changes
+
+- 4d0fb62: Report bibliographies now carry each source's author and published date
+  (`[^n]: url — author, YYYY-MM-DD`) instead of a bare URL, via the exported
+  `formatBibliographyLine`. `parseMarkdownReport` reads the date from any
+  trailer position, so a dated source with no author round-trips. Readers of the
+  corpus can now tell how old the evidence behind a report is.
+
+  Bibliography entries also carry `scraped_at` (when the run obtained the
+  source's content), so the stored report says when its evidence was scraped.
+  The internal runner prints a `braintied_internal_research_progress` line every
+  minute while polling, with the server run's heartbeat age and a `stalled` flag
+  after ten silent minutes, so a hung durable run is visible long before the
+  client deadline.
+
+- 6244719: `@braintied/research`: `createRedditClient(credentials, { fetchImpl?, now?, sleep? })` is the one fleet Reddit client. It owns the OAuth client_credentials token (cached per client id, refreshed 60s before expiry, dropped and retried once on a 401), paces requests at 650ms per client id, waits for `x-ratelimit-reset` when `x-ratelimit-remaining` reaches 0, and backs off on 429 for `Retry-After` or the reset header up to 3 attempts before throwing `RedditApiError` (`status`, `reason`, `stage`). Reads only go to `oauth.reddit.com` with `redirect: 'error'`: `search`, `listSubreddit` (`hot` / `new` / `top` / `rising`) and `fetchThread`, which returns the full nested comment tree and the count of unexpanded `more` children. `probe()` and `probeReddit(researchCredentials)` return `{ ok, latencyMs, rateLimitRemaining }` or `{ ok: false, stage, status?, reason }` without throwing or exposing a secret. `REDDIT_VAULT_KEYS` and `redditCredentialsFromResolver(resolve)` name the platform vault rows `reddit/client_id`, `reddit/client_secret`, `reddit/user_agent`.
+
+  The `reddit` provider now runs on this client; its search results, filters, markdown and `reddit_oauth_api` backend are unchanged, and thread fetches now request `raw_json=1`, so comment text arrives without HTML entities. Unauthenticated `www.reddit.com` / `old.reddit.com` JSON answers HTTP 403 (verified 2026-10-11), and hosts that hand-rolled their own Reddit OAuth should move onto this client.
+
+### Patch Changes
+
+- 74036d0: Optional peers stay optional when they are installed anyway.
+
+  GitHub Packages serves no `peerDependenciesMeta`, so a strict install now puts every optional peer of every package in `node_modules`. A string-literal `import('playwright')` is then followed by the consumer's bundler and file tracer, `webpackIgnore` or not (esbuild ignores the comment, and OpenNext builds Workers with esbuild). Runtime-only peers now load through each package's own `importOptionalPeer(specifier)`: a non-literal specifier with `webpackIgnore` and `@vite-ignore`, which no bundler or tracer follows and Node still resolves from the package.
+
+  - seo: `playwright` and `@braintied/agentic-browser` (the root entry no longer drags a browser driver into a Next or Worker build).
+  - agentic-browser: `@browserbasehq/sdk`, `@browserbasehq/stagehand`, `@1password/sdk`.
+  - agent-audit: `playwright`, `@braintied/cost`. marketplace: `playwright`. media (`/site`), vectorize: `sharp`; vectorize: `@neplex/vectorizer`. draft: `@resvg/resvg-js`. vault-client: `@1password/sdk`.
+  - investor: `puppeteer`, `@sparticuz/chromium`, `pdf-lib`, `pdfjs-dist`, `@napi-rs/canvas`. A host that runs the PDF export inside a bundled serverless function names them in its own trace (`serverExternalPackages` or `outputFileTracingIncludes`).
+  - investor booking slide: the `@braintied/bookings-react` import carried `webpackIgnore`, which left a bare specifier in the browser bundle that no browser resolves, so the slide always showed the missing-package note. It is now a literal the bundler splits into its own chunk, with `turbopackOptional` so a Turbopack build without the peer still compiles.
+  - press, meeting-ship: their non-literal imports gain `webpackIgnore`, so webpack no longer compiles them into a context module that throws.
+  - kit, stage-terminal, investor (booking), meeting-intelligence, meeting-ship, research, video-review declare the peers they import by literal on purpose in `braintied.literalOptionalPeers`, each with the reason a consumer's bundler or tracer must see it.
+  - blog (`harness`) and agent-surface import `@braintied/seo/site` instead of the package root. Every symbol they use is there, and the root entry carries the distribution harness (`child_process`, the browser loaders) into the consumer's bundle; Parlor's herochurch moved to `/site` for the same reason (ga1ien/parlor#592).
+
+- Updated dependencies [d4e68e8]
+- Updated dependencies [1add23c]
+- Updated dependencies [b4892f7]
+  - @braintied/cost@6.5.0
+  - @braintied/models@1.23.0
+
+## 2.6.1
+
+### Patch Changes
+
+- Updated dependencies [72dfb7a]
+- Updated dependencies [e487b68]
+  - @braintied/cost@6.4.1
+
+## 2.6.0
+
+### Minor Changes
+
+- b8f9256: `@braintied/models`: `failoverLadderForResolution(resolution, { residency?, providers? })` returns the failover ladder for a resolution a caller already holds. Candidate 0 is that resolution unchanged, and the use-case's provider binding and the process residency apply as in `resolveFailoverLadder`.
+
+  `@braintied/research`: `callModel` fails over to the same model on another host. A DeepSeek 402 (empty prepaid balance), 429, 5xx or no response moves the call to Fireworks when `FIREWORKS_API_KEY` is configured. When every host fails it throws `FailoverExhaustedError`, and the extractor and the categoriser rethrow it (new export `isProviderAccountFailure`, also true for 401/403) instead of returning an empty result. Measured 2026-10-07 (PT): with the fleet DeepSeek balance at $0.00, every page extraction failed with HTTP 402 and was logged as a bad page, so paid runs finished `partial` / `ungrounded` with zero citations for about $0.002 and no stated cause. Such a run now fails and names the cause, or is served by Fireworks.
+
+### Patch Changes
+
+- Updated dependencies [b8f9256]
+  - @braintied/models@1.22.0
+
+## 2.5.1
+
+### Patch Changes
+
+- 1b72dfb: `SearchOpts.search_locale` sets SerpApi `hl`/`gl` (default en/us, unchanged).
+- 1b72dfb: `inferredTravelCommunities` takes an optional destination-to-subreddit table (`DestinationCommunities`); the shipped `DESTINATION_COMMUNITIES` stays the default.
+
+## 2.5.0
+
+### Minor Changes
+
+- f9eb4d1: The RSS, sitemap and Hacker News lanes no longer send `contact: team@braintied.com`. `setResearchUserAgentContact(contact)` (exported) lets the host name its own operator contact once at its process boundary; unset, the User-Agent names the library and lane only. To keep the old header call `setResearchUserAgentContact('team@braintied.com')`.
+
+### Patch Changes
+
+- Updated dependencies [f9eb4d1]
+  - @braintied/cost@6.4.0
+
+## 2.4.9
+
+### Patch Changes
+
+- d16c132: The default logger now writes every level to stderr. `info` and `debug` used `console.info` / `console.debug`, which write to stdout, so any CLI importing the package (for example the Reddit provider's `[Reddit] event` lines on every search and fetch) had library diagnostics mixed into its stdout and could not emit clean JSON. Sanitization is unchanged.
+- Updated dependencies [fcd523f]
+- Updated dependencies [57751f5]
+- Updated dependencies [d2098bb]
+  - @braintied/cost@6.3.0
+  - @braintied/models@1.21.0
+
 ## 2.4.8
 
 ### Patch Changes

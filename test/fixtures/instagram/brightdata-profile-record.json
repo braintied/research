@@ -1,0 +1,84 @@
+[
+  {
+    "account": "example.dj",
+    "fbid": "10000000000000001",
+    "id": "1000000001",
+    "followers": 1645,
+    "posts_count": 164,
+    "is_verified": false,
+    "external_url": [
+      "https://soundcloud.com/example-radio/example-mix-02-07-25"
+    ],
+    "biography": "DNB - JUNGLE - HIP HOP \nHOUSE - TECHNO - DISCO",
+    "post_hashtags": [
+      "riverside",
+      "yogaandmusic"
+    ],
+    "following": 8078,
+    "posts": [
+      {
+        "caption": "Start your morning a little differently.\n\nAn hour of yoga and a live DJ set by the river.",
+        "datetime": "2026-10-05T00:00:00.000Z",
+        "id": "400000000000000000",
+        "image_url": "https://scontent.cdninstagram.com/v/t51.82787-15/redacted_0_n.jpg?stp=dst-jpg_e35_s640x640_tt6&oh=REDACTED&oe=REDACTED",
+        "post_hashtags": null,
+        "content_type": "Video",
+        "url": "https://www.instagram.com/p/ExAmPlE0"
+      },
+      {
+        "caption": "Make your Sunday count. #riverside #yogaandmusic",
+        "datetime": "2026-09-29T00:00:00.000Z",
+        "id": "400000000000000001",
+        "image_url": "https://scontent.cdninstagram.com/v/t51.82787-15/redacted_1_n.jpg?stp=dst-jpg_e35_s640x640_tt6&oh=REDACTED&oe=REDACTED",
+        "post_hashtags": [
+          "riverside",
+          "yogaandmusic"
+        ],
+        "content_type": "Image",
+        "url": "https://www.instagram.com/p/ExAmPlE1"
+      },
+      {
+        "caption": "",
+        "datetime": "2026-09-27T00:00:00.000Z",
+        "id": "400000000000000002",
+        "image_url": "https://scontent.cdninstagram.com/v/t51.82787-15/redacted_2_n.jpg?stp=dst-jpg_e35_s640x640_tt6&oh=REDACTED&oe=REDACTED",
+        "post_hashtags": null,
+        "content_type": "Video",
+        "url": "https://www.instagram.com/p/ExAmPlE2"
+      }
+    ],
+    "profile_image_link": "https://scontent.cdninstagram.com/v/t51.82787-19/redacted_avatar_n.jpg?stp=dst-jpg_s150x150_tt6&oh=REDACTED&oe=REDACTED",
+    "profile_url": "https://instagram.com/example.dj",
+    "profile_name": "Example DJ",
+    "highlights_count": 8,
+    "highlights": [
+      {
+        "id": "10000000000000002",
+        "image": "https://scontent.cdninstagram.com/v/t51.82787-15/redacted_highlight_n.jpg?stp=dst-jpg_e35_s640x640_tt6&oh=REDACTED&oe=REDACTED",
+        "title": "Gigs"
+      }
+    ],
+    "full_name": "Example DJ",
+    "is_private": false,
+    "bio_hashtags": null,
+    "url": "https://www.instagram.com/example.dj/",
+    "is_joined_recently": false,
+    "partner_id": "10000000000000001",
+    "email_address": null,
+    "external_url_title": {
+      "url": "https://soundcloud.com/example-radio/example-mix-02-07-25",
+      "title": null
+    },
+    "pronouns": null,
+    "external_urls": [
+      {
+        "title": "Example Mix on Example Radio",
+        "url": "https://soundcloud.com/example-radio/example-mix-02-07-25"
+      }
+    ],
+    "timestamp": "2026-10-17T23:56:44.362Z",
+    "input": {
+      "url": "https://www.instagram.com/example.dj/"
+    }
+  }
+]

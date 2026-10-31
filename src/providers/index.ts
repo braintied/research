@@ -196,6 +196,65 @@ export {
   createPodcastsProvider,
   createGithubProvider,
 };
+// The one fleet Reddit door: OAuth, rate limiting and validation live here.
+export {
+  createRedditClient,
+  probeReddit,
+  RedditApiError,
+  REDDIT_VAULT_KEYS,
+  redditCredentialsFromResolver,
+  redditThreadApiUrl,
+} from './reddit-client.js';
+export {
+  collectRedditCorpus,
+  fetchExpandedThread,
+  discoverSubreddits,
+  flattenCorpusTree,
+  redactUserMentions,
+  redditSearchCacheKey,
+  REDDIT_CORPUS_SCHEMA,
+} from './reddit-corpus.js';
+export { createDirectoryThreadStore } from './reddit-corpus-store.js';
+export type {
+  RedditClient,
+  RedditClientOptions,
+  RedditSearchOptions,
+  RedditListSubredditOptions,
+  RedditFetchThreadOptions,
+  RedditSearchSort,
+  RedditListingSort,
+  RedditCommentSort,
+  RedditTimeFilter,
+  RedditPost,
+  RedditListing,
+  RedditComment,
+  RedditThread,
+  RedditProbeResult,
+  RedditErrorStage,
+  RedditThreadUrlResult,
+  RedditMoreStub,
+  RedditMoreChildrenOptions,
+  RedditMoreChildrenResult,
+  RedditSubredditInfo,
+  RedditSearchSubredditsOptions,
+} from './reddit-client.js';
+export type {
+  RedditCorpusCommentMode,
+  RedditCorpusComment,
+  RedditCorpusCommentStats,
+  RedditCorpusThread,
+  RedditCorpusErrorStage,
+  RedditCorpusError,
+  RedditCorpusSearchPage,
+  RedditThreadStore,
+  RedditCorpusProgress,
+  RedditCorpusOptions,
+  RedditCorpusResult,
+  ExpandThreadOptions,
+  ExpandedThread,
+  DiscoverSubredditsOptions,
+  DiscoverSubredditsResult,
+} from './reddit-corpus.js';
 export type {
   XBackend,
   XBackendAttempt,
@@ -212,11 +271,19 @@ export {
   parseInstagramStoriesUrl,
   discoverInstagramProfilePosts,
   InstagramSnapshotPendingError,
+  fetchInstagramProfile,
+  normalizeInstagramProfileSnapshot,
+  INSTAGRAM_PROFILE_WAIT_MS,
 } from './instagram.js';
 export type {
   InstagramStoriesTarget,
   InstagramProfilePostsInput,
   NormalizedInstagramPost,
+  InstagramBioLink,
+  InstagramProfile,
+  InstagramProfilePost,
+  InstagramProfileFetchResult,
+  FetchInstagramProfileOptions,
 } from './instagram.js';
 // Strict, consent-gated LinkedIn member-profile surface. Deliberately beside
 // the Instagram strict exports and NOT beside the tolerant Bright Data
@@ -259,7 +326,13 @@ export {
   unlockUrl,
   fetchLinkedInPostsBrightData,
   fetchFacebookGroupPostsBrightData,
+  BrightDataSnapshotPendingError,
 } from './brightdata.js';
+export { waitForBrightDataSnapshot } from './brightdata-snapshot.js';
+export type {
+  WaitForBrightDataSnapshotOptions,
+  BrightDataSnapshotWaitResult,
+} from './brightdata-snapshot.js';
 export type {
   PollSnapshotOptions,
   ScrapeDatasetOptions,

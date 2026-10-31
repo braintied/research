@@ -229,11 +229,15 @@ function emit(method: ConsoleMethod, obj: Record<string, unknown> | string, msg?
 /**
  * Console-backed logger used by default. Mirrors pino's `(obj, msg)` /
  * `(msg)` overloads so harvested call sites need no changes.
+ *
+ * Every level writes to stderr. This is a library: stdout belongs to the
+ * consuming CLI, and `console.info` / `console.debug` would interleave
+ * diagnostics into output a caller pipes as JSON.
  */
 function consoleLogger(): Logger {
   return {
     info(obj, msg) {
-      emit(console.info.bind(console), obj, msg);
+      emit(console.error.bind(console), obj, msg);
     },
     warn(obj, msg) {
       emit(console.warn.bind(console), obj, msg);
@@ -242,7 +246,7 @@ function consoleLogger(): Logger {
       emit(console.error.bind(console), obj, msg);
     },
     debug(obj, msg) {
-      emit(console.debug.bind(console), obj, msg);
+      emit(console.error.bind(console), obj, msg);
     },
   };
 }
